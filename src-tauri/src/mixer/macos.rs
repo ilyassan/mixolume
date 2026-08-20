@@ -144,15 +144,16 @@
 //!
 //! ## Highest-risk spots a Mac-equipped contributor should check FIRST
 //!
-//! 1. **The `block2` IOProc closures in [`CaptureAggregate::start`] / [`PlaybackTap::start`].**
-//!    `AudioDeviceIOBlock` is a raw `*mut DynBlock<dyn Fn(..)>`, not the `&Block<F>`/`Option<&Block<F>>`
-//!    shape most other objc2-ecosystem block-taking functions use. The exact incantation to turn a
-//!    Rust closure into that raw pointer via `block2::RcBlock::new(...)` (construction, lifetime,
-//!    whether a reference coerces automatically or an explicit cast/`.as_ptr()`-style call is
-//!    needed) is the single least-verified line in this file. If it doesn't compile as spelled,
-//!    the fix is almost certainly a small adjustment to how the `RcBlock` is constructed/passed,
-//!    not a rethink of "one closure per IOProc, capturing an `Arc<[AtomicGainSlot]>` plus the ring
-//!    buffer" as the overall shape.
+//! 1. ~~The `block2` IOProc closures in [`CaptureAggregate::start`] / [`PlaybackTap::start`].~~
+//!    **RESOLVED** -- verified and fixed against real macOS 26.4 hardware (crash report
+//!    confirmed a `SIGABRT`/`OBJC` "Attempt to use unknown class" fatal inside
+//!    `AudioDeviceCreateIOProcIDWithBlock`, one frame below `CaptureAggregate::start`). The bug
+//!    was `&block as *const _ as *mut _`, which took a pointer to the `RcBlock<F>` *wrapper
+//!    struct on the Rust stack* rather than to the heap-allocated `Block<F>`/ObjC block object it
+//!    wraps -- Core Audio then tried to invoke through a garbage pointer. Fixed by using
+//!    `RcBlock::as_ptr(&block)`, block2 0.6.2's own documented accessor for the real
+//!    `*mut Block<F>` (`AudioDeviceIOBlock` is exactly `*mut block2::DynBlock<F>`, and
+//!    `DynBlock<F> = Block<F>`, confirmed by reading both crates' source directly).
 //! 2. **`CATapMuteBehavior`'s associated-constant spelling** (`MutedWhenTapped` vs.
 //!    `MUTED_WHEN_TAPPED` vs. something else) -- `docs.rs` confirmed the three *cases* exist and
 //!    their semantics, but the exact Rust-side casing objc2's codegen picked was not independently
@@ -205,12 +206,6 @@ use super::{clamp_volume, AppSession, AudioMixerBackend, MixerError};
 /// convention (see `mixer/windows.rs`).
 fn session_id_for_pid(pid: i32) -> String {
     format!("macos-{pid}")
-}
-
-/// Inverse of [`session_id_for_pid`]. Returns `None` for anything not shaped like `macos-<pid>`
-/// (e.g. an id from a different backend, or garbage from the frontend).
-fn parse_pid_from_session_id(id: &str) -> Option<i32> {
-    id.strip_prefix("macos-")?.parse::<i32>().ok()
 }
 
 /// Per-app volume + mute state, independent of whether the app is currently tapped.
@@ -317,6 +312,7 @@ impl FloatRingBuffer {
         }
     }
 
+    #[allow(dead_code)] // only called from #[cfg(test)] tests below; no production caller yet
     fn fill_level(&self) -> usize {
         self.head
             .load(Ordering::Relaxed)
@@ -467,9 +463,21 @@ use objc2_foundation::{NSArray, NSNumber, NSString};
 /// only Rust-side touch after installation is a single drop, always performed while holding
 /// `Inner`'s mutex (see [`MacosMixerBackend`]), so there's never concurrent access from two Rust
 /// threads at once.
-struct SendSyncBlock<F: ?Sized>(RcBlock<F>);
+struct SendSyncBlock<F: ?Sized>(#[allow(dead_code)] RcBlock<F>); // held only for its Drop (releases the block); never read
 unsafe impl<F: ?Sized> Send for SendSyncBlock<F> {}
 unsafe impl<F: ?Sized> Sync for SendSyncBlock<F> {}
+
+/// The closure signature Core Audio's `AudioDeviceIOBlock` expects (see the module doc comment).
+/// Named so [`CaptureAggregate`]/[`PlaybackTap`]'s `block` fields and their `start()` methods
+/// don't repeat this five-`NonNull`-argument `dyn Fn` shape inline (clippy's `type_complexity`
+/// lint flagged the inline version).
+type IoProcFn = dyn Fn(
+    std::ptr::NonNull<AudioTimeStamp>,
+    std::ptr::NonNull<AudioBufferList>,
+    std::ptr::NonNull<AudioTimeStamp>,
+    std::ptr::NonNull<AudioBufferList>,
+    std::ptr::NonNull<AudioTimeStamp>,
+);
 
 fn check_status(status: i32, what: &str) -> Result<(), MixerError> {
     if status == 0 {
@@ -739,17 +747,7 @@ struct CaptureAggregate {
     /// Kept alive for the aggregate's lifetime -- the block only borrows the `Arc`s it needs, but
     /// the `RcBlock` itself must outlive `io_proc_id`'s registration.
     #[allow(dead_code)]
-    block: Option<
-        SendSyncBlock<
-            dyn Fn(
-                *mut AudioTimeStamp,
-                *mut AudioBufferList,
-                *mut AudioTimeStamp,
-                *mut AudioBufferList,
-                *mut AudioTimeStamp,
-            ),
-        >,
-    >,
+    block: Option<SendSyncBlock<IoProcFn>>,
 }
 
 /// Shared cap on how many samples any one realtime callback mixes/reads per invocation. Sized
@@ -800,25 +798,32 @@ impl CaptureAggregate {
         let ring = Arc::clone(&self.ring);
         let scratch = Arc::clone(&self.scratch);
 
-        // RISK (see module doc, item 1): the exact `block2::RcBlock` construction/coercion into
-        // the raw `AudioDeviceIOBlock = *mut DynBlock<..>` parameter type is the least-verified
-        // line in this file.
-        let block: RcBlock<
-            dyn Fn(
-                *mut AudioTimeStamp,
-                *mut AudioBufferList,
-                *mut AudioTimeStamp,
-                *mut AudioBufferList,
-                *mut AudioTimeStamp,
-            ),
-        > = RcBlock::new(
-            move |_now, input_data, _input_time, output_data, _output_time| {
+        // The real generated `AudioDeviceIOBlock` type (checked directly against
+        // objc2-core-audio 0.3.2's source) takes `NonNull<..>`, not raw `*mut ..` pointers --
+        // confirmed the hard way, by a real compile error once `RcBlock::as_ptr` (a type-checked
+        // function) replaced the unchecked `as` cast that used to silently paper over this.
+        let block: RcBlock<IoProcFn> = RcBlock::new(
+            // `RcBlock::new`'s generic `IntoBlock` bound can't backpropagate the argument types
+            // from the `let block: RcBlock<dyn Fn(NonNull<..>, ..)>` annotation above into an
+            // untyped closure -- confirmed by a real E0282 "type annotations needed" error with
+            // these left elided. Every parameter needs its type spelled out explicitly.
+            move |_now: std::ptr::NonNull<AudioTimeStamp>,
+                  input_data: std::ptr::NonNull<AudioBufferList>,
+                  _input_time: std::ptr::NonNull<AudioTimeStamp>,
+                  output_data: std::ptr::NonNull<AudioBufferList>,
+                  _output_time: std::ptr::NonNull<AudioTimeStamp>| {
                 // SAFETY: called by Core Audio on its own realtime thread with valid, non-null
                 // pointers for the lifetime of the call. No allocation/locking happens in this
                 // closure body -- only atomic loads, raw pointer arithmetic, and reuse of the
                 // pre-allocated `scratch` buffer via `Scratch::as_mut_slice`.
                 unsafe {
-                    mix_capture_callback(input_data, output_data, &gain_slots, &ring, &scratch);
+                    mix_capture_callback(
+                        input_data.as_ptr(),
+                        output_data.as_ptr(),
+                        &gain_slots,
+                        &ring,
+                        &scratch,
+                    );
                 }
             },
         );
@@ -829,7 +834,15 @@ impl CaptureAggregate {
                 std::ptr::NonNull::from(&mut io_proc_id),
                 self.aggregate_id,
                 None,
-                &block as *const _ as *mut _,
+                // FIXED (was the file's flagged highest-risk line, and a real crash on real
+                // hardware: "objc: Attempt to use unknown class" -> abort in
+                // AudioDeviceCreateIOProcIDWithBlock). `&block as *const _ as *mut _` took a
+                // pointer to the `RcBlock<F>` *wrapper struct on the Rust stack* (a pointer to a
+                // pointer), not to the heap-allocated Objective-C block object it wraps -- Core
+                // Audio then tried to send an ObjC message through that garbage pointer.
+                // `RcBlock::as_ptr(&block)` is block2's own documented accessor for the real
+                // `*mut Block<F>` (== `AudioDeviceIOBlock`, since `DynBlock<F> = Block<F>`).
+                RcBlock::as_ptr(&block),
             )
         };
         check_status(status, "AudioDeviceCreateIOProcIDWithBlock (capture)")?;
@@ -937,17 +950,7 @@ struct PlaybackTap {
     /// See [`Scratch`]'s doc comment.
     scratch: Arc<Scratch>,
     #[allow(dead_code)]
-    block: Option<
-        SendSyncBlock<
-            dyn Fn(
-                *mut AudioTimeStamp,
-                *mut AudioBufferList,
-                *mut AudioTimeStamp,
-                *mut AudioBufferList,
-                *mut AudioTimeStamp,
-            ),
-        >,
-    >,
+    block: Option<SendSyncBlock<IoProcFn>>,
 }
 
 impl PlaybackTap {
@@ -962,20 +965,16 @@ impl PlaybackTap {
 
     fn start(&mut self, ring: Arc<FloatRingBuffer>) -> Result<(), MixerError> {
         let scratch = Arc::clone(&self.scratch);
-        let block: RcBlock<
-            dyn Fn(
-                *mut AudioTimeStamp,
-                *mut AudioBufferList,
-                *mut AudioTimeStamp,
-                *mut AudioBufferList,
-                *mut AudioTimeStamp,
-            ),
-        > = RcBlock::new(
-            move |_now, _input_data, _input_time, output_data, _output_time| {
+        let block: RcBlock<IoProcFn> = RcBlock::new(
+            move |_now: std::ptr::NonNull<AudioTimeStamp>,
+                  _input_data: std::ptr::NonNull<AudioBufferList>,
+                  _input_time: std::ptr::NonNull<AudioTimeStamp>,
+                  output_data: std::ptr::NonNull<AudioBufferList>,
+                  _output_time: std::ptr::NonNull<AudioTimeStamp>| {
                 // SAFETY: same realtime-callback contract as the capture side. No allocation: reuses
                 // the pre-allocated `scratch` buffer via `Scratch::as_mut_slice`.
                 unsafe {
-                    mix_playback_callback(output_data, &ring, &scratch);
+                    mix_playback_callback(output_data.as_ptr(), &ring, &scratch);
                 }
             },
         );
@@ -986,7 +985,9 @@ impl PlaybackTap {
                 std::ptr::NonNull::from(&mut io_proc_id),
                 self.device_id,
                 None,
-                &block as *const _ as *mut _,
+                // See the matching fix in `CaptureAggregate::start` for why this must be
+                // `RcBlock::as_ptr(&block)`, not a raw cast of `&block` itself.
+                RcBlock::as_ptr(&block),
             )
         };
         check_status(status, "AudioDeviceCreateIOProcIDWithBlock (playback)")?;
@@ -1364,7 +1365,7 @@ impl MacosMixerBackend {
                 let gain = inner
                     .gain_state
                     .entry(id.clone())
-                    .or_insert_with(AppGainState::default)
+                    .or_default()
                     .effective_gain();
                 (*p, id, gain)
             })
@@ -1394,7 +1395,7 @@ impl AudioMixerBackend for MacosMixerBackend {
                 inner
                     .gain_state
                     .entry(session_id_for_pid(p.pid))
-                    .or_insert_with(AppGainState::default);
+                    .or_default();
             }
         }
 
@@ -1471,19 +1472,6 @@ mod tests {
     #[test]
     fn session_id_matches_windows_backend_convention_shape() {
         assert_eq!(session_id_for_pid(1234), "macos-1234");
-    }
-
-    #[test]
-    fn session_id_round_trips_through_parse() {
-        assert_eq!(parse_pid_from_session_id(&session_id_for_pid(9)), Some(9));
-    }
-
-    #[test]
-    fn parse_rejects_other_backends_ids() {
-        assert_eq!(parse_pid_from_session_id("win-1234"), None);
-        assert_eq!(parse_pid_from_session_id("linux-42"), None);
-        assert_eq!(parse_pid_from_session_id("macos-not-a-number"), None);
-        assert_eq!(parse_pid_from_session_id(""), None);
     }
 
     // ---------------------------------------------------------------------------------------
