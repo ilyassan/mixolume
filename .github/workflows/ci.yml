@@ -1,0 +1,152 @@
+name: CI
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+        branches: [main]
+
+jobs:
+    changes:
+        runs-on: ubuntu-latest
+        outputs:
+            frontend: ${{ steps.filter.outputs.frontend }}
+            backend: ${{ steps.filter.outputs.backend }}
+        steps:
+            - uses: actions/checkout@v7
+            - uses: dorny/paths-filter@v4
+              id: filter
+              with:
+                  filters: |
+                      frontend:
+                          - 'src/**'
+                          - 'public/**'
+                          - 'index.html'
+                          - 'package.json'
+                          - 'package-lock.json'
+                          - 'tsconfig*.json'
+                          - 'vite.config.ts'
+                          - '.github/workflows/ci.yml'
+                      backend:
+                          - 'src-tauri/**'
+                          - 'package.json'
+                          - 'package-lock.json'
+                          - '.github/workflows/ci.yml'
+
+    frontend:
+        needs: changes
+        if: needs.changes.outputs.frontend == 'true'
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v7
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v7
+              with:
+                  node-version: 20
+                  cache: npm
+
+            - name: Install frontend dependencies
+              run: npm ci
+
+            - name: Type-check
+              run: npx tsc --noEmit
+
+            - name: Run frontend tests
+              run: npx vitest run
+
+    backend:
+        needs: changes
+        if: needs.changes.outputs.backend == 'true'
+        runs-on: ${{ matrix.os }}
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    # PLAN.md notes ubuntu-22.04 is also acceptable for wider glibc
+                    # compatibility; we use ubuntu-latest here for current tooling
+                    # and to match GitHub's supported-runner default, since Mixolume
+                    # (like ytaudiobar) has no known reason to pin an older glibc.
+                    - os: ubuntu-latest
+                      platform: linux
+                    - os: windows-latest
+                      platform: windows
+                    - os: macos-latest
+                      platform: macos
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v7
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v7
+              with:
+                  node-version: 20
+                  cache: npm
+
+            - name: Install Rust
+              uses: dtolnay/rust-toolchain@stable
+
+            - name: Cache Rust build artifacts
+              uses: Swatinem/rust-cache@v2
+              with:
+                  workspaces: src-tauri
+
+            - name: Install system dependencies (Ubuntu only)
+              if: matrix.platform == 'linux'
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libasound2-dev
+
+            - name: Install frontend dependencies
+              run: npm ci
+
+            # cargo test/check requires tauri::generate_context!() to find a real
+            # frontendDist directory (../dist) at compile time -- a plain `npm
+            # run build` (no Tauri bundling) is enough to satisfy that.
+            - name: Build frontend
+              run: npm run build
+
+            - name: cargo check
+              working-directory: src-tauri
+              run: cargo check --verbose
+
+            - name: Run backend tests
+              working-directory: src-tauri
+              run: cargo test --verbose
+
+    # `backend` is a matrix job, so GitHub posts distinct per-OS check names
+    # (e.g. "backend (windows-latest, windows)") only when it actually runs --
+    # when the whole job is skipped (no src-tauri/** changes), it instead
+    # posts a single unqualified "backend" check. Branch protection can't
+    # require a set of names that shifts shape like that, so this job exists
+    # purely to give required-status-checks one stable name that's correct
+    # either way: skip cleanly when `backend` itself was skipped, and fail if
+    # any matrix leg of a real run didn't succeed.
+    backend-status:
+        needs: [changes, backend]
+        if: always()
+        runs-on: ubuntu-latest
+        steps:
+            - name: Check backend result
+              run: |
+                  if [ "${{ needs.changes.outputs.backend }}" == "true" ] && [ "${{ needs.backend.result }}" != "success" ]; then
+                      echo "backend job did not succeed: ${{ needs.backend.result }}"
+                      exit 1
+                  fi
+
+    # Same rationale as backend-status, but for the (non-matrix) frontend job:
+    # gives required-status-checks a single stable name that is correct
+    # whether frontend files changed or not.
+    frontend-status:
+        needs: [changes, frontend]
+        if: always()
+        runs-on: ubuntu-latest
+        steps:
+            - name: Check frontend result
+              run: |
+                  if [ "${{ needs.changes.outputs.frontend }}" == "true" ] && [ "${{ needs.frontend.result }}" != "success" ]; then
+                      echo "frontend job did not succeed: ${{ needs.frontend.result }}"
+                      exit 1
+                  fi
