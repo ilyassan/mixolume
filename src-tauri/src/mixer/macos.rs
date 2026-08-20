@@ -1053,10 +1053,14 @@ unsafe fn mix_playback_callback(
 /// one clearly-typed, unambiguous coercion site instead of relying on multi-hop inference through
 /// a generic call.
 ///
-/// Callers must manually deref through `CFRetained<X>` first (`as_cf_type(&*retained_value)`) --
-/// `CFRetained<X>` itself only derefs to `X`, not transitively to `CFType`, so `T` here must
-/// already be the concrete CF type (`CFString`, `CFBoolean`, `CFDictionary<..>`, ...), not a
-/// `CFRetained<..>` wrapper around it.
+/// Callers must pass a `&T` where `T` is the concrete CF type itself, never a wrapper around it:
+/// - `CFRetained<X>` values (from e.g. `CFString::from_str`) need one manual deref first --
+///   `as_cf_type(&*retained_value)` -- since `CFRetained<X>` only derefs to `X`, not transitively
+///   to `CFType`.
+/// - `CFBoolean::new(..)` returns `&'static CFBoolean` directly (Core Foundation booleans are
+///   process-wide singletons, not heap-allocated per call) -- pass it as-is, `as_cf_type(value)`,
+///   with no extra `&` (a real, confirmed compile error from mixing this up: `&CFBoolean` doesn't
+///   itself implement `Deref<Target = CFType>`, only `CFBoolean` does).
 fn as_cf_type<T>(value: &T) -> &objc2_core_foundation::CFType
 where
     T: ?Sized + std::ops::Deref<Target = objc2_core_foundation::CFType>,
@@ -1115,7 +1119,7 @@ fn build_aggregate_description(
         let drift_true = CFBoolean::new(true);
         let dict: CFRetained<CFDictionary<CFString, CFType>> = CFDictionary::from_slices(
             &[&*key_sub_tap_uid, &*key_sub_tap_drift],
-            &[as_cf_type(&*uid_cf), as_cf_type(&drift_true)],
+            &[as_cf_type(&*uid_cf), as_cf_type(drift_true)],
         );
         tap_dicts.push(dict);
     }
@@ -1151,10 +1155,10 @@ fn build_aggregate_description(
     let values: Vec<&CFType> = vec![
         as_cf_type(&*aggregate_uid),
         as_cf_type(&*aggregate_name),
-        as_cf_type(&is_private),
-        as_cf_type(&is_stacked),
+        as_cf_type(is_private),
+        as_cf_type(is_stacked),
         as_cf_type(&*output_uid_cf),
-        as_cf_type(&tap_autostart),
+        as_cf_type(tap_autostart),
         as_cf_type(&*sub_device_list),
         as_cf_type(&*tap_list),
     ];
