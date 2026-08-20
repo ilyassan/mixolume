@@ -445,12 +445,31 @@ fn is_hidden_system_bundle(bundle_id: &str) -> bool {
 
 use block2::RcBlock;
 use objc2::rc::Retained;
+// `AnyThread` brings `CATapDescription::alloc()` into scope -- objc2's alloc/init pattern puts
+// `alloc()` on this trait (implemented for every objc2 class) rather than directly on each class,
+// which the compiler doesn't surface unless the trait itself is imported.
+use objc2::AnyThread;
 use objc2_core_audio::{
     self as ca, AudioDeviceIOProcID, AudioObjectID, AudioObjectPropertyAddress, CATapDescription,
     CATapMuteBehavior,
 };
 use objc2_core_audio_types::{AudioBufferList, AudioTimeStamp};
 use objc2_foundation::{NSArray, NSNumber, NSString};
+
+/// Makes an `RcBlock` `Send`/`Sync` so it can live inside `Mutex<Inner>` -- required because
+/// `AudioMixerBackend: Send + Sync`, and `RcBlock` isn't `Send`/`Sync` by default (it wraps a
+/// `NonNull<Block<..>>`, and raw pointers are conservatively never `Send`/`Sync`).
+///
+/// # Safety
+/// Once installed via `AudioDeviceCreateIOProcIDWithBlock`, Rust never calls through this pointer
+/// again -- Core Audio invokes the underlying Objective-C block on its own realtime thread using
+/// ordinary (thread-safe, atomically refcounted) Objective-C block retain/release semantics. The
+/// only Rust-side touch after installation is a single drop, always performed while holding
+/// `Inner`'s mutex (see [`MacosMixerBackend`]), so there's never concurrent access from two Rust
+/// threads at once.
+struct SendSyncBlock<F: ?Sized>(RcBlock<F>);
+unsafe impl<F: ?Sized> Send for SendSyncBlock<F> {}
+unsafe impl<F: ?Sized> Sync for SendSyncBlock<F> {}
 
 fn check_status(status: i32, what: &str) -> Result<(), MixerError> {
     if status == 0 {
@@ -721,7 +740,7 @@ struct CaptureAggregate {
     /// the `RcBlock` itself must outlive `io_proc_id`'s registration.
     #[allow(dead_code)]
     block: Option<
-        RcBlock<
+        SendSyncBlock<
             dyn Fn(
                 *mut AudioTimeStamp,
                 *mut AudioBufferList,
@@ -752,8 +771,15 @@ impl CaptureAggregate {
 
         let mut aggregate_id: AudioObjectID = ca::kAudioObjectUnknown as AudioObjectID;
         let status = unsafe {
+            // `description` is `CFRetained<CFDictionary<CFString, CFType>>`, but
+            // `AudioHardwareCreateAggregateDevice` takes the bare (`Opaque`-parameterized)
+            // `&CFDictionary` -- `.as_ref()` uses `CFDictionary<K, V>: AsRef<CFDictionary>`
+            // (confirmed present in objc2-core-foundation 0.3.2's source alongside the analogous,
+            // already-relied-upon `CFArray<T>: AsRef<CFArray>` impl) rather than a `Deref`
+            // coercion, since going from a concretely-parameterized `CFDictionary<K, V>` to the
+            // bare default-parameterized one isn't a `Deref` relationship.
             ca::AudioHardwareCreateAggregateDevice(
-                &description,
+                description.as_ref(),
                 std::ptr::NonNull::from(&mut aggregate_id),
             )
         };
@@ -797,7 +823,7 @@ impl CaptureAggregate {
             },
         );
 
-        let mut io_proc_id: AudioDeviceIOProcID = std::ptr::null_mut();
+        let mut io_proc_id: AudioDeviceIOProcID = None;
         let status = unsafe {
             ca::AudioDeviceCreateIOProcIDWithBlock(
                 std::ptr::NonNull::from(&mut io_proc_id),
@@ -812,7 +838,7 @@ impl CaptureAggregate {
         check_status(status, "AudioDeviceStart (capture aggregate)")?;
 
         self.io_proc_id = Some(io_proc_id);
-        self.block = Some(block);
+        self.block = Some(SendSyncBlock(block));
         Ok(())
     }
 }
@@ -912,7 +938,7 @@ struct PlaybackTap {
     scratch: Arc<Scratch>,
     #[allow(dead_code)]
     block: Option<
-        RcBlock<
+        SendSyncBlock<
             dyn Fn(
                 *mut AudioTimeStamp,
                 *mut AudioBufferList,
@@ -954,7 +980,7 @@ impl PlaybackTap {
             },
         );
 
-        let mut io_proc_id: AudioDeviceIOProcID = std::ptr::null_mut();
+        let mut io_proc_id: AudioDeviceIOProcID = None;
         let status = unsafe {
             ca::AudioDeviceCreateIOProcIDWithBlock(
                 std::ptr::NonNull::from(&mut io_proc_id),
@@ -969,7 +995,7 @@ impl PlaybackTap {
         check_status(status, "AudioDeviceStart (playback)")?;
 
         self.io_proc_id = Some(io_proc_id);
-        self.block = Some(block);
+        self.block = Some(SendSyncBlock(block));
         Ok(())
     }
 }
@@ -1019,20 +1045,47 @@ unsafe fn mix_playback_callback(
     }
 }
 
+/// Coerce a reference to any concrete Core Foundation wrapper down to `&CFType`, the common root
+/// type every CF wrapper `Deref`s to (per `objc2_core_foundation::CFType`'s own doc comment: "All
+/// Core Foundation types Deref to this type"). A plain function rather than an inline `as` cast --
+/// `as` does not perform `Deref`-based coercion, only genuine coercion sites do (fn args/return,
+/// `let` with a type annotation) -- so this gives every heterogeneous dictionary/array value below
+/// one clearly-typed, unambiguous coercion site instead of relying on multi-hop inference through
+/// a generic call.
+///
+/// Callers must manually deref through `CFRetained<X>` first (`as_cf_type(&*retained_value)`) --
+/// `CFRetained<X>` itself only derefs to `X`, not transitively to `CFType`, so `T` here must
+/// already be the concrete CF type (`CFString`, `CFBoolean`, `CFDictionary<..>`, ...), not a
+/// `CFRetained<..>` wrapper around it.
+fn as_cf_type<T>(value: &T) -> &objc2_core_foundation::CFType
+where
+    T: ?Sized + std::ops::Deref<Target = objc2_core_foundation::CFType>,
+{
+    value
+}
+
 /// Build the `kAudioAggregateDeviceUIDKey`/etc. description dictionary Core Audio expects for
-/// `AudioHardwareCreateAggregateDevice`. See risk item 3 in the module doc comment: the exact
-/// `objc2-core-foundation` 0.3.2 dictionary/array-building call shape used here (`CFDictionary::
-/// from_slices`, `CFType`-erasing each heterogeneous value via `.as_opaque()`/`Into<CFRetained<
-/// CFType>>` or similar) was fetched via `docs.rs` in this session but the fetch tool's summary of
-/// that page was internally inconsistent about whether `CFDictionary`/`CFArray` are generic
-/// (`from_slices<K, V>`) or a fixed non-generic opaque type -- i.e. this is a *lower*-confidence
-/// area than the `objc2-core-audio` signatures cited elsewhere in this file, which came back
-/// consistent across multiple independent fetches. Treat every call in this function as needing a
-/// first-compile check, not just a smoke test.
+/// `AudioHardwareCreateAggregateDevice`. See risk item 3 in the module doc comment.
+///
+/// `objc2_core_foundation::CFDictionary`/`CFArray` default their generic params to `Opaque` (a
+/// marker with no `Type`/`PartialEq`/`Hash` impls) when left unparameterized -- confirmed the hard
+/// way, by a real compile attempt failing with "the trait bound `Opaque: Type` is not satisfied"
+/// on every bare `CFDictionary`/`CFArray` use below. Every dictionary/array built in this function
+/// is therefore explicitly parameterized as `CFDictionary<CFString, CFType>` / `CFArray<CFType>`
+/// (`CFType` as the uniform, type-erased value type for what's semantically a heterogeneous
+/// `[String: Any]`-shaped dictionary), never left as bare `CFDictionary`/`CFArray`.
 fn build_aggregate_description(
     output_device_uid: &str,
     taps: &[ProcessTap],
-) -> Result<objc2_core_foundation::CFRetained<objc2_core_foundation::CFDictionary>, MixerError> {
+) -> Result<
+    objc2_core_foundation::CFRetained<
+        objc2_core_foundation::CFDictionary<
+            objc2_core_foundation::CFString,
+            objc2_core_foundation::CFType,
+        >,
+    >,
+    MixerError,
+> {
     use objc2_core_foundation::{CFArray, CFBoolean, CFDictionary, CFRetained, CFString, CFType};
 
     let aggregate_uid = CFString::from_str(&format!("com.mixolume.aggregate.{}", uuid_v4_ish()));
@@ -1041,16 +1094,17 @@ fn build_aggregate_description(
 
     // kAudioAggregateDeviceSubDeviceListKey: [ { kAudioSubDeviceUIDKey: output_device_uid } ]
     let key_sub_device_uid = ca_cfstring(ca::kAudioSubDeviceUIDKey);
-    let sub_device_dict: CFRetained<CFDictionary> =
-        CFDictionary::from_slices(&[&*key_sub_device_uid], &[&*output_uid_cf.as_opaque()]);
-    let sub_device_list: CFRetained<CFArray> =
-        CFArray::from_slice(&[&*sub_device_dict.as_opaque()]);
+    let sub_device_dict: CFRetained<CFDictionary<CFString, CFType>> =
+        CFDictionary::from_slices(&[&*key_sub_device_uid], &[as_cf_type(&*output_uid_cf)]);
+    let sub_device_list: CFRetained<CFArray<CFType>> =
+        CFArray::from_objects(&[as_cf_type(&*sub_device_dict)]);
 
     // kAudioAggregateDeviceTapListKey: one { kAudioSubTapUIDKey, kAudioSubTapDriftCompensationKey }
     // dict per currently-active tap.
     let key_sub_tap_uid = ca_cfstring(ca::kAudioSubTapUIDKey);
     let key_sub_tap_drift = ca_cfstring(ca::kAudioSubTapDriftCompensationKey);
-    let mut tap_dicts: Vec<CFRetained<CFDictionary>> = Vec::with_capacity(taps.len());
+    let mut tap_dicts: Vec<CFRetained<CFDictionary<CFString, CFType>>> =
+        Vec::with_capacity(taps.len());
     for tap in taps {
         let Some(uid) = tap.uid() else {
             return Err(MixerError::Platform(
@@ -1059,14 +1113,14 @@ fn build_aggregate_description(
         };
         let uid_cf = CFString::from_str(&uid);
         let drift_true = CFBoolean::new(true);
-        let dict: CFRetained<CFDictionary> = CFDictionary::from_slices(
+        let dict: CFRetained<CFDictionary<CFString, CFType>> = CFDictionary::from_slices(
             &[&*key_sub_tap_uid, &*key_sub_tap_drift],
-            &[&*uid_cf.as_opaque(), &*drift_true.as_opaque()],
+            &[as_cf_type(&*uid_cf), as_cf_type(&drift_true)],
         );
         tap_dicts.push(dict);
     }
-    let tap_dict_refs: Vec<&CFType> = tap_dicts.iter().map(|d| &*d.as_opaque()).collect();
-    let tap_list: CFRetained<CFArray> = CFArray::from_slice(&tap_dict_refs);
+    let tap_dict_refs: Vec<&CFType> = tap_dicts.iter().map(|d| as_cf_type(&**d)).collect();
+    let tap_list: CFRetained<CFArray<CFType>> = CFArray::from_objects(&tap_dict_refs);
 
     let is_private = CFBoolean::new(true);
     let is_stacked = CFBoolean::new(false);
@@ -1095,27 +1149,32 @@ fn build_aggregate_description(
         &key_tap_list,
     ];
     let values: Vec<&CFType> = vec![
-        &*aggregate_uid.as_opaque(),
-        &*aggregate_name.as_opaque(),
-        &*is_private.as_opaque(),
-        &*is_stacked.as_opaque(),
-        &*output_uid_cf.as_opaque(),
-        &*tap_autostart.as_opaque(),
-        &*sub_device_list.as_opaque(),
-        &*tap_list.as_opaque(),
+        as_cf_type(&*aggregate_uid),
+        as_cf_type(&*aggregate_name),
+        as_cf_type(&is_private),
+        as_cf_type(&is_stacked),
+        as_cf_type(&*output_uid_cf),
+        as_cf_type(&tap_autostart),
+        as_cf_type(&*sub_device_list),
+        as_cf_type(&*tap_list),
     ];
 
     Ok(CFDictionary::from_slices(&keys, &values))
 }
 
-/// Wrap one of `objc2-core-audio`'s `&'static str`-ish key constants as a `CFString`.
+/// Wrap one of `objc2-core-audio`'s HAL property/dictionary key constants as a `CFString`.
 ///
-/// RISK: this assumes `objc2-core-audio`'s `kAudio*Key` constants (e.g.
-/// `kAudioAggregateDeviceUIDKey`) are exposed as Rust `&str`/`CFString` statics, matching how
-/// AudioCap/sonicflow use them as plain Swift `String` dictionary keys. If the real crate instead
-/// exposes them only as raw C string pointers or a different type, this helper's signature is the
-/// one line that needs adjusting, not the overall per-key dictionary shape above.
-fn ca_cfstring(key: &str) -> objc2_core_foundation::CFRetained<objc2_core_foundation::CFString> {
+/// A real compile confirmed these constants (e.g. `kAudioAggregateDeviceUIDKey`) are exposed as
+/// `&'static CStr`, not `&str` -- corrected from this file's original guess. Core Audio's own key
+/// strings are always plain ASCII, so the `to_str()` conversion is infallible in practice; it's
+/// still asserted rather than silently swallowed so a genuinely malformed constant would fail loud
+/// instead of silently producing a wrong dictionary key.
+fn ca_cfstring(
+    key: &std::ffi::CStr,
+) -> objc2_core_foundation::CFRetained<objc2_core_foundation::CFString> {
+    let key = key
+        .to_str()
+        .expect("Core Audio HAL property key constants are always valid ASCII/UTF-8");
     objc2_core_foundation::CFString::from_str(key)
 }
 
