@@ -296,20 +296,24 @@ stance rather than reinventing one:
 
 ## 10. Notes accumulated during the initial autonomous build session (2026-08-20)
 
-- **macOS licensing decision (made, not a placeholder):** `kyleneideck/BackgroundMusic` is
-  **GPLv2**. Its §2(b) copyleft extends to "any work that... contains or is derived from" it.
-  Decision taken: Mixolume does **not** vendor or fork BGMDriver/BGMApp source. It treats an
-  independently-installed, unmodified BGMDriver as a system dependency and talks to it only via
-  Core Audio's public `AudioObjectGetPropertyData`/`SetPropertyData` HAL properties (GPL §2's
-  "mere aggregation" carve-out). See `src-tauri/macos-driver/README.md` for the full rationale
-  and an **open question that still needs the maintainer's call**: whether Mixolume also needs
-  the user to separately run BGMApp (which currently owns default-device switching + passthrough
-  audio), or whether Mixolume should implement that role itself.
-- Per-app volume *is* exposed as a real HAL property on the BGM virtual device:
-  `kAudioDeviceCustomPropertyAppVolumes` (fourCC `'apvs'`), confirmed from BackgroundMusic's own
-  `SharedSource/BGM_Types.h`. No per-app mute bit exists on the wire — mute is synthesized
-  locally by caching the pre-mute volume. `macos.rs` is written against this but is unverified —
-  no Mac was available in this build session to compile/run it.
+- **macOS approach (superseded once, see below):** the first pass built the macOS backend against
+  an independently-installed `kyleneideck/BackgroundMusic` (GPLv2) `BGMDriver`, reasoning that
+  talking to its public HAL property (`kAudioDeviceCustomPropertyAppVolumes`, fourCC `'apvs'`) from
+  outside was GPL §2 "mere aggregation," not a derivative work. That design is **no longer used**
+  — kept here only as build history. It also left unresolved whether Mixolume needed the user to
+  separately run BGMApp (which owned default-device switching + passthrough audio) or had to
+  reimplement that role itself.
+- **Current macOS approach:** Apple's own **Core Audio Process Tap API**
+  (`CATapDescription`/`AudioHardwareCreateProcessTap`, macOS 14.2+, matured by 14.4) replaces the
+  BackgroundMusic dependency entirely — confirmed against two real, working MIT-licensed reference
+  implementations (`altuzar/sonicflow`, `insidegui/AudioCap`), not guessed from memory. This is a
+  public Apple framework: no GPL exposure, no third-party driver install, no admin privileges, no
+  `coreaudiod` restart, and the audio-routing question is fully solved (a private capture aggregate
+  taps each app with a real mute of its normal output path, bridged via a lock-free ring buffer to
+  a second IOProc on the real output device) rather than left open. Trade-off: macOS 14.2+ only,
+  no fallback for older systems. See `src-tauri/macos-audio/README.md` for the full architecture,
+  citations, and what a Mac-equipped contributor needs to verify first — `macos.rs` is real,
+  carefully-written code but has never been compiled; no Mac was available in this build session.
 - Reference project `C:\Users\ianida\personal\ytaudiobar` (same author, Tauri v2 + React 19 +
   Tailwind v4 + Zustand) supplied the tray-icon-toggle pattern, the CI paths-filter fan-in-job
   pattern (to avoid the exact required-check trap this document warns about above), and general

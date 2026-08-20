@@ -10,11 +10,12 @@ has `pavucontrol`. Nothing ships one polished app that does this on **all three*
 codebase — that's the gap Mixolume fills.
 
 > **Status:** early, actively-developed. The Windows backend is real and functional (WASAPI
-> session enumeration + per-app volume/mute). The Linux backend (PulseAudio via `pactl`) is
-> implemented but has only been syntax/unit-test verified on this machine, not run against a
-> real PulseAudio install yet. The macOS backend is a documented, unverified scaffold — see
-> [`src-tauri/macos-driver/README.md`](src-tauri/macos-driver/README.md) for why, and for a real
-> open licensing/product question that needs a decision before macOS support is finished.
+> session enumeration + per-app volume/mute), verified live against real audio on a dev machine.
+> The Linux backend (PulseAudio via `pactl`) is implemented but has only been syntax/unit-test
+> verified, not run against a real PulseAudio install yet. The macOS backend is written against
+> Apple's Core Audio Process Tap API but entirely unverified — no Mac was available during
+> development. See [`src-tauri/macos-audio/README.md`](src-tauri/macos-audio/README.md) for the
+> full architecture and what a Mac-equipped contributor needs to check first.
 
 ## How it works
 
@@ -22,11 +23,13 @@ codebase — that's the gap Mixolume fills.
   (`IAudioSessionManager2` → `ISimpleAudioVolume`). No driver, no elevated privileges.
 - **Linux:** shells out to `pactl` to read/set PulseAudio (or PipeWire's `pipewire-pulse`
   compat shim) sink-input volumes. No elevated privileges.
-- **macOS:** has no public per-app volume API at all. Mixolume talks to an independently
-  installed [BackgroundMusic](https://github.com/kyleneideck/BackgroundMusic) `BGMDriver`
-  virtual audio device via the public Core Audio HAL property `kAudioDeviceCustomPropertyAppVolumes`
-  — Mixolume does not vendor or fork BackgroundMusic's (GPLv2) source. Full rationale in
-  [`src-tauri/macos-driver/README.md`](src-tauri/macos-driver/README.md).
+- **macOS:** has no public per-app volume API at all, so Mixolume uses Apple's Core Audio
+  **Process Tap** API (`CATapDescription` / `AudioHardwareCreateProcessTap`, macOS 14.2+) to tap
+  each app's audio with a real mute of its normal output path, mix in a per-app gain, and feed the
+  result back to the real output device via a private aggregate device + lock-free ring buffer.
+  No third-party driver, no admin install, no GPL dependency — just a one-time system permission
+  prompt. Full rationale, citations, and version-floor trade-offs in
+  [`src-tauri/macos-audio/README.md`](src-tauri/macos-audio/README.md).
 
 One Tauri app, one repo, one React UI shared across all three platforms — see
 [`PLAN.md`](PLAN.md) for the full architecture writeup.
@@ -58,6 +61,5 @@ Mixolume does not collect any analytics in its current state. If that changes, t
 
 ## License
 
-[MIT](LICENSE) for Mixolume's own code. macOS support depends on a separately-installed,
-unmodified GPLv2 component (BackgroundMusic) that Mixolume does not redistribute — see
-[`src-tauri/macos-driver/README.md`](src-tauri/macos-driver/README.md).
+[MIT](LICENSE) for Mixolume's own code. The macOS backend uses only public Apple frameworks —
+no third-party or GPL-licensed component involved.
