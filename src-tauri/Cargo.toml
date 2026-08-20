@@ -54,9 +54,24 @@ windows = { version = "0.58", features = [
 regex = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-core-foundation = "0.9"
-core-foundation-sys = "0.8"
-coreaudio-sys = "0.2"
+# Core Audio Process Tap API backend (see src-tauri/src/mixer/macos.rs's module doc comment and
+# src-tauri/macos-audio/README.md for the full rationale). CATapDescription and the
+# AudioHardwareCreateProcessTap/AudioHardwareCreateAggregateDevice/AudioDeviceCreateIOProcIDWithBlock
+# functions were confirmed (via docs.rs, 2026-08-20) to live in `objc2-core-audio`, NOT
+# `objc2-audio-toolbox` as originally assumed -- so `objc2-audio-toolbox` is deliberately not a
+# dependency here. Exact versions below were the `max_stable_version` crates.io reported for each
+# crate at research time; re-check before bumping since this whole file is unverified/uncompiled.
+objc2 = "0.6"
+# NSNumber has no feature of its own -- it's defined inside the `NSValue` feature's generated
+# module (confirmed by downloading objc2-foundation 0.3.2's source and checking
+# src/generated/NSValue.rs directly, after `cargo check` on Windows caught this: Cargo resolves
+# the full dependency graph including other-OS target deps even when not building for that OS, so
+# a bad macOS-only feature name broke resolution here too).
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSString", "NSValue", "NSObject"] }
+objc2-core-audio = { version = "0.3", features = ["AudioHardware"] }
+objc2-core-audio-types = "0.3"
+objc2-core-foundation = "0.3"
+block2 = "0.6"
 
 [dev-dependencies]
 tokio-test = "0.4"
