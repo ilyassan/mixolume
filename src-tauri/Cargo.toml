@@ -12,7 +12,13 @@ edition = "2021"
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "mixolume_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# `cdylib` (needed for Tauri mobile targets) is deliberately omitted: this project targets
+# desktop only (see PLAN.md), and on this machine's GNU/mingw Rust host the huge symbol table
+# windows-rs + tauri pull in overflows mingw ld's export-ordinal table ("export ordinal too
+# large") when building the cdylib. `staticlib`/`rlib` don't hit this since they don't emit a
+# DLL export table. If mobile support is ever added, re-add "cdylib" and build with the MSVC
+# toolchain instead of GNU on Windows.
+crate-type = ["staticlib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
