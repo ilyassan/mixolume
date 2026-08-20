@@ -223,8 +223,11 @@ impl AudioMixerBackend for WindowsMixerBackend {
         let mut sessions = Vec::new();
         unsafe {
             for control in controls {
-                // The session mixed for system notification sounds isn't a real "app" for our UI.
-                if control.IsSystemSoundsSession().is_ok() {
+                // `IsSystemSoundsSession` returns a raw HRESULT: S_OK (0) means "yes", S_FALSE
+                // (1) means "no" -- both are non-negative, so `.is_ok()` (which only checks
+                // "not a failure code") is true for EVERY session and would skip all of them.
+                // We must compare against S_OK specifically.
+                if control.IsSystemSoundsSession() == windows::Win32::Foundation::S_OK {
                     continue;
                 }
 
@@ -291,6 +294,26 @@ impl AudioMixerBackend for WindowsMixerBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Manual smoke test against the real WASAPI session list on whatever machine runs it --
+    /// not a unit test (no fixture, depends on real audio actually playing), so it's `#[ignore]`d
+    /// by default. Run with something audible playing: `cargo test -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn manual_list_real_sessions() {
+        let backend = WindowsMixerBackend::new();
+        let sessions = backend.list_sessions().expect("list_sessions should succeed");
+        for s in &sessions {
+            println!(
+                "{} (id={}, volume={:.2}, muted={}, active={})",
+                s.display_name, s.id, s.volume, s.muted, s.is_active
+            );
+        }
+        assert!(
+            !sessions.is_empty(),
+            "expected at least one audio session -- make sure something is actually playing sound"
+        );
+    }
 
     #[test]
     fn session_id_round_trips_through_pid_parsing() {
