@@ -1,12 +1,9 @@
 # macOS audio strategy: Core Audio Process Tap API (no third-party driver)
 
-This directory replaces `src-tauri/macos-driver/` (superseded -- see below). It documents the
-macOS backend (`src-tauri/src/mixer/macos.rs`), which uses Apple's public **Core Audio Process Tap
-API** directly. There is no HAL driver, no third-party dependency to install, and no GPL exposure.
-
-**`src-tauri/macos-driver/README.md` is superseded by this file and should be deleted.** (This
-research/build session did not have a file-delete tool available; deleting that path is a
-one-line follow-up for whoever next touches this repo with full tooling.)
+This directory replaces the now-deleted `src-tauri/macos-driver/` (see git history for that
+earlier design). It documents the macOS backend (`src-tauri/src/mixer/macos.rs`), which uses
+Apple's public **Core Audio Process Tap API** directly. There is no HAL driver, no third-party
+dependency to install, and no GPL exposure.
 
 ## Why the previous approach was replaced
 
