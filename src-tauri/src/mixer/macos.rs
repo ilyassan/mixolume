@@ -1438,7 +1438,21 @@ impl Default for MacosMixerBackend {
 
 impl AudioMixerBackend for MacosMixerBackend {
     fn list_sessions(&self) -> Result<Vec<AppSession>, MixerError> {
-        let processes = list_audio_processes()?;
+        // Exclude our own process before it ever reaches `reconcile_engine`. Confirmed live on
+        // real hardware: once `PlaybackTap` genuinely writes audio into the real output device,
+        // Core Audio reports Mixolume's own process as `is_running_output = true` -- which,
+        // filtered only at UI-display time (see `is_hidden_system_bundle` below) rather than
+        // here, meant the engine kept tapping itself. That changed the active-process set on
+        // (almost) every single poll tick, forcing a full teardown+rebuild roughly once a
+        // second, which never gave the freshly-created playback IOProc a stable window to
+        // actually run -- explaining total silence/glitching despite capture working fine.
+        // Filtering by our own PID (not just bundle id) is the robust check: it doesn't depend
+        // on `read_process_bundle_id`'s CFString bridging succeeding.
+        let own_pid = std::process::id() as i32;
+        let processes: Vec<AudioProcessInfo> = list_audio_processes()?
+            .into_iter()
+            .filter(|p| p.pid != own_pid)
+            .collect();
         let mut inner = self.inner.lock().unwrap();
 
         // Ensure every currently-audible process has a persistent gain_state entry (freshly-seen

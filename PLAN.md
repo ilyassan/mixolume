@@ -345,14 +345,67 @@ running the compiled code, not by reading it.
   single `CGPreflightScreenCaptureAccess`/`CGRequestScreenCaptureAccess` check (Apple's public API
   for this exact "Screen & System Audio Recording" TCC category) before `TapEngine::new` does
   anything else.
-- **Apparent "permission doesn't persist" / black window, real cause found:** after the fix above,
-  a *single* clean install (one copy in `/Applications`, fresh TCC state) showed exactly one
-  dialog, granted correctly, and rendered the real UI after the quit-and-reopen macOS requires
-  post-grant. The repeated-prompting and black-window symptoms only reproduced when *multiple*
-  copies of the app (same bundle identifier, different builds) existed on disk at once — an
-  artifact of this session's own iterative rebuild-and-retest cycle, not a code bug, but a real
-  risk for any real user updating without removing the previous copy first. This is a direct
-  consequence of shipping unsigned/ad-hoc-signed builds (no Apple Developer ID configured in this
-  repo yet) — proper code signing + notarization would remove the whole class of problem. Until
-  that's set up, release notes now explicitly warn users to delete the old copy before installing
-  an update.
+- **"Permission doesn't persist" / black window -- multi-copy confusion was one real cause, not
+  the only one.** First pass: a single clean install (one copy in `/Applications`, fresh TCC
+  state, installed via `cp -R`+`xattr -cr`) showed exactly one dialog and rendered correctly,
+  which looked like the whole story -- multiple same-bundle-identifier copies on disk (an
+  artifact of this session's own rebuild/retest cycle) confusing TCC. That's real and still worth
+  avoiding. But it was an *incomplete* diagnosis: `cp -R`+`xattr -cr` never gives the app a
+  `com.apple.quarantine` attribute in the first place, which means that test never actually
+  exercised **Gatekeeper App Translocation** -- the real mechanism a genuine user hits every time
+  they mount the DMG and drag `Mixolume.app` to `/Applications` via Finder (confirmed live: even a
+  proper Finder-mediated copy carries quarantine, and `ps` showed the running process executing
+  from a randomized `/private/var/folders/.../AppTranslocation/<uuid>/d/mixolume.app` path, not
+  `/Applications/mixolume.app`). Contrary to some folklore, moving an app out of a mounted DMG via
+  Finder does **not** disable translocation -- that only holds for same-volume moves (e.g.
+  `~/Downloads` to `/Applications`); a DMG-to-`/Applications` copy is inherently cross-volume, so
+  translocation triggers on every fresh install regardless of *how* the user drags it in. Once
+  translocated, the app's on-disk path is different (and re-randomized) on every single launch,
+  which is why permission looked like it "didn't persist" and the WKWebView reliably rendered
+  black -- both are downstream of running from that constantly-shifting sandboxed path. Confirmed
+  fix: stripping quarantine (`xattr -cr`) **before the app's first launch** keeps it running from
+  its real installed path and both symptoms disappear. This is a direct consequence of shipping
+  unsigned/ad-hoc-signed builds (no Apple Developer ID configured in this repo yet) -- proper code
+  signing + notarization removes translocation entirely, which is the real, durable fix. Until
+  that's set up, users need to manually strip quarantine after every fresh install; release notes
+  document this, though it's a genuinely poor first-run experience for anyone not comfortable with
+  Terminal.
+- **A real, distinct bug found the same session: Mixolume tapped itself.** `is_hidden_system_bundle`
+  filtering was only applied when building the UI's session list, never before
+  `Self::reconcile_engine`, which decides what to actually tap. Once `PlaybackTap` genuinely wrote
+  real audio into the output device, Core Audio reported Mixolume's own process as
+  `is_running_output = true`, so the engine tapped itself too -- confirmed live via a temporary
+  debug build (`[playback-debug]`/`[probe2]` instrumentation, since removed) showing the engine
+  destroying and rebuilding itself roughly once per second, indefinitely, which never gave a
+  freshly-created playback IOProc a stable window to run even once. Fixed by filtering
+  `list_audio_processes()`'s result by `std::process::id()` in `list_sessions` before it ever
+  reaches `reconcile_engine`, not just before display. Verified fixed: with the filter in place,
+  the engine builds exactly once and stays stable for a real, continuously-playing app
+  (`YTAudioBar`) rather than churning.
+- **Still open after the above two fixes: the playback IOProc can fail to ever receive a single
+  callback, even with a stable (non-churning) engine, capture actively writing to the ring buffer,
+  and `AudioDeviceCreateIOProcIDWithBlock`/`AudioDeviceStart` both reporting success (status 0) on
+  a verified-correct device (confirmed real `BuiltInSpeakerDevice`, sane 512-frame buffer / 44100Hz
+  sample rate -- not a stale/reused `AudioObjectID`).** Ruled out: stale `coreaudiod` state (a
+  fresh restart, confirmed via new PID, didn't fix it), orphaned aggregate devices from earlier
+  killed test runs (a standalone Swift diagnostic enumerating `kAudioHardwarePropertyDevices`
+  found none), and a sequencing/architecture mismatch against the reference implementation (a
+  side-by-side fetch of sonicflow's actual `AggregateOutputDevice.swift`/`PlaybackDevice.swift`/
+  `AudioGainController.swift` from GitHub confirmed our Rust port matches its structure and
+  call-ordering closely). The one concrete lead: `log show --predicate 'process == "coreaudiod"'`
+  during a real Mixolume session showed `com.apple.audioanalytics:carc` overload-diagnostic
+  messages with `"cause": ClientTimeout`, `"overload_type": ClientTimeoutStart`, and
+  `"num_continuous_silent_io_cycles": 63999` for the real output device specifically (not the
+  private aggregate, which never showed this) -- i.e. Core Audio's own realtime-scheduling watchdog
+  considers our registered client on the *real hardware device* unable to meet its deadline and
+  is silencing it, despite every API call we make reporting success. This smells like a realtime
+  thread / `AudioWorkgroup` participation issue specific to registering a direct IOProc on a
+  shared physical device (as opposed to a private aggregate device the app fully owns, which
+  works reliably) -- worth investigating `kAudioDevicePropertyIOThreadOSWorkgroup` /
+  `os_workgroup_join` next, though it's unconfirmed whether that's actually required for
+  block-based (`AudioDeviceCreateIOProcIDWithBlock`) registration or only for the raw
+  function-pointer API. Also unconfirmed: whether this is stable, reproducible OS/hardware
+  behavior or itself an artifact of this same session's ~10+ aggregate device create/destroy
+  cycles (a full reboot, not just a `coreaudiod` restart, was the next step to rule that out, but
+  wasn't done this session). A Mac-equipped contributor picking this up should start with a clean
+  reboot before assuming the workgroup theory is the real fix.
