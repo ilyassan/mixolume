@@ -318,3 +318,41 @@ stance rather than reinventing one:
   Tailwind v4 + Zustand) supplied the tray-icon-toggle pattern, the CI paths-filter fan-in-job
   pattern (to avoid the exact required-check trap this document warns about above), and general
   stack versions — reused deliberately rather than reinvented.
+
+## 11. macOS bugs found and fixed on real hardware (2026-08-21)
+
+A Mac became available this session; the two items below were only discoverable by actually
+running the compiled code, not by reading it.
+
+- **Crash on every launch, real audio never worked:** `AudioDeviceCreateIOProcIDWithBlock`'s block
+  argument was built as `&block as *const _ as *mut _` (a pointer to the `RcBlock<F>` wrapper
+  struct on the Rust stack, not to the heap-allocated `Block<F>`/Objective-C block object it
+  wraps) — Core Audio then dereferenced garbage and the process aborted with an ObjC "Attempt to
+  use unknown class" fatal, every time. Fixed with `RcBlock::as_ptr(&block)`, block2's own
+  documented accessor for the real pointer; this also surfaced a second latent bug (the IOProc
+  closure signatures used raw `*mut` pointers where the real generated binding expects
+  `NonNull<..>`) that the old unchecked `as` cast had been silently papering over. Verified
+  end-to-end afterward: real audio detected, mixed, and played back correctly.
+- **One system permission dialog per already-open app, and total audio silence while running:**
+  `TapEngine::new` tapped every already-audible process in one tight synchronous loop on first
+  launch; each authorization-triggering `AudioHardwareCreateProcessTap` call fired before the
+  previous one's TCC decision had propagated, producing N queued dialogs instead of one. Worse,
+  each attempt that failed on a still-unauthorized process destroyed every tap already created in
+  that attempt and retried from scratch on the next 700ms poll tick — so for the whole window a
+  user was clicking through N dialogs, taps were being created and destroyed in a loop, each
+  `mutedWhenTapped`-muting its process with no stable reinjection path ever formed, which is why
+  *all* system audio went silent until the app quit. Fixed by gating all tap creation behind a
+  single `CGPreflightScreenCaptureAccess`/`CGRequestScreenCaptureAccess` check (Apple's public API
+  for this exact "Screen & System Audio Recording" TCC category) before `TapEngine::new` does
+  anything else.
+- **Apparent "permission doesn't persist" / black window, real cause found:** after the fix above,
+  a *single* clean install (one copy in `/Applications`, fresh TCC state) showed exactly one
+  dialog, granted correctly, and rendered the real UI after the quit-and-reopen macOS requires
+  post-grant. The repeated-prompting and black-window symptoms only reproduced when *multiple*
+  copies of the app (same bundle identifier, different builds) existed on disk at once — an
+  artifact of this session's own iterative rebuild-and-retest cycle, not a code bug, but a real
+  risk for any real user updating without removing the previous copy first. This is a direct
+  consequence of shipping unsigned/ad-hoc-signed builds (no Apple Developer ID configured in this
+  repo yet) — proper code signing + notarization would remove the whole class of problem. Until
+  that's set up, release notes now explicitly warn users to delete the old copy before installing
+  an update.
