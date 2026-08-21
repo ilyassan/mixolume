@@ -1195,6 +1195,54 @@ fn uuid_v4_ish() -> String {
     format!("{nanos:x}")
 }
 
+/// Gates all process-tap creation behind a single, explicit, app-lifetime-once permission
+/// request instead of letting each [`ProcessTap::new`] call implicitly trigger its own OS prompt.
+///
+/// Confirmed live on real hardware: without this gate, launching with N already-audible apps
+/// open produced N separate sequential system permission dialogs (one per app) instead of one.
+/// The module doc comment's cited reference (sonicflow) says no explicit preflight is
+/// *required* -- the OS prompts automatically on the first `AudioHardwareCreateProcessTap` call
+/// -- but that claim was evidently only tested with taps created one at a time over real time,
+/// not in the tight batch loop [`TapEngine::new`] uses to tap every already-running app at once
+/// on first launch. Firing that many authorization-triggering calls within milliseconds of each
+/// other, before the first one's decision has propagated through the TCC daemon, is what
+/// produces the queued-up separate prompts.
+///
+/// `CGPreflightScreenCaptureAccess`/`CGRequestScreenCaptureAccess` (CoreGraphics.framework) are
+/// Apple's public, documented API for exactly this permission category -- as of macOS
+/// Sonoma/Sequoia, system audio capture via Core Audio process taps shares the same "Screen &
+/// System Audio Recording" TCC bucket as screen recording, which is why the screen-recording API
+/// is the correct thing to preflight/request here even though we're not capturing video.
+mod screen_capture_permission {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGPreflightScreenCaptureAccess() -> bool;
+        fn CGRequestScreenCaptureAccess() -> bool;
+    }
+
+    static REQUEST_SENT: AtomicBool = AtomicBool::new(false);
+
+    /// Returns `true` if permission is already granted. If not, triggers the OS prompt at most
+    /// once per process lifetime (later calls just recheck status without prompting again) and
+    /// returns `false` -- callers must back off and retry later rather than proceeding to create
+    /// any taps, since doing so per-process is exactly what caused the multi-prompt bug.
+    pub(super) fn ensure_granted() -> bool {
+        // SAFETY: both are argument-less functions returning a plain Boolean; documented public
+        // Apple API, safe to call from any thread.
+        if unsafe { CGPreflightScreenCaptureAccess() } {
+            return true;
+        }
+        if !REQUEST_SENT.swap(true, Ordering::SeqCst) {
+            unsafe {
+                CGRequestScreenCaptureAccess();
+            }
+        }
+        false
+    }
+}
+
 /// The live tap+aggregate+playback rig for whatever set of processes is currently producing
 /// output. Torn down and rebuilt (via `Drop`, then a fresh [`TapEngine::new`]) whenever that set
 /// changes -- Core Audio has no documented way to add/remove a tap from a running aggregate
@@ -1215,6 +1263,12 @@ impl TapEngine {
     fn new(
         active: &[(&AudioProcessInfo, String, f32)], // (process, session_id, initial_gain)
     ) -> Result<Self, MixerError> {
+        if !screen_capture_permission::ensure_granted() {
+            return Err(MixerError::Platform(
+                "waiting for screen & system audio recording permission".to_string(),
+            ));
+        }
+
         let system_object: AudioObjectID = ca::kAudioObjectSystemObject as AudioObjectID;
         let output_device_id: AudioObjectID =
             unsafe { read_property(system_object, ca::kAudioHardwarePropertyDefaultOutputDevice)? };
