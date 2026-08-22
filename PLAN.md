@@ -438,27 +438,33 @@ running the compiled code, not by reading it.
   `scale_factor()`, not used as raw physical pixels). `on_window_event` +
   `WindowEvent::Focused(false)` hides the window on focus loss, matching Tauri's own documented
   example for exactly this "native popover" pattern.
-- **Explicitly NOT shipped: a fully undecorated window (no title bar / traffic-light buttons).**
-  This was attempted at real length and reverted after confirming live, multiple times, that it
-  doesn't work in this app:
-  - `decorations: false` alone -> solid black WKWebView content (window chrome gone, but content
-    never renders).
-  - Adding `transparent: true` (the CSS in `global.css` already assumes a transparent
-    `html`/`body` with an opaque `#root` -- this was clearly the intended original design,
-    just never turned on) -- still black.
-  - Adding an explicit `"backgroundColor": [0,0,0,0]` (Tauri's own documented mechanism for
-    setting window *and* webview background together) -- still black.
-  - Pinning `tauri`/`tauri-runtime-wry`/`wry` to the exact versions (2.10.3 / 2.10.1 / 0.54.4)
-    used successfully by a sibling app on this same machine (`ytaudiobar-tauri`, confirmed
-    working daily) with an *identical* `decorations:false`+`transparent:true`+`shadow:false`
-    config -- ran into a genuine cross-crate trait-interface incompatibility between
-    `tauri-runtime-wry` 2.10.1 and the newer `tauri-runtime` 2.11.3 that came along for the ride
-    (`WebviewDispatch` missing `eval_script_with_callback`, a `Sync` bound mismatch on
-    `with_new_window_req_handler`) -- cherry-picking individual transitive versions with `cargo
-    update --precise` produces an inconsistent graph; matching a sibling project's *exact*
-    resolved dependency tree isn't as simple as pinning the top-level version.
-  - Reverted to `decorations: true` / `shadow: true` (the previously-verified-working state)
-    rather than ship a broken window -- confirmed working again afterward. This remains a real,
-    open gap between what the user asked for (a fully native, chrome-free menu-bar popover) and
-    what's shipped; worth a dedicated investigation with more time, ideally starting from a
-    minimal repro rather than inside the full app.
+- **Fully undecorated window (no title bar / traffic-light buttons): now shipped, resolved
+  2026-08-22.** Originally documented above as an open gap after `decorations: false` +
+  `transparent: true` repeatedly produced a solid black WKWebView content area with several fixes
+  attempted (adding `transparent: true`, an explicit `backgroundColor`, pinning
+  `tauri`/`tauri-runtime-wry`/`wry` to a sibling app's exact versions -- none of it helped, and the
+  version-pinning attempt broke the build outright via a cross-crate trait incompatibility).
+  - **Real root cause: unrelated to `decorations`/`transparent` at all.** A `window.open_devtools()`
+    call added in `setup()` (to get real WebKit console output while diagnosing this exact issue)
+    was itself breaking the WKWebView's initial content paint in the *bundled* release build --
+    opening devtools before/during the page's first load left the content layer never composited,
+    while the window's own CSS background (`#root`'s `bg-background`) still painted normally. That
+    made every earlier black-screen screenshot, taken with devtools auto-opening, look identical
+    regardless of the `decorations`/`transparent` values being tested -- the real variable under
+    test was masked by the diagnostic tool itself.
+  - Confirmed via pixel-sampling screenshots (`screencapture -x -l<windowID>` targeting the app's
+    own window specifically, bypassing the devtools panel entirely): with `open_devtools()` still
+    present, the content area was *exactly* one flat color end to end (proven by
+    `PIL.Image.getcolors()` returning a single distinct RGB value) even for an unconditional,
+    inline-styled debug `<p>` element -- meaning nothing was compositing above the base background,
+    not even literally-red text. Removing the `open_devtools()` call alone (keeping
+    `decorations:false`+`transparent:true`) immediately fixed it -- content, icons, sliders all
+    rendered correctly on the next rebuild.
+  - Shipped config: `decorations: false`, `transparent: true`, `shadow: false` (`tauri.conf.json`),
+    matching the CSS in `global.css` that already assumed a transparent `html`/`body` with an
+    opaque `#root` -- that design intent is now actually realized.
+  - Lesson for future diagnosis in this app: don't add `tauri`'s `devtools` feature /
+    `open_devtools()` back as a first move on a bundled-build-only rendering bug -- it's a plausible
+    cause of exactly this symptom, not just a neutral diagnostic. If devtools is needed again,
+    open it manually after the window is confirmed showing content, or gate it behind a delay/user
+    action rather than calling it unconditionally in `setup()`.
