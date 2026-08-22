@@ -1,15 +1,37 @@
 mod mixer;
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use mixer::{AppSession, AudioMixerBackend, MixerError};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State};
 
 struct MixerState {
     backend: Arc<dyn AudioMixerBackend>,
+}
+
+/// How long after a programmatic `show()` the hide-on-blur handler should ignore a `Focused
+/// (false)` event. Both the OS itself (bringing a freshly-created/reordered window forward) and
+/// our own repaint nudge (a deliberate resize, see [`nudge_repaint`]) can emit a transient
+/// focus-loss blip right around show time; without this guard either one can immediately hide the
+/// window we just showed, which is exactly the "sometimes works, sometimes doesn't" flakiness
+/// this was added to fix.
+const POST_SHOW_BLUR_GUARD: Duration = Duration::from_millis(400);
+
+#[derive(Default)]
+struct WindowShowState {
+    /// Set every time [`show_main_window_near_tray`] actually shows the window; read by the
+    /// hide-on-blur handler to ignore spurious blur events shortly after.
+    last_shown_at: Mutex<Option<Instant>>,
+    /// The last successfully tray-anchored physical position. `TrayIconEvent::Click`'s `rect`
+    /// (or the tray-by-id lookup the menu item uses) occasionally comes back `None` on a given
+    /// click even when the user did click the real tray icon -- when that happens we reuse this
+    /// instead of leaving the window at whatever position it last happened to have (which, for a
+    /// window that's never been successfully positioned yet, is `tauri.conf.json`'s unset
+    /// default, nowhere near the tray).
+    last_tray_position: Mutex<Option<PhysicalPosition<f64>>>,
 }
 
 fn mixer_error_to_string(err: MixerError) -> String {
@@ -69,29 +91,49 @@ const TRAY_ICON_ID: &str = "mixolume-tray";
 
 /// Moves the main window so it appears directly under the tray icon, like a native menu-bar
 /// app (Control Center, Wi-Fi/Bluetooth menu extras, etc.) rather than wherever the window
-/// manager last happened to place it.
+/// manager last happened to place it. Returns the computed position so the caller can cache it
+/// as the fallback for the next click, in case that one can't get a tray rect at all.
 ///
 /// `tray_rect`'s `position`/`size` are DPI-aware (`tauri::Position`/`Size`, not raw physical
 /// pixels) -- converted via the window's own `scale_factor()` before arithmetic, since mixing a
 /// logical tray-icon rect with a physical window size would misplace the window on any non-1x
 /// display.
-fn position_window_under_tray(window: &tauri::WebviewWindow, tray_rect: tauri::Rect) {
-    let Ok(scale) = window.scale_factor() else {
-        return;
-    };
-    let Ok(window_size) = window.outer_size() else {
-        return;
-    };
+fn position_window_under_tray(
+    window: &tauri::WebviewWindow,
+    tray_rect: tauri::Rect,
+) -> Option<PhysicalPosition<f64>> {
+    let scale = window.scale_factor().ok()?;
+    let window_size = window.outer_size().ok()?;
     let icon_pos = tray_rect.position.to_physical::<f64>(scale);
     let icon_size = tray_rect.size.to_physical::<f64>(scale);
 
     let x = icon_pos.x + (icon_size.width / 2.0) - (window_size.width as f64 / 2.0);
     // A few points of gap below the icon, same idea as a native menu-bar dropdown.
     let y = icon_pos.y + icon_size.height + 4.0;
-    let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+    let position = PhysicalPosition::new(x, y);
+    let _ = window.set_position(position);
+    Some(position)
 }
 
-fn show_main_window_near_tray(app: &AppHandle, tray_rect: Option<tauri::Rect>) {
+/// Forces WKWebView to actually repaint after becoming visible, working around an intermittent
+/// wry/WKWebView issue on macOS where a transparent window's content doesn't reliably recomposite
+/// right after an `orderOut`/`orderFront` (hide/show) cycle -- it can keep showing stale or empty
+/// content until *something* forces a real relayout. A 1-point resize-and-restore is a standard,
+/// imperceptible workaround for this class of bug (see tauri-apps/wry#1524).
+fn nudge_repaint(window: &tauri::WebviewWindow) {
+    let Ok(size) = window.outer_size() else {
+        return;
+    };
+    let nudged = tauri::PhysicalSize::new(size.width.saturating_sub(1), size.height);
+    let _ = window.set_size(tauri::Size::Physical(nudged));
+    let _ = window.set_size(tauri::Size::Physical(size));
+}
+
+fn show_main_window_near_tray(
+    app: &AppHandle,
+    show_state: &WindowShowState,
+    tray_rect: Option<tauri::Rect>,
+) {
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
@@ -103,11 +145,26 @@ fn show_main_window_near_tray(app: &AppHandle, tray_rect: Option<tauri::Rect>) {
         app.tray_by_id(TRAY_ICON_ID)
             .and_then(|tray| tray.rect().ok().flatten())
     });
-    if let Some(rect) = rect {
-        position_window_under_tray(&window, rect);
+    match rect {
+        Some(rect) => {
+            if let Some(position) = position_window_under_tray(&window, rect) {
+                *show_state.last_tray_position.lock().unwrap() = Some(position);
+            }
+        }
+        // The tray click definitely happened (we're in this function at all), but this
+        // particular event/lookup didn't carry a usable rect -- reuse the last position we
+        // successfully computed rather than leaving the window whatever position it last had
+        // (which, before the first successful positioning, is nowhere near the tray).
+        None => {
+            if let Some(position) = *show_state.last_tray_position.lock().unwrap() {
+                let _ = window.set_position(position);
+            }
+        }
     }
     let _ = window.show();
     let _ = window.set_focus();
+    *show_state.last_shown_at.lock().unwrap() = Some(Instant::now());
+    nudge_repaint(&window);
 }
 
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
@@ -120,7 +177,10 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "quit" => app.exit(0),
-            "show" => show_main_window_near_tray(app, None),
+            "show" => {
+                let show_state = app.state::<WindowShowState>();
+                show_main_window_near_tray(app, &show_state, None);
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -131,7 +191,9 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                 ..
             } = event
             {
-                show_main_window_near_tray(tray.app_handle(), Some(rect));
+                let app = tray.app_handle();
+                let show_state = app.state::<WindowShowState>();
+                show_main_window_near_tray(app, &show_state, Some(rect));
             }
         });
 
@@ -153,7 +215,15 @@ pub fn run() {
         .on_window_event(|window, event| {
             if window.label() == "main" {
                 if let tauri::WindowEvent::Focused(false) = event {
-                    let _ = window.hide();
+                    let show_state = window.state::<WindowShowState>();
+                    let recently_shown = show_state
+                        .last_shown_at
+                        .lock()
+                        .unwrap()
+                        .is_some_and(|at| at.elapsed() < POST_SHOW_BLUR_GUARD);
+                    if !recently_shown {
+                        let _ = window.hide();
+                    }
                 }
             }
         })
@@ -167,6 +237,20 @@ pub fn run() {
             app.handle()
                 .set_activation_policy(tauri::ActivationPolicy::Accessory)?;
 
+            // Without this, macOS's Automatic Termination silently kills the whole app after a
+            // while: it deliberately keeps its main window hidden between tray clicks (that's the
+            // entire point of a menu-bar popover), and macOS reads "accessory-policy app with no
+            // visible windows" as an idle background process safe to reap. Confirmed live via
+            // Console logs -- "AutomaticTermination: No windows open yet" followed by a clean
+            // voluntary exit (code 0, no crash) a short while later, with no user action at all.
+            #[cfg(target_os = "macos")]
+            objc2_foundation::NSProcessInfo::processInfo().disableAutomaticTermination(
+                &objc2_foundation::NSString::from_str(
+                    "Menu-bar app must keep running with its window hidden",
+                ),
+            );
+
+            app.manage(WindowShowState::default());
             let backend: Arc<dyn AudioMixerBackend> = Arc::from(mixer::new_platform_backend());
             app.manage(MixerState {
                 backend: backend.clone(),

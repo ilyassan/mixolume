@@ -24,7 +24,16 @@ crate-type = ["staticlib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# macos-private-api: required for tauri.conf.json's window "transparent":true to actually take
+# effect on macOS -- without it, wry's own "transparent" Cargo feature (which disables WKWebView's
+# `drawsBackground` and sets `NSWindow.isOpaque = false`) never compiles in, so the window keeps
+# an opaque white backing underneath. Confirmed by reading tauri-runtime-wry 2.11.4's own
+# Cargo.toml directly: `wry/transparent` is only pulled in via this feature (bundled with
+# `wry/fullscreen`), not by tauri.conf.json's "transparent" value alone. Diagnosed after CSS-level
+# rounded corners looked right everywhere except the corner cutouts, which sampled as fully opaque
+# white (alpha=255) rather than transparent -- exactly what a missing `drawsBackground` override
+# would produce. Also requires "macOSPrivateApi": true in tauri.conf.json's `app` config.
+tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -67,7 +76,12 @@ objc2 = "0.6"
 # src/generated/NSValue.rs directly, after `cargo check` on Windows caught this: Cargo resolves
 # the full dependency graph including other-OS target deps even when not building for that OS, so
 # a bad macOS-only feature name broke resolution here too).
-objc2-foundation = { version = "0.3", features = ["NSArray", "NSString", "NSValue", "NSObject"] }
+# NSProcessInfo added for disableAutomaticTermination -- without it, macOS's Automatic
+# Termination silently kills this app (confirmed live via Console logs: "AutomaticTermination:
+# No windows open yet" followed minutes later by a clean voluntary exit, code 0, no crash) since
+# it's an accessory-policy menu-bar app that deliberately keeps its window hidden between tray
+# clicks, which macOS reads as "idle background app, safe to reap".
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSString", "NSValue", "NSObject", "NSProcessInfo"] }
 objc2-core-audio = { version = "0.3", features = ["AudioHardware"] }
 objc2-core-audio-types = "0.3"
 objc2-core-foundation = "0.3"
@@ -90,6 +104,14 @@ objc2-app-kit = { version = "0.3", features = [
     "NSBitmapImageRep",
 ] }
 libc = "0.2"
+# For walking up a process's parent chain when resolving app names -- some audio-producing
+# processes (e.g. Chromium/Brave's ".helper" renderer subprocesses) have no usable
+# NSRunningApplication.localizedName of their own, but their parent (the actual browser process)
+# does. `pidinfo::<bsd_info::BSDInfo>` wraps `proc_pidinfo(PROC_PIDTBSDINFO)`, whose
+# `proc_bsdinfo.pbi_ppid` field is the parent pid -- confirmed via the crate's own generated
+# bindings (docs_rs/osx_libproc_bindings.rs) since `libc` itself doesn't expose Darwin's private
+# `kinfo_proc` layout.
+libproc = "0.14"
 
 [dev-dependencies]
 tokio-test = "0.4"

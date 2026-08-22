@@ -450,23 +450,61 @@ use objc2_core_audio::{
 use objc2_core_audio_types::{AudioBufferList, AudioTimeStamp};
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString};
 
+/// How many parent-process hops [`resolve_named_running_app`] will follow before giving up.
+/// Chromium-family helper processes are typically one hop from the browser's main process; this
+/// is generous headroom for deeper subprocess trees without risking a long walk on a pathological
+/// process ancestry.
+const MAX_PARENT_WALK_DEPTH: u8 = 8;
+
+/// `NSRunningApplication` for `pid` if it has a usable `localizedName` itself; otherwise walks up
+/// its parent-process chain looking for the nearest ancestor that does.
+///
+/// Some audio-producing processes have no display identity of their own -- e.g. Chromium/Brave's
+/// `*.helper` renderer/GPU subprocesses, which show up as raw bundle ids (`com.brave.Browser.
+/// helper`) rather than anything a user would recognize -- while their parent (the actual browser
+/// process the user launched) does. Walking up to that parent and borrowing its name/icon matches
+/// what the user actually thinks of as "the app playing audio".
+fn resolve_named_running_app(pid: i32) -> Option<Retained<NSRunningApplication>> {
+    let mut current_pid = pid;
+    for _ in 0..MAX_PARENT_WALK_DEPTH {
+        let running_app =
+            NSRunningApplication::runningApplicationWithProcessIdentifier(current_pid as libc::pid_t);
+        let has_name = running_app
+            .as_ref()
+            .and_then(|app| app.localizedName())
+            .is_some_and(|name| !name.to_string().is_empty());
+        if has_name {
+            return running_app;
+        }
+
+        let Ok(info) = libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(current_pid, 0)
+        else {
+            return None;
+        };
+        let parent_pid = info.pbi_ppid as i32;
+        // pid 1 is launchd; ppid 0/negative or no progress means we've hit the top with nothing.
+        if parent_pid <= 1 || parent_pid == current_pid {
+            return None;
+        }
+        current_pid = parent_pid;
+    }
+    None
+}
+
 /// Real, human-readable app name (e.g. "YTAudioBar", not the raw `com.ytaudiobar.app` bundle id)
 /// plus a PNG-encoded app icon, for a tapped process. Both come from the same
-/// `NSRunningApplication` lookup, so this resolves them together rather than making two separate
-/// objc2 round-trips per process per poll tick.
+/// `NSRunningApplication` (possibly a parent process's, via [`resolve_named_running_app`]), so
+/// this resolves them together rather than making two separate objc2 round-trips per process per
+/// poll tick.
 ///
 /// `NSRunningApplication.localizedName`/`.icon` are the same name/icon macOS itself shows in the
 /// Dock and Force Quit window, and are available for any regular running app regardless of
 /// whether it also has a `kAudioProcessPropertyBundleID` (some audio-producing helper processes
-/// don't). Name falls back to the bundle id, then to `pid <N>`, if the process can't be resolved
-/// (e.g. it already exited); icon falls back to `None` (the frontend already renders a
-/// placeholder for that -- see `SessionIcon.tsx`).
+/// don't). Name falls back to the bundle id, then to `pid <N>`, if neither the process nor any
+/// ancestor can be resolved (e.g. it already exited); icon falls back to `None` (the frontend
+/// already renders a placeholder for that -- see `SessionIcon.tsx`).
 fn resolve_app_info(pid: i32, bundle_id: Option<&str>) -> (String, Option<Vec<u8>>) {
-    // `runningApplicationWithProcessIdentifier` is a safe objc2 wrapper (no `unsafe` needed --
-    // confirmed by a real "unnecessary `unsafe` block" compiler warning once wrapped in one): it
-    // returns `None` for an unknown/exited pid rather than a dangling pointer.
-    let running_app =
-        NSRunningApplication::runningApplicationWithProcessIdentifier(pid as libc::pid_t);
+    let running_app = resolve_named_running_app(pid);
 
     let name = running_app
         .as_ref()

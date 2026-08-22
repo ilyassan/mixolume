@@ -87,12 +87,16 @@
   }
 
   body {
-    @apply text-foreground h-full m-0;
+    /* Window itself has no native chrome (decorations:false) to round its corners for us. Both
+       body and #root need to clip to the rounded shape -- rounding #root alone leaves the gap
+       between the window's rectangular edge and #root's rounded edge filled by body's untrimmed
+       rectangle, which shows through as a white/opaque corner bleed instead of transparency. */
+    @apply text-foreground h-full m-0 overflow-hidden rounded-xl;
     background: transparent;
   }
 
   #root {
-    @apply bg-background h-full;
+    @apply bg-background h-full overflow-hidden rounded-xl;
   }
 
   /* Hide scrollbars while keeping scroll functionality. */

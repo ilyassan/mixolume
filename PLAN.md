@@ -468,3 +468,58 @@ running the compiled code, not by reading it.
     cause of exactly this symptom, not just a neutral diagnostic. If devtools is needed again,
     open it manually after the window is confirmed showing content, or gate it behind a delay/user
     action rather than calling it unconditionally in `setup()`.
+
+## 13. Follow-up fixes after shipping the native window look (2026-08-22)
+
+- **Real window transparency requires `macos-private-api`, not just `tauri.conf.json`'s
+  `"transparent": true`.** Section 12 shipped with a real bug hiding in it: the rounded corners
+  looked right everywhere except the corner cutouts, which sampled as fully opaque white
+  (alpha=255) instead of transparent. Root cause, confirmed by reading `tauri-runtime-wry`
+  2.11.4's own `Cargo.toml`: `wry`'s entire transparency implementation (disabling WKWebView's
+  private `drawsBackground` key, setting `NSWindow.isOpaque = false`) is gated behind wry's own
+  `transparent` Cargo feature, which is *only* pulled in via tauri's `macos-private-api` feature
+  (bundled with `wry/fullscreen`) -- `tauri.conf.json`'s `"transparent": true` value alone doesn't
+  enable it. Fixed by adding `"macos-private-api"` to the `tauri` dependency's features in
+  `Cargo.toml` and `"macOSPrivateApi": true` under `app` in `tauri.conf.json`. Also rounded `body`
+  (not just `#root`) with matching `border-radius`/`overflow:hidden` in `global.css`, matching the
+  working reference app (`ytaudiobar-tauri`) -- rounding `#root` alone left a gap between the
+  window's rectangular edge and `#root`'s rounded edge where `body`'s untrimmed rectangle showed
+  through.
+- **App names for helper subprocesses (e.g. Chromium/Brave's `*.helper` renderer processes)** now
+  resolve by walking up the parent-process chain (`libproc::proc_pid::pidinfo::<BSDInfo>`'s
+  `pbi_ppid`, since `libc` doesn't expose Darwin's private `kinfo_proc` layout) until an ancestor
+  with a real `NSRunningApplication.localizedName` is found, instead of showing the raw bundle id
+  (`com.brave.Browser.helper`). See `resolve_named_running_app` in `macos.rs`.
+- **Tray-click show/hide was intermittently flaky: sometimes a black/empty window, sometimes
+  wrong position, sometimes the whole app silently gone.** Root cause turned out to be three
+  separate, compounding issues, only found by actually reading Console logs and process state
+  instead of guessing from screenshots alone:
+  1. **macOS Automatic Termination was silently killing the app.** Confirmed live: Console showed
+     `AutomaticTermination: No windows open yet` followed, a short while later, by a clean
+     voluntary exit (code 0, no crash, no signal) with zero user action. An accessory-policy app
+     that deliberately keeps its window hidden between tray clicks looks exactly like an idle
+     background process macOS is allowed to reap. Fixed by calling
+     `NSProcessInfo.processInfo().disableAutomaticTermination(reason:)` in `setup()` (needs
+     objc2-foundation's `NSProcessInfo` feature).
+  2. **Two instances running at once.** A second copy launched directly from
+     `target/release/bundle/macos/mixolume.app` (outside `/Applications`) was running alongside
+     the installed one -- two tray icons, two windows, both racing for the same Core Audio taps.
+     Always launch/test only the `/Applications` copy; never run the build-output binary directly
+     while another instance may already be running.
+  3. **An intermittent WKWebView repaint bug on the hide/show cycle itself**, separate from the
+     open_devtools issue in section 12 -- a transparent window's content doesn't always
+     recomposite reliably after `orderOut`/`orderFront` (tauri-apps/wry#1524 describes the same
+     class of bug, though its repro is GTK-specific). Worked around with a 1-point
+     resize-and-restore right after `show()` (`nudge_repaint` in `lib.rs`), guarded by a short
+     grace period on the hide-on-blur handler (`POST_SHOW_BLUR_GUARD`) so the nudge's own resize
+     doesn't trigger a spurious focus-loss blur that immediately hides the window it just showed.
+     Also cached the last successfully-computed tray-anchored position (`WindowShowState
+     ::last_tray_position`) as a fallback for the (occasional) click where `TrayIconEvent::Click`'s
+     `rect` comes back `None`, instead of leaving the window at whatever position it last had.
+- **Process isn't literally required to fix "not working" reports by editing code.** More than
+  once during this investigation, the user reported the app broken, and it started working again
+  on its own after enough real time passed -- without a rebuild or restart -- purely because
+  enough poll cycles / Core Audio state settling had happened in the meantime. Before assuming a
+  code change fixed something, check whether the same already-running process would have recovered
+  anyway; the reliable diagnostic signal is Console logs and process/window state at the exact
+  moment of the report, not "I changed something and now it's fine."
