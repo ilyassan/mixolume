@@ -72,6 +72,24 @@ objc2-core-audio = { version = "0.3", features = ["AudioHardware"] }
 objc2-core-audio-types = "0.3"
 objc2-core-foundation = "0.3"
 block2 = "0.6"
+# For resolving a tapped process's real display name (e.g. "YTAudioBar" instead of the raw
+# "com.ytaudiobar.app" bundle id) via NSRunningApplication.localizedName -- confirmed present in
+# objc2-app-kit 0.3.2's generated bindings (src/generated/NSRunningApplication.rs).
+# `runningApplicationWithProcessIdentifier` is itself gated behind objc2-app-kit's own `libc`
+# feature (confirmed by reading that file's `#[cfg(feature = "libc")]` directly), separate from
+# just depending on the `libc` crate ourselves for the `libc::pid_t` parameter type.
+#
+# NSImage/NSBitmapImageRep added for icon resolution: NSRunningApplication.icon() -> NSImage ->
+# TIFFRepresentation() -> NSBitmapImageRep -> representationUsingType_properties(.PNG) -> PNG
+# bytes. Confirmed each step's real signature by reading the generated bindings directly rather
+# than assuming (e.g. it's `TIFFRepresentation`, all-caps TIFF, not `tiffRepresentation`).
+objc2-app-kit = { version = "0.3", features = [
+    "NSRunningApplication",
+    "libc",
+    "NSImage",
+    "NSBitmapImageRep",
+] }
+libc = "0.2"
 
 [dev-dependencies]
 tokio-test = "0.4"

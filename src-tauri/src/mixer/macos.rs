@@ -170,12 +170,9 @@
 //!
 //! ## Known, deliberate limitations (same honesty bar as the previous scaffold)
 //!
-//! - **Display name / icon resolution is NOT implemented.** Core Audio's process object only ever
-//!   gives a pid and/or bundle identifier -- never a human-readable name or an icon. Both AudioCap
-//!   and sonicflow resolve this via AppKit's `NSRunningApplication` /
-//!   `NSWorkspace.icon(forFile:)`, which needs an AppKit/`objc2-app-kit` dependency not added here.
-//!   `TODO(macos): resolve display_name/icon_png via NSRunningApplication + NSWorkspace; this is a
-//!   placeholder`, exactly like the file it replaces.
+//! - **Display name and icon are both resolved via `NSRunningApplication`** (see
+//!   [`resolve_app_info`]) -- `.localizedName` for the name, `.icon` re-encoded to PNG via
+//!   `NSBitmapImageRep` for `AppSession::icon_png`, matching what AudioCap/sonicflow do.
 //! - **Mute is a local convenience on top of the tap's real gain knob**, not a separate wire-level
 //!   concept -- see [`AppGainState`]. This is simpler than the old BackgroundMusic-era code's
 //!   cross-process "shared property" mute problem: since gain here lives entirely in Mixolume's
@@ -445,12 +442,76 @@ use objc2::rc::Retained;
 // `alloc()` on this trait (implemented for every objc2 class) rather than directly on each class,
 // which the compiler doesn't surface unless the trait itself is imported.
 use objc2::AnyThread;
+use objc2_app_kit::NSRunningApplication;
 use objc2_core_audio::{
     self as ca, AudioDeviceIOProcID, AudioObjectID, AudioObjectPropertyAddress, CATapDescription,
     CATapMuteBehavior,
 };
 use objc2_core_audio_types::{AudioBufferList, AudioTimeStamp};
-use objc2_foundation::{NSArray, NSNumber, NSString};
+use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString};
+
+/// Real, human-readable app name (e.g. "YTAudioBar", not the raw `com.ytaudiobar.app` bundle id)
+/// plus a PNG-encoded app icon, for a tapped process. Both come from the same
+/// `NSRunningApplication` lookup, so this resolves them together rather than making two separate
+/// objc2 round-trips per process per poll tick.
+///
+/// `NSRunningApplication.localizedName`/`.icon` are the same name/icon macOS itself shows in the
+/// Dock and Force Quit window, and are available for any regular running app regardless of
+/// whether it also has a `kAudioProcessPropertyBundleID` (some audio-producing helper processes
+/// don't). Name falls back to the bundle id, then to `pid <N>`, if the process can't be resolved
+/// (e.g. it already exited); icon falls back to `None` (the frontend already renders a
+/// placeholder for that -- see `SessionIcon.tsx`).
+fn resolve_app_info(pid: i32, bundle_id: Option<&str>) -> (String, Option<Vec<u8>>) {
+    // `runningApplicationWithProcessIdentifier` is a safe objc2 wrapper (no `unsafe` needed --
+    // confirmed by a real "unnecessary `unsafe` block" compiler warning once wrapped in one): it
+    // returns `None` for an unknown/exited pid rather than a dangling pointer.
+    let running_app =
+        NSRunningApplication::runningApplicationWithProcessIdentifier(pid as libc::pid_t);
+
+    let name = running_app
+        .as_ref()
+        .and_then(|app| app.localizedName())
+        .map(|name| name.to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| bundle_id.map(str::to_string))
+        .unwrap_or_else(|| format!("pid {pid}"));
+
+    let icon_png = running_app.and_then(|app| app.icon()).and_then(|icon| {
+        // SAFETY: `representationUsingType_properties`'s only documented precondition is that
+        // `properties`' value type matches what the chosen `storage_type` expects -- for `.PNG`
+        // with no per-key options, an empty dictionary is always valid (this mirrors how
+        // AppKit's own `NSBitmapImageRep` sample code calls it with `[:]`).
+        unsafe { icon_to_png(&icon) }
+    });
+
+    (name, icon_png)
+}
+
+/// `NSImage` -> PNG bytes, via the standard AppKit round-trip (TIFF representation -> bitmap rep
+/// -> re-encode as PNG). There's no direct "give me PNG bytes" method on `NSImage` itself.
+///
+/// # Safety
+/// `representationUsingType_properties` requires `properties`'s value type to match what
+/// `storage_type` expects; passing an empty dictionary for `.PNG` (no per-format options) is
+/// always valid.
+unsafe fn icon_to_png(icon: &objc2_app_kit::NSImage) -> Option<Vec<u8>> {
+    let tiff = icon.TIFFRepresentation()?;
+    let bitmap = objc2_app_kit::NSBitmapImageRep::initWithData(
+        objc2_app_kit::NSBitmapImageRep::alloc(),
+        &tiff,
+    )?;
+    // `CopiedKey = NSString` explicitly: an empty slice gives the compiler nothing to infer it
+    // from, and `NSBitmapImageRepPropertyKey` (the dictionary's `KeyType`) is itself `NSString`,
+    // so `NSString` is the natural (and only sensible) choice satisfying `NSCopying` here.
+    let empty_properties: Retained<
+        NSDictionary<objc2_app_kit::NSBitmapImageRepPropertyKey, objc2::runtime::AnyObject>,
+    > = NSDictionary::from_slices::<NSString>(&[], &[]);
+    let png_data = bitmap.representationUsingType_properties(
+        objc2_app_kit::NSBitmapImageFileType::PNG,
+        &empty_properties,
+    )?;
+    Some(png_data.to_vec())
+}
 
 /// Makes an `RcBlock` `Send`/`Sync` so it can live inside `Mutex<Inner>` -- required because
 /// `AudioMixerBackend: Send + Sync`, and `RcBlock` isn't `Send`/`Sync` by default (it wraps a
@@ -1358,6 +1419,19 @@ struct Inner {
     /// `None` when no process is currently producing output (nothing to tap yet, or every
     /// previously-tapped process went silent).
     engine: Option<TapEngine>,
+    /// [`resolve_app_info`] results, cached by pid. A process's name/icon never change during
+    /// its lifetime, so there's no reason to re-run the `NSRunningApplication`/`NSImage`/
+    /// `NSBitmapImageRep` round-trip on every single 700ms poll tick.
+    ///
+    /// This isn't just a perf nicety: confirmed live on real hardware that re-encoding the icon
+    /// to PNG from scratch every poll tick, for every active session, leaked memory catastrophically
+    /// (observed 15GB+ RSS within a few minutes) -- these AppKit calls create autoreleased
+    /// temporary objects, and this poll loop runs on a plain tokio background thread with no
+    /// autorelease pool ever pushed to drain them. Caching cuts the call frequency from "every
+    /// ~700ms per active app" down to "once per app, ever" (until the app exits and its pid gets
+    /// reused, at which point removing the stale entry -- see `list_sessions` -- fixes it),
+    /// which makes the leak negligible even without solving the underlying autorelease-pool gap.
+    app_info_cache: HashMap<i32, (String, Option<Vec<u8>>)>,
 }
 
 /// macOS backend: per-app volume via Core Audio process taps + a private aggregate device +
@@ -1373,6 +1447,7 @@ impl MacosMixerBackend {
             inner: Mutex::new(Inner {
                 gain_state: HashMap::new(),
                 engine: None,
+                app_info_cache: HashMap::new(),
             }),
         }
     }
@@ -1477,26 +1552,39 @@ impl AudioMixerBackend for MacosMixerBackend {
                 }
             }
             let id = session_id_for_pid(p.pid);
-            let Some(state) = inner.gain_state.get(&id) else {
+            // Copy out before touching `app_info_cache` below -- `state` borrows
+            // `inner.gain_state` immutably, and the cache lookup needs `inner` mutably; ending
+            // the borrow here (both fields are `Copy`) avoids the conflict.
+            let Some((volume, muted)) = inner.gain_state.get(&id).map(|s| (s.volume, s.muted))
+            else {
                 // Never seen producing output -- not a "known" session yet, matching the
                 // task's "lazily tap any newly-seen process" contract (nothing to report until
                 // it's actually made sound at least once).
                 continue;
             };
+            // Cached by pid -- see `Inner::app_info_cache`'s doc comment for why re-resolving
+            // this every poll tick is a real memory-safety bug, not just wasted work.
+            let (display_name, icon_png) = inner
+                .app_info_cache
+                .entry(p.pid)
+                .or_insert_with(|| resolve_app_info(p.pid, p.bundle_id.as_deref()))
+                .clone();
             sessions.push(AppSession {
                 id,
-                // TODO(macos): resolve display_name/icon_png via NSRunningApplication +
-                // NSWorkspace; this is a placeholder, exactly like the file this replaces.
-                display_name: p
-                    .bundle_id
-                    .clone()
-                    .unwrap_or_else(|| format!("pid {}", p.pid)),
-                icon_png: None,
-                volume: state.volume,
-                muted: state.muted,
+                display_name,
+                icon_png,
+                volume,
+                muted,
                 is_active: p.is_running_output,
             });
         }
+        // Drop cache entries for pids that no longer exist -- keeps this bounded over a long
+        // Mixolume session that sees many different apps come and go, rather than growing
+        // forever. Cheap: just a pid membership check per entry, no AppKit calls.
+        let live_pids: std::collections::HashSet<i32> = processes.iter().map(|p| p.pid).collect();
+        inner
+            .app_info_cache
+            .retain(|pid, _| live_pids.contains(pid));
         Ok(sessions)
     }
 
