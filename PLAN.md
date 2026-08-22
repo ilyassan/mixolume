@@ -409,3 +409,56 @@ running the compiled code, not by reading it.
   cycles (a full reboot, not just a `coreaudiod` restart, was the next step to rule that out, but
   wasn't done this session). A Mac-equipped contributor picking this up should start with a clean
   reboot before assuming the workgroup theory is the real fix.
+
+## 12. Menu-bar-native UI pass, and a real memory leak found along the way (2026-08-22)
+
+- **Session list now shows real app names/icons, not raw bundle ids.** `resolve_app_info` (in
+  `macos.rs`) resolves both via `NSRunningApplication` -- `.localizedName()` for the name,
+  `.icon()` re-encoded to PNG via `NSImage::TIFFRepresentation` -> `NSBitmapImageRep` ->
+  `representationUsingType_properties(.PNG)` for the icon (there's no direct "give me PNG bytes"
+  call on `NSImage`). The frontend (`SessionIcon.tsx`/`iconUrl.ts`) already had full support for
+  `iconPng` waiting unused -- it just needed the backend to populate it.
+- **Real bug found via this feature, not hypothetically: re-resolving name+icon on every single
+  700ms poll tick, for every active session, leaked memory catastrophically** -- observed 15GB+
+  RSS within a few minutes on real hardware, discovered while chasing an unrelated "window shows
+  black" report. `NSRunningApplication`/`NSImage`/`NSBitmapImageRep` calls create autoreleased
+  temporary objects, and the poll loop runs on a plain `tauri::async_runtime::spawn` (tokio)
+  background thread that never pushes an autorelease pool to drain them. Fixed by caching results
+  by pid in `Inner::app_info_cache` -- a process's name/icon don't change during its lifetime, so
+  there's no reason to re-resolve every tick -- with stale entries pruned once their pid exits.
+  The underlying "no autorelease pool on this thread" gap is still there in principle; caching
+  just makes the call frequency low enough (once per process, ever) that it's negligible. A more
+  thorough fix would wrap the AppKit calls in an actual `@autoreleasepool`-equivalent.
+- **Dock hidden via `AppHandle::set_activation_policy(ActivationPolicy::Accessory)`** in `setup()`
+  -- confirmed via `osascript`/System Events (`background only` process query), not just assumed
+  from the API docs.
+- **Tray-anchored window positioning + hide-on-blur.** Clicking the tray icon positions the
+  window directly under it (via `TrayIconEvent::Click`'s `rect` / `TrayIcon::rect()`, a
+  `tauri::Rect` with DPI-aware `Position`/`Size` -- converted through the window's own
+  `scale_factor()`, not used as raw physical pixels). `on_window_event` +
+  `WindowEvent::Focused(false)` hides the window on focus loss, matching Tauri's own documented
+  example for exactly this "native popover" pattern.
+- **Explicitly NOT shipped: a fully undecorated window (no title bar / traffic-light buttons).**
+  This was attempted at real length and reverted after confirming live, multiple times, that it
+  doesn't work in this app:
+  - `decorations: false` alone -> solid black WKWebView content (window chrome gone, but content
+    never renders).
+  - Adding `transparent: true` (the CSS in `global.css` already assumes a transparent
+    `html`/`body` with an opaque `#root` -- this was clearly the intended original design,
+    just never turned on) -- still black.
+  - Adding an explicit `"backgroundColor": [0,0,0,0]` (Tauri's own documented mechanism for
+    setting window *and* webview background together) -- still black.
+  - Pinning `tauri`/`tauri-runtime-wry`/`wry` to the exact versions (2.10.3 / 2.10.1 / 0.54.4)
+    used successfully by a sibling app on this same machine (`ytaudiobar-tauri`, confirmed
+    working daily) with an *identical* `decorations:false`+`transparent:true`+`shadow:false`
+    config -- ran into a genuine cross-crate trait-interface incompatibility between
+    `tauri-runtime-wry` 2.10.1 and the newer `tauri-runtime` 2.11.3 that came along for the ride
+    (`WebviewDispatch` missing `eval_script_with_callback`, a `Sync` bound mismatch on
+    `with_new_window_req_handler`) -- cherry-picking individual transitive versions with `cargo
+    update --precise` produces an inconsistent graph; matching a sibling project's *exact*
+    resolved dependency tree isn't as simple as pinning the top-level version.
+  - Reverted to `decorations: true` / `shadow: true` (the previously-verified-working state)
+    rather than ship a broken window -- confirmed working again afterward. This remains a real,
+    open gap between what the user asked for (a fully native, chrome-free menu-bar popover) and
+    what's shipped; worth a dedicated investigation with more time, ideally starting from a
+    minimal repro rather than inside the full app.
