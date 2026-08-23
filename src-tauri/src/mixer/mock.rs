@@ -42,6 +42,16 @@ impl AudioMixerBackend for MockMixerBackend {
         session.muted = muted;
         Ok(())
     }
+
+    fn set_balance(&self, session_id: &str, balance: f32) -> Result<(), MixerError> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions
+            .iter_mut()
+            .find(|s| s.id == session_id)
+            .ok_or_else(|| MixerError::SessionNotFound(session_id.to_string()))?;
+        session.balance = balance.clamp(-1.0, 1.0);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -55,8 +65,25 @@ mod tests {
             icon_png: None,
             volume: 0.5,
             muted: false,
+            balance: 0.0,
             is_active: true,
         }
+    }
+
+    #[test]
+    fn set_balance_clamps_out_of_range_input() {
+        let backend = MockMixerBackend::new(vec![sample_session("1")]);
+        backend.set_balance("1", 3.0).unwrap();
+        assert_eq!(backend.list_sessions().unwrap()[0].balance, 1.0);
+        backend.set_balance("1", -3.0).unwrap();
+        assert_eq!(backend.list_sessions().unwrap()[0].balance, -1.0);
+    }
+
+    #[test]
+    fn set_balance_on_unknown_session_errors() {
+        let backend = MockMixerBackend::new(vec![sample_session("1")]);
+        let err = backend.set_balance("missing", 0.5).unwrap_err();
+        assert!(matches!(err, MixerError::SessionNotFound(id) if id == "missing"));
     }
 
     #[test]

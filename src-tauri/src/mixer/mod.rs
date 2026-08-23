@@ -30,6 +30,8 @@ pub struct AppSession {
     /// 0.0 (silent) to 1.0 (full scale). Platforms that allow boosting past unity may exceed 1.0.
     pub volume: f32,
     pub muted: bool,
+    /// Left/right stereo balance: -1.0 is full left, 0.0 is centered, 1.0 is full right.
+    pub balance: f32,
     /// Producing sound right now, as opposed to present-but-silent.
     pub is_active: bool,
 }
@@ -55,6 +57,8 @@ pub trait AudioMixerBackend: Send + Sync {
     fn list_sessions(&self) -> Result<Vec<AppSession>, MixerError>;
     fn set_volume(&self, session_id: &str, volume: f32) -> Result<(), MixerError>;
     fn set_muted(&self, session_id: &str, muted: bool) -> Result<(), MixerError>;
+    /// -1.0 (full left) to 1.0 (full right), 0.0 centered.
+    fn set_balance(&self, session_id: &str, balance: f32) -> Result<(), MixerError>;
 }
 
 /// Construct the real backend for whichever OS this binary is compiled for.

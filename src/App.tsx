@@ -17,6 +17,7 @@ function App() {
   const init = useMixerStore((state) => state.init);
   const setVolume = useMixerStore((state) => state.setVolume);
   const setMuted = useMixerStore((state) => state.setMuted);
+  const setBalance = useMixerStore((state) => state.setBalance);
 
   const [inactiveExpanded, setInactiveExpanded] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -75,6 +76,7 @@ function App() {
             session={session}
             onVolumeChange={setVolume}
             onMuteToggle={setMuted}
+            onBalanceChange={setBalance}
           />
         ))}
       </div>
@@ -102,6 +104,7 @@ function App() {
                   session={session}
                   onVolumeChange={setVolume}
                   onMuteToggle={setMuted}
+                  onBalanceChange={setBalance}
                 />
               ))}
             </div>

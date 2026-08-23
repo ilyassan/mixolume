@@ -12,13 +12,15 @@ export interface AppSession {
   iconPng: number[] | null;
   volume: number;
   muted: boolean;
+  /** -1.0 (full left) to 1.0 (full right), 0.0 centered. */
+  balance: number;
   isActive: boolean;
 }
 
 // Substring of the Rust error returned while Screen & System Audio Recording permission hasn't
 // been granted yet (see `screen_capture_permission::ensure_granted` in macos.rs). Screen Recording
 // is one of the few macOS permission categories that only takes effect after a full app relaunch
-// -- granting it while Mixolume is already running will not make sessions start appearing on
+// -- granting it while MiXolume is already running will not make sessions start appearing on
 // their own, no matter how long the app keeps polling. The UI needs to tell the user this
 // explicitly rather than silently showing an empty list forever.
 const PERMISSION_ERROR_MARKER = "screen & system audio recording permission";
@@ -35,6 +37,9 @@ export const setVolume = (sessionId: string, volume: number) =>
 
 export const setMuted = (sessionId: string, muted: boolean) =>
   invoke<void>("set_muted", { sessionId, muted });
+
+export const setBalance = (sessionId: string, balance: number) =>
+  invoke<void>("set_balance", { sessionId, balance });
 
 // ===== EVENTS =====
 

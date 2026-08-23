@@ -27,7 +27,7 @@ What actually happened instead.
 ## Environment
 
 - OS: [e.g. Windows 11 23H2, macOS 15.1, Ubuntu 24.04]
-- Mixolume version: [e.g. 0.1.0]
+- MiXolume version: [e.g. 0.1.0]
 - Installed via: [e.g. installer, built from source]
 
 ## Logs / screenshots

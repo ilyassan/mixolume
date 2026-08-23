@@ -219,14 +219,21 @@ struct AppGainState {
     /// wire format had no separate mute bit; here it's just a second field).
     volume: f32,
     muted: bool,
+    /// Left/right stereo balance: -1.0 is full left, 0.0 is centered (both channels at full
+    /// `volume`), 1.0 is full right. The tap is created via `initStereoMixdownOfProcesses`, so
+    /// every app's captured audio is already an interleaved stereo stream by the time it reaches
+    /// the realtime mixer -- balance only needed a per-channel gain instead of one scalar, not a
+    /// pipeline redesign.
+    balance: f32,
 }
 
 impl AppGainState {
-    /// Default state for a freshly-seen process: full volume, unmuted.
+    /// Default state for a freshly-seen process: full volume, unmuted, centered.
     const fn default_full_volume() -> Self {
         Self {
             volume: 1.0,
             muted: false,
+            balance: 0.0,
         }
     }
 
@@ -238,13 +245,23 @@ impl AppGainState {
         self.muted = muted;
     }
 
-    /// What the realtime callback should actually multiply samples by.
-    fn effective_gain(&self) -> f32 {
+    fn set_balance(&mut self, balance: f32) {
+        self.balance = balance.clamp(-1.0, 1.0);
+    }
+
+    /// What the realtime callback should actually multiply the left/right channels by. Linear
+    /// (constant-gain, not constant-power) pan law: at center both channels get the full volume;
+    /// panning fully to one side takes the *other* channel to zero while leaving the panned-to
+    /// channel at the full volume, rather than a curved crossfade. Simpler to reason about than
+    /// equal-power panning and plenty precise for a volume-mixer slider rather than a mixing
+    /// console.
+    fn effective_gains(&self) -> (f32, f32) {
         if self.muted {
-            0.0
-        } else {
-            self.volume
+            return (0.0, 0.0);
         }
+        let left = self.volume * (1.0 - self.balance.max(0.0));
+        let right = self.volume * (1.0 + self.balance.min(0.0));
+        (left, right)
     }
 }
 
@@ -254,28 +271,43 @@ impl Default for AppGainState {
     }
 }
 
-/// A single realtime-safe gain cell: one `AtomicU32` per tapped app, storing an `f32`'s bit
-/// pattern. The realtime IOProc closure only ever calls [`AtomicGainSlot::load`] (a single relaxed
-/// atomic load, no allocation, no lock); [`AtomicGainSlot::store`] is called from the
-/// non-realtime `set_volume`/`set_muted` control path. Equivalent to sonicflow's `GainSlot`
-/// (a `Float` behind an `UnsafeMutablePointer`, "atomic on aligned 32-bit boundaries") but uses an
-/// explicit `AtomicU32` instead of relying on natural-alignment atomicity.
+/// A realtime-safe stereo gain cell: two `AtomicU32`s per tapped app (left channel, right
+/// channel), each storing an `f32`'s bit pattern. The realtime IOProc closure only ever calls
+/// [`AtomicGainSlot::load`] (two relaxed atomic loads, no allocation, no lock);
+/// [`AtomicGainSlot::store`] is called from the non-realtime `set_volume`/`set_muted`/
+/// `set_balance` control path. Equivalent to sonicflow's `GainSlot` (a `Float` behind an
+/// `UnsafeMutablePointer`, "atomic on aligned 32-bit boundaries") but uses explicit `AtomicU32`s
+/// instead of relying on natural-alignment atomicity, and doubled up for independent per-channel
+/// gain rather than one scalar -- the two loads/stores aren't tied together as a single atomic
+/// operation, but a torn read (old left paired with new right, or vice versa) for one audio
+/// buffer is completely inaudible, so that's a fine trade against the complexity of packing both
+/// into one atomic value.
 #[derive(Debug)]
-struct AtomicGainSlot(AtomicU32);
+struct AtomicGainSlot {
+    left: AtomicU32,
+    right: AtomicU32,
+}
 
 impl AtomicGainSlot {
-    fn new(initial: f32) -> Self {
-        Self(AtomicU32::new(initial.to_bits()))
+    fn new((left, right): (f32, f32)) -> Self {
+        Self {
+            left: AtomicU32::new(left.to_bits()),
+            right: AtomicU32::new(right.to_bits()),
+        }
     }
 
     /// Called only from the realtime audio callback.
-    fn load(&self) -> f32 {
-        f32::from_bits(self.0.load(Ordering::Relaxed))
+    fn load(&self) -> (f32, f32) {
+        (
+            f32::from_bits(self.left.load(Ordering::Relaxed)),
+            f32::from_bits(self.right.load(Ordering::Relaxed)),
+        )
     }
 
-    /// Called only from the non-realtime `set_volume`/`set_muted` control path.
-    fn store(&self, value: f32) {
-        self.0.store(value.to_bits(), Ordering::Relaxed);
+    /// Called only from the non-realtime `set_volume`/`set_muted`/`set_balance` control path.
+    fn store(&self, (left, right): (f32, f32)) {
+        self.left.store(left.to_bits(), Ordering::Relaxed);
+        self.right.store(right.to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -775,7 +807,7 @@ impl ProcessTap {
             CATapDescription::initStereoMixdownOfProcesses(CATapDescription::alloc(), &ids)
         };
         unsafe {
-            description.setName(&NSString::from_str(&format!("Mixolume.{label}")));
+            description.setName(&NSString::from_str(&format!("MiXolume.{label}")));
             description.setPrivate(true);
             // RISK (see module doc, item 2): exact enum-case spelling unverified.
             description.setMuteBehavior(CATapMuteBehavior::MutedWhenTapped);
@@ -1022,15 +1054,18 @@ unsafe fn mix_capture_callback(
         if buf.mData.is_null() {
             continue;
         }
-        let gain = gain_slots[i].load();
-        if gain == 0.0 {
+        let (gain_l, gain_r) = gain_slots[i].load();
+        if gain_l == 0.0 && gain_r == 0.0 {
             continue;
         }
         let in_samples = buf.mDataByteSize as usize / std::mem::size_of::<f32>();
         let n = in_samples.min(mix_samples);
         let src = std::slice::from_raw_parts(buf.mData as *const f32, n);
-        for f in 0..n {
-            mix_buf[f] += src[f] * gain;
+        // Interleaved stereo (the tap is `initStereoMixdownOfProcesses`): even sample indices
+        // are the left channel, odd indices are the right channel.
+        for (f, sample) in src.iter().enumerate() {
+            let gain = if f % 2 == 0 { gain_l } else { gain_r };
+            mix_buf[f] += sample * gain;
         }
     }
 
@@ -1196,7 +1231,7 @@ fn build_aggregate_description(
     use objc2_core_foundation::{CFArray, CFBoolean, CFDictionary, CFRetained, CFString, CFType};
 
     let aggregate_uid = CFString::from_str(&format!("com.mixolume.aggregate.{}", uuid_v4_ish()));
-    let aggregate_name = CFString::from_str("Mixolume Capture");
+    let aggregate_name = CFString::from_str("MiXolume Capture");
     let output_uid_cf = CFString::from_str(output_device_uid);
 
     // kAudioAggregateDeviceSubDeviceListKey: [ { kAudioSubDeviceUIDKey: output_device_uid } ]
@@ -1363,7 +1398,7 @@ struct TapEngine {
 
 impl TapEngine {
     fn new(
-        active: &[(&AudioProcessInfo, String, f32)], // (process, session_id, initial_gain)
+        active: &[(&AudioProcessInfo, String, (f32, f32))], // (process, session_id, initial (left, right) gain)
     ) -> Result<Self, MixerError> {
         if !screen_capture_permission::ensure_granted() {
             return Err(MixerError::Platform(
@@ -1416,9 +1451,9 @@ impl TapEngine {
         })
     }
 
-    fn set_gain(&self, session_id: &str, effective_gain: f32) {
+    fn set_gain(&self, session_id: &str, effective_gains: (f32, f32)) {
         if let Some(&idx) = self.slot_of.get(session_id) {
-            self.gain_slots[idx].store(effective_gain);
+            self.gain_slots[idx].store(effective_gains);
         }
     }
 }
@@ -1528,16 +1563,16 @@ impl MacosMixerBackend {
             return Ok(());
         }
 
-        let active_with_state: Vec<(&AudioProcessInfo, String, f32)> = active
+        let active_with_state: Vec<(&AudioProcessInfo, String, (f32, f32))> = active
             .iter()
             .map(|p| {
                 let id = session_id_for_pid(p.pid);
-                let gain = inner
+                let gains = inner
                     .gain_state
                     .entry(id.clone())
                     .or_default()
-                    .effective_gain();
-                (*p, id, gain)
+                    .effective_gains();
+                (*p, id, gains)
             })
             .collect();
 
@@ -1596,7 +1631,10 @@ impl AudioMixerBackend for MacosMixerBackend {
             // Copy out before touching `app_info_cache` below -- `state` borrows
             // `inner.gain_state` immutably, and the cache lookup needs `inner` mutably; ending
             // the borrow here (both fields are `Copy`) avoids the conflict.
-            let Some((volume, muted)) = inner.gain_state.get(&id).map(|s| (s.volume, s.muted))
+            let Some((volume, muted, balance)) = inner
+                .gain_state
+                .get(&id)
+                .map(|s| (s.volume, s.muted, s.balance))
             else {
                 // Never seen producing output -- not a "known" session yet, matching the
                 // task's "lazily tap any newly-seen process" contract (nothing to report until
@@ -1616,6 +1654,7 @@ impl AudioMixerBackend for MacosMixerBackend {
                 icon_png,
                 volume,
                 muted,
+                balance,
                 is_active: p.is_running_output,
             });
         }
@@ -1636,7 +1675,7 @@ impl AudioMixerBackend for MacosMixerBackend {
             .get_mut(session_id)
             .ok_or_else(|| MixerError::SessionNotFound(session_id.to_string()))?;
         state.set_volume(volume);
-        let effective = state.effective_gain();
+        let effective = state.effective_gains();
         if let Some(engine) = &inner.engine {
             engine.set_gain(session_id, effective);
         }
@@ -1650,7 +1689,21 @@ impl AudioMixerBackend for MacosMixerBackend {
             .get_mut(session_id)
             .ok_or_else(|| MixerError::SessionNotFound(session_id.to_string()))?;
         state.set_muted(muted);
-        let effective = state.effective_gain();
+        let effective = state.effective_gains();
+        if let Some(engine) = &inner.engine {
+            engine.set_gain(session_id, effective);
+        }
+        Ok(())
+    }
+
+    fn set_balance(&self, session_id: &str, balance: f32) -> Result<(), MixerError> {
+        let mut inner = self.inner.lock().unwrap();
+        let state = inner
+            .gain_state
+            .get_mut(session_id)
+            .ok_or_else(|| MixerError::SessionNotFound(session_id.to_string()))?;
+        state.set_balance(balance);
+        let effective = state.effective_gains();
         if let Some(engine) = &inner.engine {
             engine.set_gain(session_id, effective);
         }
@@ -1680,7 +1733,8 @@ mod tests {
         let s = AppGainState::default();
         assert_eq!(s.volume, 1.0);
         assert!(!s.muted);
-        assert_eq!(s.effective_gain(), 1.0);
+        assert_eq!(s.balance, 0.0);
+        assert_eq!(s.effective_gains(), (1.0, 1.0));
     }
 
     #[test]
@@ -1698,8 +1752,8 @@ mod tests {
         s.set_volume(0.6);
         s.set_muted(true);
         assert_eq!(
-            s.effective_gain(),
-            0.0,
+            s.effective_gains(),
+            (0.0, 0.0),
             "muted -> silent regardless of volume"
         );
         assert_eq!(s.volume, 0.6, "the underlying volume must survive a mute");
@@ -1711,7 +1765,49 @@ mod tests {
         s.set_volume(0.42);
         s.set_muted(true);
         s.set_muted(false);
-        assert_eq!(s.effective_gain(), 0.42);
+        assert_eq!(s.effective_gains(), (0.42, 0.42));
+    }
+
+    #[test]
+    fn balance_clamps_into_negative_one_one_range() {
+        let mut s = AppGainState::default();
+        s.set_balance(2.0);
+        assert_eq!(s.balance, 1.0);
+        s.set_balance(-2.0);
+        assert_eq!(s.balance, -1.0);
+    }
+
+    #[test]
+    fn full_right_balance_silences_left_channel_only() {
+        let mut s = AppGainState::default();
+        s.set_volume(0.8);
+        s.set_balance(1.0);
+        assert_eq!(s.effective_gains(), (0.0, 0.8));
+    }
+
+    #[test]
+    fn full_left_balance_silences_right_channel_only() {
+        let mut s = AppGainState::default();
+        s.set_volume(0.8);
+        s.set_balance(-1.0);
+        assert_eq!(s.effective_gains(), (0.8, 0.0));
+    }
+
+    #[test]
+    fn partial_balance_only_attenuates_the_opposite_channel() {
+        let mut s = AppGainState::default();
+        s.set_volume(1.0);
+        s.set_balance(0.5);
+        assert_eq!(s.effective_gains(), (0.5, 1.0));
+    }
+
+    #[test]
+    fn muting_overrides_balance_in_both_channels() {
+        let mut s = AppGainState::default();
+        s.set_volume(1.0);
+        s.set_balance(1.0);
+        s.set_muted(true);
+        assert_eq!(s.effective_gains(), (0.0, 0.0));
     }
 
     #[test]
@@ -1720,7 +1816,7 @@ mod tests {
         s.set_muted(true);
         s.set_volume(0.9);
         assert!(s.muted, "changing volume alone must not implicitly unmute");
-        assert_eq!(s.effective_gain(), 0.0);
+        assert_eq!(s.effective_gains(), (0.0, 0.0));
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1730,16 +1826,22 @@ mod tests {
     #[test]
     fn atomic_gain_slot_round_trips_typical_values() {
         for v in [0.0f32, 0.25, 0.5, 1.0, 2.0] {
-            let slot = AtomicGainSlot::new(v);
-            assert_eq!(slot.load(), v);
+            let slot = AtomicGainSlot::new((v, v));
+            assert_eq!(slot.load(), (v, v));
         }
     }
 
     #[test]
+    fn atomic_gain_slot_round_trips_independent_left_right_values() {
+        let slot = AtomicGainSlot::new((0.2, 0.9));
+        assert_eq!(slot.load(), (0.2, 0.9));
+    }
+
+    #[test]
     fn atomic_gain_slot_store_then_load_sees_the_new_value() {
-        let slot = AtomicGainSlot::new(1.0);
-        slot.store(0.33);
-        assert_eq!(slot.load(), 0.33);
+        let slot = AtomicGainSlot::new((1.0, 1.0));
+        slot.store((0.33, 0.66));
+        assert_eq!(slot.load(), (0.33, 0.66));
     }
 
     // ---------------------------------------------------------------------------------------

@@ -94,6 +94,53 @@ impl AudioMixerBackend for LinuxMixerBackend {
             session_id,
         )
     }
+
+    /// -1.0 (full left) to 1.0 (full right). `pactl` has no direct "set balance" subcommand --
+    /// the standard technique (also what PulseAudio's own volume control GUIs do) is
+    /// `set-sink-input-volume <id> <left>% <right>%`, passing one percentage per channel instead
+    /// of a single shared one. Assumes a 2-channel (front-left, front-right) sink input, matching
+    /// the `list_sessions` doc comment's own example `pactl` output -- a session with a different
+    /// channel count/map would need per-channel-index handling this doesn't attempt.
+    fn set_balance(&self, session_id: &str, balance: f32) -> Result<(), MixerError> {
+        // We don't currently track the session's volume ourselves (list_sessions re-parses it
+        // fresh from pactl every call), so re-read it here rather than assuming/guessing one --
+        // otherwise this would silently reset volume to 100% every time balance changes.
+        let volume = current_volume(session_id)?;
+        let balance = balance.clamp(-1.0, 1.0);
+        let left = (volume * (1.0 - balance.max(0.0)) * 100.0).round() as i32;
+        let right = (volume * (1.0 + balance.min(0.0)) * 100.0).round() as i32;
+        run_pactl(
+            &[
+                "set-sink-input-volume",
+                session_id,
+                &format!("{left}%"),
+                &format!("{right}%"),
+            ],
+            session_id,
+        )
+    }
+}
+
+/// Re-reads a single session's current volume fresh from `pactl list sink-inputs`, for
+/// `set_balance` to scale its per-channel values against instead of assuming a stale/guessed
+/// volume.
+fn current_volume(session_id: &str) -> Result<f32, MixerError> {
+    let output = Command::new("pactl")
+        .args(["list", "sink-inputs"])
+        .output()
+        .map_err(|e| MixerError::Platform(format!("failed to spawn pactl: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(MixerError::Platform(format!(
+            "pactl list sink-inputs failed: {stderr}"
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_sink_inputs(&stdout)
+        .into_iter()
+        .find(|s| s.id == session_id)
+        .map(|s| s.volume)
+        .ok_or_else(|| MixerError::SessionNotFound(session_id.to_string()))
 }
 
 /// Run a `pactl` subcommand that doesn't produce output we care about (the two setters), mapping
@@ -155,6 +202,7 @@ fn parse_sink_inputs(output: &str) -> Vec<AppSession> {
 fn parse_block(id: &str, lines: &[&str]) -> AppSession {
     let mut volume = 1.0f32;
     let mut muted = false;
+    let mut balance = 0.0f32;
     let mut is_active = true;
     let mut in_properties = false;
     let mut properties: HashMap<String, String> = HashMap::new();
@@ -180,6 +228,15 @@ fn parse_block(id: &str, lines: &[&str]) -> AppSession {
             }
         } else if let Some(rest) = trimmed.strip_prefix("Mute:") {
             muted = rest.trim() == "yes";
+        } else if let Some(rest) = trimmed.strip_prefix("balance") {
+            // pactl already reports balance directly (see this module's doc comment example
+            // output), on its own line right after "Volume:", in the same -1.0..=1.0 range this
+            // app uses everywhere else -- no per-channel-volume math needed to read it back,
+            // unlike `set_balance` which has to write it that way since pactl has no direct
+            // "set balance" subcommand.
+            if let Ok(value) = rest.trim().parse::<f32>() {
+                balance = value.clamp(-1.0, 1.0);
+            }
         } else if let Some(rest) = trimmed.strip_prefix("Corked:") {
             // Corked (paused) sink-inputs are present but not currently producing sound.
             is_active = rest.trim() != "yes";
@@ -200,6 +257,7 @@ fn parse_block(id: &str, lines: &[&str]) -> AppSession {
         icon_png: None,
         volume,
         muted,
+        balance,
         is_active,
     }
 }
@@ -318,6 +376,7 @@ Sink Input #11
         assert_eq!(session.display_name, "Firefox");
         assert_eq!(session.volume, 1.0);
         assert!(!session.muted);
+        assert_eq!(session.balance, 0.0);
         assert!(session.is_active);
         assert!(session.icon_png.is_none());
     }
@@ -342,6 +401,23 @@ Sink Input #11
         assert_eq!(sessions.len(), 1);
         assert!(sessions[0].muted);
         assert!((sessions[0].volume - 0.50).abs() < 0.001);
+    }
+
+    const PANNED_RIGHT_SINK_INPUT: &str = "Sink Input #55
+\tDriver: protocol-native.c
+\tCorked: no
+\tMute: no
+\tVolume: front-left: 32768 / 50% / -6.00 dB,   front-right: 65536 / 100% / 0.00 dB
+\t        balance 0.50
+\tProperties:
+\t\tapplication.name = \"Firefox\"
+";
+
+    #[test]
+    fn parses_nonzero_balance() {
+        let sessions = parse_sink_inputs(PANNED_RIGHT_SINK_INPUT);
+        assert_eq!(sessions.len(), 1);
+        assert!((sessions[0].balance - 0.50).abs() < 0.001);
     }
 
     #[test]

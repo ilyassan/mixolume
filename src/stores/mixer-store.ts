@@ -6,6 +6,7 @@ import {
   listenToSessionsChanged,
   setVolume as setVolumeCommand,
   setMuted as setMutedCommand,
+  setBalance as setBalanceCommand,
 } from "@/lib/tauri";
 
 interface MixerState {
@@ -33,6 +34,8 @@ interface MixerState {
   setVolume: (sessionId: string, volume: number) => void;
   /** Optimistically toggles mute locally and asks the backend to apply it. */
   setMuted: (sessionId: string, muted: boolean) => void;
+  /** Optimistically updates left/right balance locally and asks the backend to apply it. */
+  setBalance: (sessionId: string, balance: number) => void;
 }
 
 let unlisten: (() => void) | null = null;
@@ -116,6 +119,18 @@ export const useMixerStore = create<MixerState>((set, get) => ({
 
     setMutedCommand(sessionId, muted).catch((error) => {
       console.error(`Failed to set muted for ${sessionId}:`, error);
+    });
+  },
+
+  setBalance: (sessionId, balance) => {
+    set((state) => ({
+      sessions: state.sessions.map((session) =>
+        session.id === sessionId ? { ...session, balance } : session,
+      ),
+    }));
+
+    setBalanceCommand(sessionId, balance).catch((error) => {
+      console.error(`Failed to set balance for ${sessionId}:`, error);
     });
   },
 }));

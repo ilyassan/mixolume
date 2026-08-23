@@ -3,6 +3,6 @@
 <plist version="1.0">
 <dict>
 	<key>NSAudioCaptureUsageDescription</key>
-	<string>Mixolume taps system audio output to apply per-app volume control. No audio is recorded, transmitted, or stored.</string>
+	<string>MiXolume taps system audio output to apply per-app volume control. No audio is recorded, transmitted, or stored.</string>
 </dict>
 </plist>

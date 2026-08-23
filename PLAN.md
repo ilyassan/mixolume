@@ -596,3 +596,52 @@ running the compiled code, not by reading it.
   lines, tuned interactively via a set of throwaway HTML/JS editors in `/tmp` rather than
   round-tripping full app rebuilds for each tweak), the final decision was to drop the custom
   glyph entirely and just ship plain "MiXolume" text (`Wordmark.tsx`).
+
+## 15. Brand name unification and per-app left/right balance (2026-08-23)
+
+- **Unified display name to "MiXolume" (capital M and X) everywhere the OS or app actually shows
+  it to a user** -- `productName` and window `title` in `tauri.conf.json` (which changes the
+  built `.app`'s literal file/folder name from `mixolume.app` to `MiXolume.app`, and drives
+  `CFBundleName`/`CFBundleDisplayName` in the generated `Info.plist`), the
+  `NSAudioCaptureUsageDescription` permission-dialog text, the tray's "Show MiXolume" menu item,
+  the Core Audio aggregate device/tap description names (visible in Audio MIDI Setup), and the
+  frontend's `PermissionNeededView` copy. Deliberately left unchanged: the bundle identifier
+  (`com.mixolume.app`, still lowercase) and every Rust/npm package name (`mixolume`,
+  `mixolume_lib`) -- those are technical identifiers, not display text, and changing the bundle
+  id specifically would have invalidated the stable-signing/TCC-permission fix from section 14.
+  Verified the rename actually took via the two APIs that matter -- `plutil -p
+  MiXolume.app/Contents/Info.plist` showing `CFBundleName`/`CFBundleDisplayName` both set to
+  "MiXolume", and (more authoritative than System Events, which showed the raw lowercase
+  executable name) `NSRunningApplication.localizedName` on the actual running process reporting
+  "MiXolume" -- the same API Force Quit, Dock, and Activity Monitor read from.
+- **Per-app left/right balance control added**, after confirming it was architecturally cheap
+  rather than assuming: the Core Audio tap is already created via
+  `initStereoMixdownOfProcesses`, so every app's captured audio was already an interleaved
+  stereo stream -- the realtime mixer was just applying one scalar gain uniformly to both
+  channels. Splitting `AtomicGainSlot` into independent left/right atomics and applying
+  `gain_slots[i]`'s two values by sample-index parity (even = left, odd = right) in the existing
+  mix loop was the entire change to the hot path; no new taps, no new aggregate devices, no
+  pipeline redesign. `AppGainState` gained a `balance: f32` field (-1.0 full left .. 1.0 full
+  right) and `effective_gains() -> (f32, f32)` (replacing the old scalar `effective_gain()`)
+  using a simple linear (constant-gain) pan law: at center both channels get full volume;
+  panning to one side takes only the *other* channel to zero rather than curving both.
+  - **Explicitly considered and declined: per-browser-tab audio control.** The user's instinct
+    that Chrome's per-tab renderer-process architecture might make this possible was worth
+    checking rather than dismissing outright -- but Chromium's audio *output* specifically is
+    centralized into one shared "Audio Service" process for the whole browser regardless of how
+    many tabs/renderer processes exist, confirmed both by Chromium's own architecture docs and by
+    something already observed live in this project: the unnamed `com.brave.Browser.helper`
+    session from section 13's app-naming work is almost certainly this exact process. Core Audio
+    (and therefore any OS-level tap, ours or a commercial one) structurally cannot see
+    individual tabs -- they're already mixed together before the OS ever gets a stream. Real
+    per-tab control would need a browser extension per browser plus native-messaging glue back to
+    this app, a genuinely separate project, not attempted here.
+  - **Windows (`IChannelAudioVolume`, cast from the same `IAudioSessionControl2` session control
+    `ISimpleAudioVolume` already comes from) and Linux (`pactl set-sink-input-volume <id> <left>%
+    <right>%` -- no direct "set balance" subcommand exists, but `pactl` conveniently already
+    *reports* current balance directly as a `balance <float>` line in `list sink-inputs`, in the
+    same -1.0..=1.0 convention used everywhere else in this app) also implement the trait method,
+    written carefully against real API docs and matching each file's existing patterns exactly,
+    but -- like the rest of those two backends -- genuinely unverified: this machine cannot even
+    syntax-check them (`#[cfg(target_os = ...)]` excludes them from compilation entirely on
+    macOS), let alone run them against real WASAPI/PulseAudio.

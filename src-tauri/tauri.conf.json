@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "mixolume",
+  "productName": "MiXolume",
   "version": "0.1.0",
   "identifier": "com.mixolume.app",
   "build": {
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Mixolume",
+        "title": "MiXolume",
         "width": 360,
         "height": 480,
         "resizable": true,

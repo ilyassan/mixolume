@@ -1,6 +1,6 @@
 ---
 name: Feature request
-about: Suggest an idea or improvement for Mixolume
+about: Suggest an idea or improvement for MiXolume
 title: "[Feature] "
 labels: enhancement
 assignees: ""

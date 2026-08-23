@@ -14,8 +14,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::Media::Audio::{
     eConsole, eRender, AudioSessionStateActive, AudioSessionStateExpired, IAudioSessionControl,
-    IAudioSessionControl2, IAudioSessionEnumerator, IAudioSessionManager2, IMMDeviceEnumerator,
-    ISimpleAudioVolume, MMDeviceEnumerator,
+    IAudioSessionControl2, IAudioSessionEnumerator, IAudioSessionManager2, IChannelAudioVolume,
+    IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator,
 };
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 use windows::Win32::System::Com::{
@@ -250,6 +250,7 @@ impl AudioMixerBackend for WindowsMixerBackend {
                     .GetMute()
                     .map(|b| b.as_bool())
                     .unwrap_or(false);
+                let balance = read_balance(&control).unwrap_or(0.0);
 
                 let (display_name, icon_png) = resolve_process_info(pid);
 
@@ -259,6 +260,7 @@ impl AudioMixerBackend for WindowsMixerBackend {
                     icon_png,
                     volume,
                     muted,
+                    balance,
                     is_active: state == AudioSessionStateActive,
                 });
             }
@@ -289,6 +291,64 @@ impl AudioMixerBackend for WindowsMixerBackend {
                 .map_err(|e| MixerError::Platform(e.to_string()))
         }
     }
+
+    /// -1.0 (full left) to 1.0 (full right), applied via `IChannelAudioVolume` -- a separate
+    /// session interface from `ISimpleAudioVolume`'s single master volume, obtained the same way
+    /// (casting the session control), see
+    /// https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-ichannelaudiovolume-setchannelvolume.
+    /// Only meaningful for 2-channel (stereo) sessions -- a no-op (not an error) for anything
+    /// else, since "left/right balance" doesn't have a sensible meaning for mono or
+    /// surround-channel-count sessions.
+    fn set_balance(&self, session_id: &str, balance: f32) -> Result<(), MixerError> {
+        let control = find_session_control(session_id)?;
+        unsafe {
+            let simple_volume: ISimpleAudioVolume = control
+                .cast()
+                .map_err(|e| MixerError::Platform(e.to_string()))?;
+            let volume = simple_volume.GetMasterVolume().unwrap_or(1.0);
+
+            let channel_volume: IChannelAudioVolume = control
+                .cast()
+                .map_err(|e| MixerError::Platform(e.to_string()))?;
+            if channel_volume.GetChannelCount().unwrap_or(0) != 2 {
+                return Ok(());
+            }
+            let balance = balance.clamp(-1.0, 1.0);
+            let left = volume * (1.0 - balance.max(0.0));
+            let right = volume * (1.0 + balance.min(0.0));
+            channel_volume
+                .SetChannelVolume(0, left, std::ptr::null())
+                .map_err(|e| MixerError::Platform(e.to_string()))?;
+            channel_volume
+                .SetChannelVolume(1, right, std::ptr::null())
+                .map_err(|e| MixerError::Platform(e.to_string()))
+        }
+    }
+}
+
+/// Best-effort read of a session's current left/right balance from its live
+/// `IChannelAudioVolume` channel levels, inverting the same linear pan law `set_balance` writes
+/// with (see its doc comment). `None` for non-stereo sessions or if the interface can't be
+/// obtained -- callers should treat that as "centered" rather than an error, matching how the
+/// rest of `list_sessions` already falls back to `unwrap_or(...)` defaults for best-effort reads.
+unsafe fn read_balance(control: &IAudioSessionControl2) -> Option<f32> {
+    let channel_volume: IChannelAudioVolume = control.cast().ok()?;
+    if channel_volume.GetChannelCount().ok()? != 2 {
+        return None;
+    }
+    let left = channel_volume.GetChannelVolume(0).ok()?;
+    let right = channel_volume.GetChannelVolume(1).ok()?;
+    Some(if right >= left {
+        if right <= 0.0 {
+            0.0
+        } else {
+            1.0 - left / right
+        }
+    } else if left <= 0.0 {
+        0.0
+    } else {
+        right / left - 1.0
+    })
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Mixolume is currently pre-1.0 and under active development. Only the latest
+MiXolume is currently pre-1.0 and under active development. Only the latest
 released version is supported with security fixes.
 
 ## Reporting a vulnerability

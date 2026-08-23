@@ -11,7 +11,7 @@ export function PermissionNeededView() {
       <ShieldAlert className="text-muted-foreground size-8" />
       <p className="text-sm font-medium">Permission needed</p>
       <p className="text-muted-foreground text-xs">
-        Mixolume needs Screen & System Audio Recording access to detect which
+        MiXolume needs Screen & System Audio Recording access to detect which
         apps are playing sound.
       </p>
       <Button
@@ -23,7 +23,7 @@ export function PermissionNeededView() {
         Open System Settings
       </Button>
       <p className="text-muted-foreground text-xs">
-        After granting access, quit and reopen Mixolume -- this permission
+        After granting access, quit and reopen MiXolume -- this permission
         only takes effect on the next launch.
       </p>
     </div>

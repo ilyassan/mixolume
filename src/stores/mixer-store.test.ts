@@ -1,12 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-const { listSessions, setVolume, setMuted, capturedCallback, unlistenMock } =
+const { listSessions, setVolume, setMuted, setBalance, capturedCallback, unlistenMock } =
   vi.hoisted(() => {
     const unlistenMock = vi.fn();
     return {
       listSessions: vi.fn(),
       setVolume: vi.fn(),
       setMuted: vi.fn(),
+      setBalance: vi.fn(),
       capturedCallback: { current: null as null | ((s: unknown[]) => void) },
       unlistenMock,
     };
@@ -16,6 +17,7 @@ vi.mock("@/lib/tauri", () => ({
   listSessions: (...args: unknown[]) => listSessions(...args),
   setVolume: (...args: unknown[]) => setVolume(...args),
   setMuted: (...args: unknown[]) => setMuted(...args),
+  setBalance: (...args: unknown[]) => setBalance(...args),
   listenToSessionsChanged: vi.fn((callback: (s: unknown[]) => void) => {
     capturedCallback.current = callback;
     return Promise.resolve(unlistenMock);
@@ -36,6 +38,7 @@ const session = (overrides: Partial<AppSession> = {}): AppSession => ({
   iconPng: null,
   volume: 0.5,
   muted: false,
+  balance: 0,
   isActive: true,
   ...overrides,
 });
@@ -47,6 +50,7 @@ describe("mixer-store", () => {
     listSessions.mockResolvedValue([]);
     setVolume.mockResolvedValue(undefined);
     setMuted.mockResolvedValue(undefined);
+    setBalance.mockResolvedValue(undefined);
     useMixerStore.setState({
       sessions: [],
       isLoaded: false,
@@ -117,6 +121,15 @@ describe("mixer-store", () => {
 
     expect(useMixerStore.getState().sessions[0].muted).toBe(true);
     expect(setMuted).toHaveBeenCalledWith("session-1", true);
+  });
+
+  it("setBalance() optimistically updates local state immediately", () => {
+    useMixerStore.setState({ sessions: [session({ balance: 0 })] });
+
+    useMixerStore.getState().setBalance("session-1", 0.7);
+
+    expect(useMixerStore.getState().sessions[0].balance).toBe(0.7);
+    expect(setBalance).toHaveBeenCalledWith("session-1", 0.7);
   });
 
   it("init() sets needsPermission when the backend reports the permission-wait error", async () => {

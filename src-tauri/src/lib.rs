@@ -59,6 +59,14 @@ fn set_muted(state: State<MixerState>, session_id: String, muted: bool) -> Resul
         .map_err(mixer_error_to_string)
 }
 
+#[tauri::command]
+fn set_balance(state: State<MixerState>, session_id: String, balance: f32) -> Result<(), String> {
+    state
+        .backend
+        .set_balance(&session_id, balance)
+        .map_err(mixer_error_to_string)
+}
+
 /// How often we re-poll the platform backend for session changes. WASAPI/PulseAudio don't give
 /// us a cheap cross-platform push notification in v1, so we poll and only emit to the frontend
 /// when the list actually differs from what we last sent (see `mixer::AppSession`'s `PartialEq`).
@@ -84,7 +92,7 @@ fn spawn_session_poll_loop(app_handle: AppHandle, backend: Arc<dyn AudioMixerBac
     });
 }
 
-/// Unique id for the (single) tray icon, so the "Show Mixolume" menu item can look it up via
+/// Unique id for the (single) tray icon, so the "Show MiXolume" menu item can look it up via
 /// [`tauri::Manager::tray_by_id`] and read its current on-screen position -- the menu item click
 /// handler only gets an `AppHandle`, not the `&TrayIcon` a direct tray-icon click gives for free.
 const TRAY_ICON_ID: &str = "mixolume-tray";
@@ -168,7 +176,7 @@ fn show_main_window_near_tray(
 }
 
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
-    let show_item = MenuItem::with_id(app, "show", "Show Mixolume", true, None::<&str>)?;
+    let show_item = MenuItem::with_id(app, "show", "Show MiXolume", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
 
@@ -268,7 +276,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_sessions,
             set_volume,
-            set_muted
+            set_muted,
+            set_balance
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

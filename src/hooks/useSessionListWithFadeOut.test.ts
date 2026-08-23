@@ -11,6 +11,7 @@ const makeSession = (overrides: Partial<AppSession> = {}): AppSession => ({
   iconPng: null,
   volume: 0.5,
   muted: false,
+  balance: 0,
   isActive: true,
   ...overrides,
 });

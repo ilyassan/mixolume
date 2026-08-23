@@ -1,6 +1,6 @@
-# Contributing to Mixolume
+# Contributing to MiXolume
 
-Thanks for your interest in contributing! Mixolume is a small, cross-platform
+Thanks for your interest in contributing! MiXolume is a small, cross-platform
 (Windows/macOS/Linux) desktop audio mixer built with [Tauri v2](https://v2.tauri.app/)
 (Rust backend) and React/TypeScript (frontend).
 
