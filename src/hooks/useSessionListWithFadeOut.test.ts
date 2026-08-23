@@ -126,6 +126,71 @@ describe("useSessionListWithFadeOut", () => {
     expect(result.current.map((s) => s.id).sort()).toEqual(["a", "b"]);
   });
 
+  it("active session reporting a brief false isActive stays displayed as active until holdMs elapses", () => {
+    const { result, rerender } = renderHook(
+      ({ sessions }) => useSessionListWithFadeOut(sessions, HOLD_MS),
+      { initialProps: { sessions: [makeSession({ id: "a", isActive: true })] } },
+    );
+
+    expect(result.current[0].isActive).toBe(true);
+
+    // Backend reports a single false tick (e.g. a buffering gap) -- session
+    // is still present in the list, just flagged inactive this time.
+    act(() => {
+      rerender({ sessions: [makeSession({ id: "a", isActive: false })] });
+    });
+
+    // Still shown as active immediately after the flip -- no flicker.
+    expect(result.current[0].isActive).toBe(true);
+
+    act(() => {
+      vi.advanceTimersByTime(HOLD_MS - 1);
+    });
+    expect(result.current[0].isActive).toBe(true);
+
+    // Only flips to inactive once the hold window fully elapses.
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(result.current[0].isActive).toBe(false);
+  });
+
+  it("active session that recovers before holdMs elapses never flips to inactive", () => {
+    const { result, rerender } = renderHook(
+      ({ sessions }) => useSessionListWithFadeOut(sessions, HOLD_MS),
+      { initialProps: { sessions: [makeSession({ id: "a", isActive: true })] } },
+    );
+
+    act(() => {
+      rerender({ sessions: [makeSession({ id: "a", isActive: false })] });
+    });
+    expect(result.current[0].isActive).toBe(true);
+
+    act(() => {
+      vi.advanceTimersByTime(HOLD_MS / 2);
+    });
+    act(() => {
+      rerender({ sessions: [makeSession({ id: "a", isActive: true })] });
+    });
+    expect(result.current[0].isActive).toBe(true);
+
+    // Advancing well past the original hold window must NOT flip it -- the
+    // original deactivation timer should have been cancelled on recovery.
+    act(() => {
+      vi.advanceTimersByTime(HOLD_MS * 2);
+    });
+    expect(result.current[0].isActive).toBe(true);
+  });
+
+  it("a session that starts out inactive is shown inactive immediately, with no hold applied", () => {
+    const sessions = [makeSession({ id: "a", isActive: false })];
+    const { result } = renderHook(() =>
+      useSessionListWithFadeOut(sessions, HOLD_MS),
+    );
+
+    expect(result.current[0].isActive).toBe(false);
+  });
+
   it("multiple sessions removed in the same update each fade out independently", () => {
     const { result, rerender } = renderHook(
       ({ sessions }) => useSessionListWithFadeOut(sessions, HOLD_MS),

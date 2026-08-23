@@ -422,6 +422,9 @@ const SYSTEM_BUNDLE_PREFIXES_TO_HIDE: &[&str] = &[
     "com.apple.controlcenter",
     "com.apple.WebKit.GPU",
     "com.apple.cmio",
+    // System alert/UI sound player (login chime, volume-change beep, etc.) -- not something a
+    // user would ever want to individually mute/adjust from a per-app mixer.
+    "com.apple.systemsoundserverd",
 ];
 
 fn is_hidden_system_bundle(bundle_id: &str) -> bool {

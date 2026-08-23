@@ -20,6 +20,11 @@ vi.mock("@/lib/tauri", () => ({
     capturedCallback.current = callback;
     return Promise.resolve(unlistenMock);
   }),
+  // Real implementation, not a mock -- it's a pure string check, and tests
+  // below rely on it actually matching the real error format.
+  isPermissionError: (error: unknown) =>
+    typeof error === "string" &&
+    error.includes("screen & system audio recording permission"),
 }));
 
 import { useMixerStore } from "./mixer-store";
@@ -46,6 +51,7 @@ describe("mixer-store", () => {
       sessions: [],
       isLoaded: false,
       isInitialized: false,
+      needsPermission: false,
     });
   });
 
@@ -111,6 +117,62 @@ describe("mixer-store", () => {
 
     expect(useMixerStore.getState().sessions[0].muted).toBe(true);
     expect(setMuted).toHaveBeenCalledWith("session-1", true);
+  });
+
+  it("init() sets needsPermission when the backend reports the permission-wait error", async () => {
+    vi.useFakeTimers();
+    listSessions.mockRejectedValue(
+      "platform audio API error: waiting for screen & system audio recording permission",
+    );
+
+    await useMixerStore.getState().init();
+
+    expect(useMixerStore.getState().needsPermission).toBe(true);
+    expect(useMixerStore.getState().isLoaded).toBe(false);
+
+    // Whether a mid-session permission grant takes effect without a full
+    // app relaunch is inconsistent in practice, so the store must keep
+    // checking rather than latching "needs permission" forever -- confirm
+    // it keeps retrying instead of giving up after the first failure.
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(listSessions.mock.calls.length).toBeGreaterThan(1);
+
+    vi.useRealTimers();
+  });
+
+  it("init() clears needsPermission once a retry succeeds after the permission is actually granted", async () => {
+    vi.useFakeTimers();
+    listSessions.mockRejectedValueOnce(
+      "platform audio API error: waiting for screen & system audio recording permission",
+    );
+    listSessions.mockResolvedValueOnce([session()]);
+
+    await useMixerStore.getState().init();
+    expect(useMixerStore.getState().needsPermission).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(useMixerStore.getState().needsPermission).toBe(false);
+    expect(useMixerStore.getState().isLoaded).toBe(true);
+
+    vi.useRealTimers();
+  });
+
+  it("init() retries on a generic (non-permission) failure and recovers once it succeeds", async () => {
+    vi.useFakeTimers();
+    listSessions.mockRejectedValueOnce(new Error("transient IPC failure"));
+    listSessions.mockResolvedValueOnce([session()]);
+
+    await useMixerStore.getState().init();
+    expect(useMixerStore.getState().isLoaded).toBe(false);
+    expect(useMixerStore.getState().needsPermission).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(useMixerStore.getState().isLoaded).toBe(true);
+    expect(useMixerStore.getState().sessions).toHaveLength(1);
+
+    vi.useRealTimers();
   });
 
   it("setVolume() still updates local state even if the backend call rejects", async () => {

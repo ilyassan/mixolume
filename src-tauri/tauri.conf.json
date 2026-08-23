@@ -40,7 +40,8 @@
       "icons/icon.ico"
     ],
     "macOS": {
-      "minimumSystemVersion": "14.4"
+      "minimumSystemVersion": "14.4",
+      "signingIdentity": "Mixolume Dev"
     }
   }
 }

@@ -1,19 +1,25 @@
 import { useEffect, useState } from "react";
-import { ChevronDown, ChevronRight, Volume2 } from "lucide-react";
+import { ChevronDown, ChevronRight, Settings, Volume2 } from "lucide-react";
 import { useMixerStore } from "@/stores/mixer-store";
 import { useSessionListWithFadeOut } from "@/hooks/useSessionListWithFadeOut";
 import { SessionRow } from "@/components/SessionRow";
+import { SettingsView } from "@/components/SettingsView";
+import { PermissionNeededView } from "@/components/PermissionNeededView";
+import { Wordmark } from "@/components/Wordmark";
+import { Button } from "@/components/ui/button";
 
 const FADE_HOLD_MS = 1500;
 
 function App() {
   const sessions = useMixerStore((state) => state.sessions);
   const isLoaded = useMixerStore((state) => state.isLoaded);
+  const needsPermission = useMixerStore((state) => state.needsPermission);
   const init = useMixerStore((state) => state.init);
   const setVolume = useMixerStore((state) => state.setVolume);
   const setMuted = useMixerStore((state) => state.setMuted);
 
   const [inactiveExpanded, setInactiveExpanded] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
 
   useEffect(() => {
     init();
@@ -28,13 +34,38 @@ function App() {
 
   const showEmptyState = isLoaded && rendered.length === 0;
 
+  if (showSettings) {
+    return (
+      <main className="bg-background text-foreground flex h-full min-h-[120px] flex-col">
+        <SettingsView onBack={() => setShowSettings(false)} />
+      </main>
+    );
+  }
+
   return (
     <main className="bg-background text-foreground flex h-full min-h-[120px] flex-col overflow-y-auto p-2">
-      {showEmptyState && (
-        <div className="text-muted-foreground flex flex-1 flex-col items-center justify-center gap-2 py-8 text-sm">
-          <Volume2 className="size-6 opacity-60" />
-          <p>No apps are currently playing audio.</p>
-        </div>
+      <div className="mb-1 flex items-center justify-between px-1">
+        <Wordmark className="text-muted-foreground text-xs" />
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-6"
+          onClick={() => setShowSettings(true)}
+          aria-label="Settings"
+        >
+          <Settings className="size-3.5" />
+        </Button>
+      </div>
+
+      {needsPermission ? (
+        <PermissionNeededView />
+      ) : (
+        showEmptyState && (
+          <div className="text-muted-foreground flex flex-1 flex-col items-center justify-center gap-2 py-8 text-sm">
+            <Volume2 className="size-6 opacity-60" />
+            <p>No apps are currently playing audio.</p>
+          </div>
+        )
       )}
 
       <div className="flex flex-col gap-1">

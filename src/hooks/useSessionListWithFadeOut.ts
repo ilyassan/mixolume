@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useReducer, useRef, useState } from "react";
 import type { AppSession } from "@/lib/tauri";
 
 export interface FadingSession extends AppSession {
@@ -8,13 +8,24 @@ export interface FadingSession extends AppSession {
 }
 
 /**
- * Renders the given `sessions` list, but instead of instantly unmounting a
- * session the moment it disappears from an update, holds it in local state
- * (flagged `removing: true`) for `holdMs` so the caller can play a fade-out
- * transition, then drops it.
+ * Renders the given `sessions` list, but smooths out two kinds of backend
+ * flicker instead of reflecting them instantly:
  *
- * If a session reappears before its hold timer fires, it simply resumes as a
- * normal (non-removing) entry - no flicker, no early removal.
+ * - A session disappearing from the list entirely (its process stopped
+ *   producing any Core Audio output object at all) is held in local state
+ *   (flagged `removing: true`) for `holdMs` so the caller can play a
+ *   fade-out transition, then dropped.
+ * - A session staying in the list but its `isActive` flag flipping to
+ *   `false` is *displayed* as still active for `holdMs` after the last time
+ *   it was confirmed active. `kAudioProcessPropertyIsRunningOutput` (the
+ *   source of `isActive`) can report a brief false reading for a genuinely
+ *   still-playing app -- e.g. a buffering gap between tracks -- and without
+ *   this hold, that one 700ms poll tick would visibly jump the row to the
+ *   "Inactive" section and back, which is exactly what it looks like from
+ *   the outside: an app that's clearly making sound shown as inactive.
+ *
+ * If a session reappears (or goes active again) before its hold timer
+ * fires, it simply resumes as normal - no flicker, no early transition.
  */
 export function useSessionListWithFadeOut(
   sessions: AppSession[],
@@ -23,19 +34,69 @@ export function useSessionListWithFadeOut(
   const [rendered, setRendered] = useState<FadingSession[]>(() =>
     sessions.map((session) => ({ ...session, removing: false })),
   );
-  const timersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  const removalTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+
+  // Wall-clock time each session id was last reported `isActive: true`.
+  // Read at render time (not just when new data arrives) so a session held
+  // active past a stale reading still flips to inactive once its hold
+  // window closes, even if no further backend update ever arrives for it.
+  const lastActiveAtRef = useRef(new Map<string, number>());
+  const deactivationTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  const [, forceRender] = useReducer((tick: number) => tick + 1, 0);
 
   useEffect(() => {
+    const now = Date.now();
+    const seenIds = new Set(sessions.map((session) => session.id));
+
+    for (const session of sessions) {
+      if (session.isActive) {
+        lastActiveAtRef.current.set(session.id, now);
+        const pending = deactivationTimersRef.current.get(session.id);
+        if (pending) {
+          clearTimeout(pending);
+          deactivationTimersRef.current.delete(session.id);
+        }
+        continue;
+      }
+      // Reported inactive, but still present in the list: if we're not
+      // already holding it, schedule a re-render for when its hold window
+      // closes (so it flips over on time even without fresh data).
+      const lastActiveAt = lastActiveAtRef.current.get(session.id);
+      const withinHold = lastActiveAt !== undefined && now - lastActiveAt < holdMs;
+      if (withinHold && !deactivationTimersRef.current.has(session.id)) {
+        const timer = setTimeout(() => {
+          deactivationTimersRef.current.delete(session.id);
+          forceRender();
+        }, lastActiveAt! + holdMs - Date.now());
+        deactivationTimersRef.current.set(session.id, timer);
+      }
+    }
+
+    // Drop hold-tracking state for ids that are no longer coming from the
+    // backend at all -- the separate removal/fade-out handling below covers
+    // their on-screen lifetime.
+    for (const id of lastActiveAtRef.current.keys()) {
+      if (!seenIds.has(id)) {
+        lastActiveAtRef.current.delete(id);
+      }
+    }
+    for (const [id, timer] of deactivationTimersRef.current) {
+      if (!seenIds.has(id)) {
+        clearTimeout(timer);
+        deactivationTimersRef.current.delete(id);
+      }
+    }
+
     setRendered((prev) => {
-      const nextIds = new Set(sessions.map((session) => session.id));
+      const nextIds = seenIds;
 
       // Present in the new list: render fresh data, not removing. Also
       // cancel any pending removal timer - the session reappeared.
       const current: FadingSession[] = sessions.map((session) => {
-        const pendingTimer = timersRef.current.get(session.id);
+        const pendingTimer = removalTimersRef.current.get(session.id);
         if (pendingTimer) {
           clearTimeout(pendingTimer);
-          timersRef.current.delete(session.id);
+          removalTimersRef.current.delete(session.id);
         }
         return { ...session, removing: false };
       });
@@ -48,14 +109,14 @@ export function useSessionListWithFadeOut(
         if (nextIds.has(prevSession.id)) {
           continue;
         }
-        if (!timersRef.current.has(prevSession.id)) {
+        if (!removalTimersRef.current.has(prevSession.id)) {
           const timer = setTimeout(() => {
             setRendered((latest) =>
               latest.filter((session) => session.id !== prevSession.id),
             );
-            timersRef.current.delete(prevSession.id);
+            removalTimersRef.current.delete(prevSession.id);
           }, holdMs);
-          timersRef.current.set(prevSession.id, timer);
+          removalTimersRef.current.set(prevSession.id, timer);
         }
         stillFading.push({ ...prevSession, removing: true });
       }
@@ -66,14 +127,28 @@ export function useSessionListWithFadeOut(
 
   // Clear any outstanding timers on unmount.
   useEffect(() => {
-    const timers = timersRef.current;
+    const removalTimers = removalTimersRef.current;
+    const deactivationTimers = deactivationTimersRef.current;
     return () => {
-      for (const timer of timers.values()) {
+      for (const timer of removalTimers.values()) {
         clearTimeout(timer);
       }
-      timers.clear();
+      removalTimers.clear();
+      for (const timer of deactivationTimers.values()) {
+        clearTimeout(timer);
+      }
+      deactivationTimers.clear();
     };
   }, []);
 
-  return rendered;
+  const now = Date.now();
+  return rendered.map((session) => {
+    if (session.isActive) {
+      return session;
+    }
+    const lastActiveAt = lastActiveAtRef.current.get(session.id);
+    const stillHeldActive =
+      lastActiveAt !== undefined && now - lastActiveAt < holdMs;
+    return stillHeldActive ? { ...session, isActive: true } : session;
+  });
 }

@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import {
   type AppSession,
+  isPermissionError,
   listSessions,
   listenToSessionsChanged,
   setVolume as setVolumeCommand,
@@ -12,6 +13,15 @@ interface MixerState {
   isLoaded: boolean;
   /** True once `init()` has registered the sessions-changed listener. */
   isInitialized: boolean;
+  /**
+   * True while the backend is reporting it's still waiting on Screen &
+   * System Audio Recording permission. Kept up to date by an ongoing retry
+   * loop rather than latched permanently -- whether a mid-session grant
+   * takes effect without an app relaunch has been inconsistent in practice,
+   * so the UI shouldn't assume either way and should just reflect whatever
+   * the backend reports on the next check.
+   */
+  needsPermission: boolean;
 
   /** Fetches the initial session list and subscribes to backend push updates. */
   init: () => Promise<void>;
@@ -31,6 +41,7 @@ export const useMixerStore = create<MixerState>((set, get) => ({
   sessions: [],
   isLoaded: false,
   isInitialized: false,
+  needsPermission: false,
 
   init: async () => {
     if (get().isInitialized) {
@@ -39,16 +50,49 @@ export const useMixerStore = create<MixerState>((set, get) => ({
     set({ isInitialized: true });
 
     const stopListening = await listenToSessionsChanged((sessions) => {
-      set({ sessions, isLoaded: true });
+      set({ sessions, isLoaded: true, needsPermission: false });
     });
     unlisten = stopListening;
 
-    try {
-      const sessions = await listSessions();
-      set({ sessions, isLoaded: true });
-    } catch (error) {
-      console.error("Failed to load initial session list:", error);
+    const tryLoad = async (): Promise<boolean> => {
+      if (get().isLoaded) {
+        return true;
+      }
+      try {
+        const sessions = await listSessions();
+        set({ sessions, isLoaded: true, needsPermission: false });
+        return true;
+      } catch (error) {
+        console.error("Failed to load initial session list:", error);
+        set({ needsPermission: isPermissionError(error) });
+        return false;
+      }
+    };
+
+    if (await tryLoad()) {
+      return;
     }
+
+    // Keep retrying on an interval rather than giving up after one failure.
+    // Two distinct failure modes land here, and both call for retrying
+    // rather than a one-shot check: (1) the very first `listSessions()`
+    // call right after window creation can occasionally lose a race in the
+    // native IPC bridge's own startup, with no error thrown -- it just never
+    // resolves with real data, and nothing else self-corrects since the
+    // backend's push loop only emits when the session list *changes* from
+    // what it last sent; (2) a permission-wait error, where whether a grant
+    // made while the app is already running takes effect without a full
+    // relaunch has been inconsistent in practice -- rather than assume it
+    // never will and get stuck showing "permission needed" forever even
+    // after the user has actually granted it, keep checking and let
+    // `needsPermission` clear itself the moment a check actually succeeds.
+    const retryInterval = setInterval(() => {
+      void tryLoad().then((succeeded) => {
+        if (succeeded) {
+          clearInterval(retryInterval);
+        }
+      });
+    }, 2000);
   },
 
   setVolume: (sessionId, volume) => {

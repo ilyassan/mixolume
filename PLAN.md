@@ -523,3 +523,76 @@ running the compiled code, not by reading it.
   code change fixed something, check whether the same already-running process would have recovered
   anyway; the reliable diagnostic signal is Console logs and process/window state at the exact
   moment of the report, not "I changed something and now it's fine."
+
+## 14. The real root cause of all the "sometimes works, sometimes doesn't" flakiness (2026-08-22/23)
+
+- **Ad-hoc code signing has no stable identity across rebuilds, so macOS's TCC (Screen & System
+  Audio Recording permission) treated every single rebuild as a brand-new, never-approved app.**
+  This was the actual root cause behind nearly every "app isn't detecting sounds" / "still shows
+  black" / "keeps asking for permission even though I already granted it" report across sections
+  12-13, not any of the code fixes attempted along the way. Confirmed directly: `codesign -dv
+  /Applications/mixolume.app` showed `Identifier=mixolume-bfb4442fc4fac866` -- a hash derived from
+  the binary's own contents, not `com.mixolume.app` (the configured bundle id). Ad-hoc signing (no
+  `signingIdentity` configured, which is Tauri's default when no certificate is set) has no stable
+  "designated requirement", so macOS can't tell that today's rebuild is "the same app" as
+  yesterday's even though the bundle id, name, and behavior are identical -- confirmed against
+  Apple's own documented behavior (see e.g. https://developer.apple.com/forums/thread/795739). One
+  concrete symptom that proved this conclusively: `tccutil reset ScreenCapture com.mixolume.app`
+  printed "Successfully reset" **six times** -- six separate stale permission entries had
+  accumulated from a single day's worth of rebuilds.
+- **Fixed with a local self-signed code-signing certificate**, giving every rebuild the same
+  stable identity without needing a paid Apple Developer Program membership:
+  1. Generated a self-signed cert: `openssl req -x509 -newkey rsa:2048 -days 3650 -keyout
+     dev.key -out dev.crt -nodes -subj "/CN=Mixolume Dev" -addext
+     "keyUsage=critical,digitalSignature" -addext "extendedKeyUsage=codeSigning"`, converted to
+     `.p12` with `openssl pkcs12 -export -legacy` (the `-legacy` flag is required -- without it the
+     Keychain import silently fails), imported via `security import ... -T /usr/bin/codesign`.
+  2. Trusted it for code signing in Keychain Access (Trust section -> Code Signing -> Always
+     Trust) -- this specific step needs a human: it's a system-trust change the permission system
+     correctly refuses to automate.
+  3. Set `signingIdentity: "Mixolume Dev"` under `bundle.macOS` in `tauri.conf.json`. `tauri
+     build` now signs with this identity automatically every time -- confirmed via `codesign -dv`
+     showing `Identifier=com.mixolume.app` (the real bundle id) instead of a content hash.
+  - **This certificate is local to this machine only** (self-signed, not trusted anywhere else --
+    exactly like the reference article this technique came from warns). On a fresh machine or
+    reinstall, this whole setup needs to be redone, and `tauri.conf.json`'s `signingIdentity`
+    referencing a non-existent certificate will make `tauri build` fail signing until either the
+    cert is recreated or the config value is removed/changed. For real distribution to other
+    users, this still needs an actual Apple Developer ID + notarization -- this only solves *this
+    machine's development-loop* stale-permission pain.
+- **Fixed the missing-permission UX properly instead of chasing the symptom further.** The
+  frontend was silently swallowing the "waiting for screen & system audio recording permission"
+  backend error (just a `console.error`, invisible without devtools open), which is what made every
+  one of these incidents look like an unexplained black/empty screen instead of what it actually
+  was. Added: `isPermissionError()` in `lib/tauri.ts` (matches the error substring), a
+  `needsPermission` flag in the mixer store, and a dedicated `PermissionNeededView` with an "Open
+  System Settings" button (`x-apple.systempreferences:com.apple.preference.security?
+  Privacy_ScreenCapture`, requiring an explicit scoped `opener:allow-open-url` capability entry
+  since that URL scheme isn't in the opener plugin's default allowed schemes). Also **do not
+  permanently latch `needsPermission` and stop retrying** -- whether a mid-session grant takes
+  effect without a full relaunch turned out to be inconsistent in live testing (sometimes a retry
+  did pick it up), so the store keeps checking on an interval and clears the flag the moment a
+  check actually succeeds, rather than assuming the worst case is always true and getting stuck
+  showing "permission needed" even after the user has genuinely granted it.
+- **A real Cargo.toml formatting bug, unrelated to any of the above**: an `Edit` call removing the
+  `devtools` feature merged a trailing doc-comment line directly onto the `tauri = {...}`
+  dependency line with no newline between them, silently commenting out the entire dependency
+  declaration. Symptom was a confusing, unrelated-looking build failure ("missing `cargo:dev`
+  instruction, please update tauri to latest") since `tauri` then only resolved transitively
+  rather than as a direct dependency. Lesson: when an `Edit`'s `old_string` ends mid-line right
+  before a comment block, double check the resulting file for merged lines rather than trusting
+  the diff summary alone.
+- **Other real fixes shipped alongside the permission work**: `com.apple.systemsoundserverd`
+  (macOS's system alert/UI sound player) added to `SYSTEM_BUNDLE_PREFIXES_TO_HIDE` in `macos.rs`
+  -- it was showing up in the Inactive list as if it were a real user app. A `[profile.release]`
+  with `strip = true` only (aggressive settings tried once -- `opt-level="s"`, `lto = true`,
+  `codegen-units = 1`, `panic = "abort"` -- broke live audio session detection immediately and
+  were reverted without fully root-causing it; this codebase's `unsafe`-heavy Core Audio FFI in
+  `macos.rs` is exactly the kind of code where aggressive cross-crate optimization can surface
+  latent bugs that don't show up under normal compilation, so it's not worth the risk for an
+  already-small ~3MB binary). A Settings page (`SettingsView.tsx`) with a "Launch at Login" toggle
+  via `tauri-plugin-autostart` (real macOS Launch Agent, not an AppleScript hack). Branding: after
+  several rounds of a custom V/X hybrid glyph (real "V" text + an SVG overlay of two extending
+  lines, tuned interactively via a set of throwaway HTML/JS editors in `/tmp` rather than
+  round-tripping full app rebuilds for each tweak), the final decision was to drop the custom
+  glyph entirely and just ship plain "MiXolume" text (`Wordmark.tsx`).

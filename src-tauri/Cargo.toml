@@ -35,6 +35,7 @@ tauri-build = { version = "2", features = [] }
 # would produce. Also requires "macOSPrivateApi": true in tauri.conf.json's `app` config.
 tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
 tauri-plugin-opener = "2"
+tauri-plugin-autostart = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
@@ -115,4 +116,18 @@ libproc = "0.14"
 
 [dev-dependencies]
 tokio-test = "0.4"
+
+# This is a small menu-bar utility that should be light to download and install, so stripping
+# debug symbols from the shipped binary is a clear win with zero behavioral risk (they're not
+# useful in a release build without a matching source tree anyway).
+#
+# Deliberately NOT using opt-level="s"/lto=true/codegen-units=1/panic="abort" here: tried them
+# once (2026-08-22) and audio session detection broke live on real hardware immediately after --
+# reverted without fully root-causing it, but this codebase's macOS backend (macos.rs) is heavy
+# with unsafe FFI directly against Core Audio (CATapDescription, AudioHardwareCreateProcessTap,
+# raw IOProc callbacks via block2), which is exactly the kind of code where aggressive
+# cross-crate optimization can surface latent unsafe-code bugs that happen to not manifest under
+# normal compilation. Not worth the risk for a binary that's already ~3MB before any of this.
+[profile.release]
+strip = true
 

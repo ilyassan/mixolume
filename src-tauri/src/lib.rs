@@ -209,6 +209,12 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // Uses a real macOS Launch Agent (not an AppleScript login-item hack) -- the frontend
+        // toggles it via the `autostart:default` capability's enable/disable/isEnabled commands.
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         // Auto-hide on focus loss, like a native menu-bar popover (Control Center, Wi-Fi/
         // Bluetooth menu extras): clicking anywhere outside the window closes it instead of
         // leaving it stranded on screen behind whatever the user clicked into next.
