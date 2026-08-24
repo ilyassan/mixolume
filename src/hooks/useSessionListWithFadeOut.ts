@@ -1,4 +1,4 @@
-import { useEffect, useReducer, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { AppSession } from "@/lib/tauri";
 
 export interface FadingSession extends AppSession {
@@ -36,13 +36,12 @@ export function useSessionListWithFadeOut(
   );
   const removalTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
 
-  // Wall-clock time each session id was last reported `isActive: true`.
-  // Read at render time (not just when new data arrives) so a session held
-  // active past a stale reading still flips to inactive once its hold
-  // window closes, even if no further backend update ever arrives for it.
+  // Wall-clock time each session id was last reported `isActive: true`. A
+  // deactivation timer (below) flips `rendered` directly once a session's
+  // hold window closes, so a stale reading still turns inactive on time even
+  // if no further backend update ever arrives for it.
   const lastActiveAtRef = useRef(new Map<string, number>());
   const deactivationTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
-  const [, forceRender] = useReducer((tick: number) => tick + 1, 0);
 
   useEffect(() => {
     const now = Date.now();
@@ -66,7 +65,11 @@ export function useSessionListWithFadeOut(
       if (withinHold && !deactivationTimersRef.current.has(session.id)) {
         const timer = setTimeout(() => {
           deactivationTimersRef.current.delete(session.id);
-          forceRender();
+          setRendered((prev) =>
+            prev.map((s) =>
+              s.id === session.id ? { ...s, isActive: false } : s,
+            ),
+          );
         }, lastActiveAt! + holdMs - Date.now());
         deactivationTimersRef.current.set(session.id, timer);
       }
@@ -98,7 +101,13 @@ export function useSessionListWithFadeOut(
           clearTimeout(pendingTimer);
           removalTimersRef.current.delete(session.id);
         }
-        return { ...session, removing: false };
+        if (session.isActive) {
+          return { ...session, removing: false };
+        }
+        const lastActiveAt = lastActiveAtRef.current.get(session.id);
+        const stillHeldActive =
+          lastActiveAt !== undefined && now - lastActiveAt < holdMs;
+        return { ...session, isActive: stillHeldActive, removing: false };
       });
 
       // Was rendered before but is missing from the new list: keep its last
@@ -141,14 +150,5 @@ export function useSessionListWithFadeOut(
     };
   }, []);
 
-  const now = Date.now();
-  return rendered.map((session) => {
-    if (session.isActive) {
-      return session;
-    }
-    const lastActiveAt = lastActiveAtRef.current.get(session.id);
-    const stillHeldActive =
-      lastActiveAt !== undefined && now - lastActiveAt < holdMs;
-    return stillHeldActive ? { ...session, isActive: true } : session;
-  });
+  return rendered;
 }

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { toLeftRight, fromLeftRight } from "./SessionRow";
+import { toLeftRight, fromLeftRight } from "./balance";
 
 describe("toLeftRight", () => {
   it("centered balance gives both channels the full volume", () => {
