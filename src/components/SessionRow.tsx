@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Volume2, VolumeX } from "lucide-react";
+import { ChevronDown, ChevronRight, Volume2, VolumeX } from "lucide-react";
 import { Slider } from "@/components/ui/slider";
 import { Button } from "@/components/ui/button";
 import { SessionIcon } from "@/components/SessionIcon";
@@ -12,6 +12,27 @@ interface SessionRowProps {
   onBalanceChange: (sessionId: string, balance: number) => void;
 }
 
+/** (volume, balance) -> independent (left, right) gains, 0..1 each. */
+export function toLeftRight(volume: number, balance: number): [number, number] {
+  const left = volume * (1 - Math.max(balance, 0));
+  const right = volume * (1 + Math.min(balance, 0));
+  return [left, right];
+}
+
+/** Inverse of `toLeftRight` -- the louder channel is the "true" volume, and balance is how far
+ * the quieter channel has been pulled down from it. Fully reversible: feeding the result back
+ * through `toLeftRight` reproduces the exact (left, right) pair a user just set. */
+export function fromLeftRight(left: number, right: number): [number, number] {
+  if (right >= left) {
+    const volume = right;
+    const balance = volume > 0 ? 1 - left / volume : 0;
+    return [volume, balance];
+  }
+  const volume = left;
+  const balance = volume > 0 ? right / volume - 1 : 0;
+  return [volume, balance];
+}
+
 export function SessionRow({
   session,
   onVolumeChange,
@@ -21,14 +42,30 @@ export function SessionRow({
   const { id, displayName, iconPng, volume, muted, balance, isActive, removing } =
     session;
   const percent = Math.round(volume * 100);
-  // Balance defaults hidden -- most apps never need it, so it stays out of the way
-  // unless a row already has one set (e.g. after a relaunch) or the user opens it.
-  const [showBalance, setShowBalance] = useState(balance !== 0);
+  // Advanced panel (balance, and room for whatever gets added later) stays collapsed by
+  // default -- opened automatically only if a row already has a non-center balance (e.g. after
+  // a relaunch), so returning users don't lose sight of a setting they already made.
+  const [expanded, setExpanded] = useState(balance !== 0);
+
+  const [left, right] = toLeftRight(volume, balance);
+  const leftPercent = Math.round(left * 100);
+  const rightPercent = Math.round(right * 100);
+
+  const handleLeftChange = (nextPercent: number) => {
+    const [newVolume, newBalance] = fromLeftRight(nextPercent / 100, right);
+    onVolumeChange(id, newVolume);
+    onBalanceChange(id, newBalance);
+  };
+  const handleRightChange = (nextPercent: number) => {
+    const [newVolume, newBalance] = fromLeftRight(left, nextPercent / 100);
+    onVolumeChange(id, newVolume);
+    onBalanceChange(id, newBalance);
+  };
 
   return (
     <div
       className={
-        "flex flex-col gap-1 rounded-lg px-3 py-2 transition-[opacity,transform] duration-500 ease-out " +
+        "rounded-xl bg-card/60 transition-[opacity,background-color] duration-500 ease-out " +
         (removing
           ? "pointer-events-none opacity-0"
           : isActive
@@ -39,79 +76,102 @@ export function SessionRow({
       data-active={isActive}
       data-removing={removing}
     >
-      <div className="flex items-center gap-3">
-        <SessionIcon iconPng={iconPng} displayName={displayName} />
+      <div className="p-2.5">
+        <div className="flex items-center gap-3">
+          <SessionIcon iconPng={iconPng} displayName={displayName} />
 
-        <div className="min-w-0 flex-1">
-          <p className="truncate text-sm font-medium leading-tight">
+          <p className="min-w-0 flex-1 truncate text-sm font-medium leading-tight">
             {displayName}
           </p>
-          <div className="mt-1 flex items-center gap-2">
+
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            disabled={removing}
+            aria-pressed={muted}
+            aria-label={muted ? `Unmute ${displayName}` : `Mute ${displayName}`}
+            onClick={() => onMuteToggle(id, !muted)}
+            className={muted ? "text-destructive" : "text-muted-foreground"}
+          >
+            {muted ? (
+              <VolumeX className="size-4" />
+            ) : (
+              <Volume2 className="size-4" />
+            )}
+          </Button>
+
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            disabled={removing}
+            aria-expanded={expanded}
+            aria-label={
+              expanded
+                ? `Hide advanced controls for ${displayName}`
+                : `Show advanced controls for ${displayName}`
+            }
+            onClick={() => setExpanded((v) => !v)}
+            className="text-muted-foreground -ml-1"
+          >
+            {expanded ? (
+              <ChevronDown className="size-3.5" />
+            ) : (
+              <ChevronRight className="size-3.5" />
+            )}
+          </Button>
+        </div>
+
+        <div className="mt-1.5 flex items-center gap-2">
+          <Slider
+            aria-label={`${displayName} volume`}
+            value={[percent]}
+            min={0}
+            max={100}
+            step={1}
+            disabled={removing}
+            onValueChange={([next]) => onVolumeChange(id, next / 100)}
+            className="flex-1"
+          />
+          <span className="text-muted-foreground w-9 shrink-0 text-right text-xs tabular-nums">
+            {percent}%
+          </span>
+        </div>
+      </div>
+
+      {expanded && (
+        <div className="mt-1.5 flex items-center gap-4 px-2.5 pb-2.5">
+          <div className="flex flex-1 items-center gap-2">
+            <span className="text-muted-foreground w-3 text-[10px] font-medium">
+              L
+            </span>
             <Slider
-              aria-label={`${displayName} volume`}
-              value={[percent]}
+              aria-label={`${displayName} left channel`}
+              value={[leftPercent]}
               min={0}
               max={100}
               step={1}
               disabled={removing}
-              onValueChange={([next]) => onVolumeChange(id, next / 100)}
+              onValueChange={([next]) => handleLeftChange(next)}
               className="flex-1"
             />
-            <span className="text-muted-foreground w-9 shrink-0 text-right text-xs tabular-nums">
-              {percent}%
-            </span>
           </div>
-        </div>
-
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          disabled={removing}
-          aria-pressed={showBalance}
-          aria-label={
-            showBalance
-              ? `Hide balance control for ${displayName}`
-              : `Show balance control for ${displayName}`
-          }
-          onClick={() => setShowBalance((v) => !v)}
-          className="text-muted-foreground shrink-0 font-mono text-[10px]"
-        >
-          L/R
-        </Button>
-
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          disabled={removing}
-          aria-pressed={muted}
-          aria-label={muted ? `Unmute ${displayName}` : `Mute ${displayName}`}
-          onClick={() => onMuteToggle(id, !muted)}
-          className={muted ? "text-destructive" : "text-muted-foreground"}
-        >
-          {muted ? (
-            <VolumeX className="size-4" />
-          ) : (
-            <Volume2 className="size-4" />
-          )}
-        </Button>
-      </div>
-
-      {showBalance && (
-        <div className="flex items-center gap-2 pl-11">
-          <span className="text-muted-foreground text-[10px]">L</span>
-          <Slider
-            aria-label={`${displayName} balance`}
-            value={[Math.round(balance * 100)]}
-            min={-100}
-            max={100}
-            step={1}
-            disabled={removing}
-            onValueChange={([next]) => onBalanceChange(id, next / 100)}
-            className="flex-1"
-          />
-          <span className="text-muted-foreground text-[10px]">R</span>
+          <div className="flex flex-1 items-center gap-2">
+            <span className="text-muted-foreground w-3 text-[10px] font-medium">
+              R
+            </span>
+            <Slider
+              aria-label={`${displayName} right channel`}
+              value={[rightPercent]}
+              min={0}
+              max={100}
+              step={1}
+              disabled={removing}
+              onValueChange={([next]) => handleRightChange(next)}
+              className="flex-1"
+            />
+          </div>
         </div>
       )}
     </div>

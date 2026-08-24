@@ -69,7 +69,7 @@ function App() {
         )
       )}
 
-      <div className="flex flex-col gap-1">
+      <div className="flex flex-col gap-2">
         {activeSessions.map((session) => (
           <SessionRow
             key={session.id}
@@ -97,7 +97,7 @@ function App() {
           </button>
 
           {inactiveExpanded && (
-            <div className="flex flex-col gap-1">
+            <div className="flex flex-col gap-2">
               {inactiveSessions.map((session) => (
                 <SessionRow
                   key={session.id}
