@@ -54,13 +54,21 @@ cargo check   # from src-tauri/
 
 ## Branching model
 
-- Create a feature branch off `main` (e.g. `feat/per-app-volume-linux`,
-  `fix/tray-icon-flicker`).
-- Open a pull request against `main`. All PRs require CI to pass and at least
-  one review before merging.
+- `main` is the trunk — create a feature branch off `main` (e.g.
+  `feat/per-app-volume-linux`, `fix/tray-icon-flicker`) and open your pull
+  request against `main`. All PRs require CI to pass and at least one review
+  before merging.
 - We use **squash merges** into `main` — a PR becomes a single commit on
   `main`, so keep your PR title/description clean, as it becomes the squash
   commit message.
+- `beta` is a prerelease checkpoint, not a place PRs target directly. When
+  `main` is in a state worth letting early testers try before it's a full
+  stable release, fast-forward `beta` to that commit and push a
+  `vX.Y.Z-beta.N` tag from it. A stable release is a `vX.Y.Z` tag pushed
+  directly from `main`. Either tag triggers
+  [`.github/workflows/release.yml`](.github/workflows/release.yml), which
+  marks the GitHub Release as a prerelease automatically whenever the tag
+  contains a `-`.
 
 ## Commit message convention
 

@@ -9,13 +9,12 @@ macOS has [SoundSource](https://rogueamoeba.com/soundsource/) and a few free alt
 has `pavucontrol`. Nothing ships one polished app that does this on **all three** from a single
 codebase — that's the gap MiXolume fills.
 
-> **Status:** early, actively-developed. The Windows backend is real and functional (WASAPI
-> session enumeration + per-app volume/mute), verified live against real audio on a dev machine.
-> The Linux backend (PulseAudio via `pactl`) is implemented but has only been syntax/unit-test
-> verified, not run against a real PulseAudio install yet. The macOS backend is written against
-> Apple's Core Audio Process Tap API but entirely unverified — no Mac was available during
-> development. See [`src-tauri/macos-audio/README.md`](src-tauri/macos-audio/README.md) for the
-> full architecture and what a Mac-equipped contributor needs to check first.
+> **Status:** early, actively-developed. The Windows and macOS backends are real and functional —
+> both verified live against real audio on real hardware, including per-app independent
+> left/right balance on macOS. The Linux backend (PulseAudio via `pactl`) is implemented and
+> unit-tested but not yet run against a real PulseAudio install. See
+> [`src-tauri/macos-audio/README.md`](src-tauri/macos-audio/README.md) for the macOS
+> architecture in full.
 
 ## How it works
 
