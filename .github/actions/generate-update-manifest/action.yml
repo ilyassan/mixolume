@@ -1,0 +1,76 @@
+name: Generate update manifest
+description: >
+  Regenerates and uploads latest.json (the tauri-plugin-updater manifest) for the current tag,
+  from whatever platform .sig files currently exist on this tag's GitHub release. Called as the
+  last step of all three release-*.yml workflows -- they build in parallel on separate runners,
+  so whichever one finishes last naturally produces the complete file; an earlier run just skips
+  with a message instead of publishing a manifest missing the platforms that aren't built yet.
+
+inputs:
+  github-token:
+    description: A token with permission to read and upload assets on this repo's releases.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+
+        TAG="${GITHUB_REF#refs/tags/}"
+        VERSION="${TAG#v}"
+        BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+
+        # latest.json feeds the updater's "releases/latest/download/latest.json" endpoint, which
+        # GitHub only ever resolves to a published, non-prerelease release -- publishing one for
+        # a beta tag would be actively wrong (nobody's install should silently jump onto a beta).
+        if [[ "$TAG" == *-* ]]; then
+          echo "Prerelease tag ($TAG) -- not generating latest.json."
+          exit 0
+        fi
+
+        fetch_sig() {
+          curl -sL -f "$1" 2>/dev/null || true
+        }
+
+        WIN_SIG=$(fetch_sig "$BASE/MiXolume_${VERSION}_x64-setup.exe.sig")
+        LINUX_SIG=$(fetch_sig "$BASE/MiXolume_${VERSION}_amd64.AppImage.sig")
+        MAC_SIG=$(fetch_sig "$BASE/MiXolume_universal.app.tar.gz.sig")
+
+        if [ -z "$WIN_SIG" ] || [ -z "$LINUX_SIG" ] || [ -z "$MAC_SIG" ]; then
+          echo "Not every platform's signature is uploaded yet -- skipping this run."
+          echo "Whichever release-*.yml workflow finishes last will complete this."
+          exit 0
+        fi
+
+        cat > latest.json << EOF
+        {
+          "version": "$VERSION",
+          "notes": "See https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md",
+          "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+          "platforms": {
+            "windows-x86_64": {
+              "signature": "$WIN_SIG",
+              "url": "$BASE/MiXolume_${VERSION}_x64-setup.exe"
+            },
+            "linux-x86_64": {
+              "signature": "$LINUX_SIG",
+              "url": "$BASE/MiXolume_${VERSION}_amd64.AppImage"
+            },
+            "darwin-x86_64": {
+              "signature": "$MAC_SIG",
+              "url": "$BASE/MiXolume_universal.app.tar.gz"
+            },
+            "darwin-aarch64": {
+              "signature": "$MAC_SIG",
+              "url": "$BASE/MiXolume_universal.app.tar.gz"
+            }
+          }
+        }
+        EOF
+
+        gh release upload "$TAG" latest.json --clobber
+        echo "Uploaded latest.json for $TAG"

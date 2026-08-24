@@ -645,3 +645,96 @@ running the compiled code, not by reading it.
     but -- like the rest of those two backends -- genuinely unverified: this machine cannot even
     syntax-check them (`#[cfg(target_os = ...)]` excludes them from compilation entirely on
     macOS), let alone run them against real WASAPI/PulseAudio.
+
+## 16. Real release infrastructure, macOS audio hiccups root-caused, and cross-platform auto-update (2026-08-24)
+
+- **Apple Developer Program (Individual) enrollment submitted.** Researched real reported
+  pitfalls before submitting rather than just following Apple's own happy-path docs: Morocco is
+  reportedly not in Apple's supported-country list for enrollment (multiple Apple Community
+  threads from Moroccan developers describe the same "enrollment could not be completed" dead
+  end); the fallback other developers in unsupported countries use is a dedicated Apple ID
+  registered to a supported country plus a matching virtual card, which turned out unnecessary
+  here -- direct enrollment worked. Notarization is unrelated to, and unblocked by, any of the
+  Paid Apps Agreement/banking complexity that only matters once there's real App Store revenue.
+- **Cross-platform release workflows**, replacing the single stale, unsigned, macOS-only
+  `release-macos.yml`: three separate tag-triggered files
+  (`release-{macos,windows,linux}.yml`, one per OS so each platform's build status/re-run is
+  independent in the Actions tab), building on every `vX.Y.Z`/`vX.Y.Z-beta.N` tag push and
+  attaching installers to one shared draft GitHub Release. macOS signs with a dedicated
+  release-only self-signed "MiXolume Release" certificate (separate from the local "Mixolume
+  Dev" one) -- confirmed directly from `tauri-cli`'s own source
+  (`crates/tauri-cli/src/interface/rust.rs`) that `APPLE_SIGNING_IDENTITY` overrides
+  `tauri.conf.json`'s static `signingIdentity` when set, which is what makes a CI-only identity
+  possible without touching the local dev config. Not notarized yet -- pending the Apple
+  enrollment above.
+- **Real bug found cutting the first beta (v0.1.0-beta.1): Windows' MSI bundler rejects semver
+  prerelease identifiers with letters** (`optional pre-release identifier ... must be
+  numeric-only ... for msi target`) -- `0.1.0-beta.1` violates MSI's own numeric-only
+  ProductVersion scheme. Fixed by dropping `msi` from `bundle.targets` in favor of `nsis` (no
+  such restriction, and Tauri's other Windows target) rather than constraining the whole
+  project's version scheme to MSI's limitation. Confirmed live: re-cut the same tag after the
+  fix and all three platforms built clean.
+- **Two real macOS audio-hiccup root causes, found by reading the tap/aggregate teardown code
+  directly, not guessed at:**
+  1. Every engine rebuild (which happens on every single app-start/stop, since Core Audio has no
+     documented way to add/remove a tap from a running aggregate device -- confirmed against real
+     developer reports, matching this project's own prior conclusion) was un-muting a tapped
+     app's normal output path (`ProcessTap::drop`, via `CATapMuteBehavior::MutedWhenTapped`)
+     *before* the old mixed pipeline (`CaptureAggregate`/`PlaybackTap`) had actually stopped --
+     Rust drops struct fields in declaration order, and `taps` was declared before
+     `capture`/`playback`. That produced a brief double-audio overlap on top of the
+     already-unavoidable rebuild gap. Fixed by reordering `TapEngine`'s fields so the mixed
+     pipeline drops first.
+  2. `app.exit()` calls `std::process::exit()` and does not run `Drop` for managed state
+     (confirmed against Tauri's own documented exit behavior, not assumed) -- quitting via the
+     tray menu while any app was tapped left it muted until macOS separately noticed the dead
+     process and reclaimed its Core Audio objects on its own, an extra audible gap on top of an
+     already-brief one. Added `AudioMixerBackend::shutdown()` (default no-op; only macOS
+     overrides it, since Windows/Linux never mute or reroute anything in the first place) and
+     call it explicitly before `app.exit()` in the quit handler.
+  - Windows/Linux are structurally immune to this whole class of glitch: their backends only poke
+    a volume/mute value on the OS's own already-persistent per-app audio session, never
+    intercepting or rerouting audio the way the macOS tap architecture has to.
+- **In-app branding cleanup**: the header and Settings page were both still showing
+  `src/assets/logo.png`, an old placeholder ring icon that predates the "Wave-M" app icon
+  (section on the icon redesign itself isn't written up here since it happened interactively via
+  chat, not as a debugging investigation) -- replaced with the real icon (`app-icon.svg`, copied
+  to `src/assets/icon.svg` for the frontend to import) in both places, and added it next to the
+  header wordmark where previously only text appeared. Also renamed the autostart toggle from
+  "Launch at login" to "Open at startup" -- "login" is macOS-specific System Settings wording,
+  not a term people reach for cross-platform.
+- **Cross-platform auto-update**, inspired by (per explicit request) YTAudioBar's
+  `tauri-plugin-updater` setup, but not copied verbatim -- that project's workflow predates
+  Tauri's `bundle.createUpdaterArtifacts` config option and manually zips/signs Windows and Linux
+  updater artifacts with hand-rolled `7z`/`tauri signer sign` steps; setting
+  `createUpdaterArtifacts: true` makes `tauri build` (with the signing env vars present) produce
+  the signed artifact for every platform, including macOS, automatically. Also deliberately
+  improved on YTAudioBar's frontend UX rather than mirroring it exactly: its "Check for Updates"
+  button just says "Update check complete! Check console logs for details.", which isn't
+  actionable for an end user with no console -- MiXolume's version reports a real outcome
+  (up to date / downloaded, restart to finish / couldn't check) via a small typed result instead
+  of a bare bool.
+  - New Ed25519 signing keypair (`tauri signer generate`), private key + password stored as
+    `TAURI_SIGNING_PRIVATE_KEY`/`_PASSWORD` GitHub secrets, public key embedded in
+    `tauri.conf.json`'s `plugins.updater.pubkey`. Endpoint is GitHub's own
+    `releases/latest/download/latest.json`, which only ever resolves to a published
+    non-prerelease release -- so a beta tag intentionally does not get a `latest.json` published
+    for it (would otherwise silently offer everyone's existing install a jump onto a beta).
+  - Since the three platforms build in three separate workflow files (not one matrix job) but
+    need to converge on a single shared `latest.json`, each workflow's last step calls a new
+    composite action (`.github/actions/generate-update-manifest`) that re-fetches whatever
+    platform `.sig` files currently exist on the release and only publishes once all three are
+    present -- whichever workflow finishes last naturally produces the complete file; an earlier
+    one just skips with a message. The macOS universal build's signature/URL is listed under
+    *both* the `darwin-x86_64` and `darwin-aarch64` manifest keys, since one universal binary
+    serves both architectures and the updater picks its platform key from the runtime arch.
+  - Backend checks silently in the background ~5s after startup (release builds only, gated
+    `#[cfg(not(debug_assertions))]` the same way YTAudioBar gates it, so dev builds don't spam
+    update-check logs against a `latest.json` that isn't meaningfully comparable) and downloads +
+    installs immediately if found -- the install only *takes effect* on next launch, so doing
+    this while the app is in active use is safe. The same underlying check is exposed as a
+    `check_for_updates` command for the Settings page's manual button.
+  - Not yet verified end-to-end on real hardware (needs an actual published stable release plus a
+    newer one to update *to* -- the beta channel deliberately doesn't exercise this path at all,
+    see above). First real verification happens whenever the first `v0.2.0`-or-later stable tag
+    follows a real `v0.1.0`.

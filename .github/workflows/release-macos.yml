@@ -16,6 +16,12 @@ name: Release macOS
 # instructions shown to users. Once the Apple Developer Program membership is active, swap
 # APPLE_CERTIFICATE/APPLE_CERTIFICATE_PASSWORD for a real Developer ID Application certificate,
 # add a notarization step, and this workflow needs no other changes.
+#
+# Separately, TAURI_SIGNING_PRIVATE_KEY/_PASSWORD sign the tauri-plugin-updater artifact
+# (MiXolume_universal.app.tar.gz.sig) -- an unrelated Ed25519 keypair used only to prove to a
+# user's already-installed app that an update actually came from us, nothing to do with macOS
+# code signing/Gatekeeper at all. See generate-update-manifest's own comments for how the three
+# release-*.yml workflows turn that into a single latest.json.
 on:
   push:
     tags:
@@ -67,6 +73,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_SIGNING_IDENTITY: "MiXolume Release"
+          # Separate from the certificate above: signs the updater artifact
+          # (MiXolume_universal.app.tar.gz.sig) so tauri-plugin-updater can verify it.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "MiXolume ${{ github.ref_name }}"
@@ -83,3 +93,8 @@ jobs:
           releaseDraft: true
           prerelease: ${{ contains(github.ref_name, '-') }}
           args: --target universal-apple-darwin
+
+      - name: Update the auto-update manifest
+        uses: ./.github/actions/generate-update-manifest
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}

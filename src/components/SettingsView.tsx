@@ -7,6 +7,7 @@ import {
 } from "@tauri-apps/plugin-autostart";
 import { Button } from "@/components/ui/button";
 import { Wordmark } from "@/components/Wordmark";
+import { checkForUpdates } from "@/lib/tauri";
 import icon from "@/assets/icon.svg";
 import pkg from "../../package.json";
 
@@ -14,9 +15,19 @@ interface SettingsViewProps {
   onBack: () => void;
 }
 
+type UpdateStatus =
+  | { kind: "idle" }
+  | { kind: "checking" }
+  | { kind: "up-to-date" }
+  | { kind: "installed"; version: string }
+  | { kind: "error" };
+
 export function SettingsView({ onBack }: SettingsViewProps) {
   const [openAtStartup, setOpenAtStartup] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus>({
+    kind: "idle",
+  });
 
   useEffect(() => {
     isAutostartEnabled()
@@ -38,6 +49,21 @@ export function SettingsView({ onBack }: SettingsViewProps) {
     } catch (error) {
       console.error("Failed to update open-at-startup:", error);
       setOpenAtStartup(!next);
+    }
+  };
+
+  const handleCheckForUpdates = async () => {
+    setUpdateStatus({ kind: "checking" });
+    try {
+      const outcome = await checkForUpdates();
+      setUpdateStatus(
+        outcome.status === "installed"
+          ? { kind: "installed", version: outcome.version }
+          : { kind: "up-to-date" },
+      );
+    } catch (error) {
+      console.error("Failed to check for updates:", error);
+      setUpdateStatus({ kind: "error" });
     }
   };
 
@@ -70,6 +96,36 @@ export function SettingsView({ onBack }: SettingsViewProps) {
             />
           </button>
         </label>
+
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-sm">Updates</span>
+          <Button
+            variant="outline"
+            className="h-7 px-2.5 text-xs"
+            disabled={updateStatus.kind === "checking"}
+            onClick={handleCheckForUpdates}
+          >
+            {updateStatus.kind === "checking"
+              ? "Checking…"
+              : "Check for Updates"}
+          </Button>
+        </div>
+        {updateStatus.kind === "up-to-date" && (
+          <p className="text-muted-foreground text-xs">
+            You're on the latest version.
+          </p>
+        )}
+        {updateStatus.kind === "installed" && (
+          <p className="text-xs text-primary">
+            Version {updateStatus.version} downloaded — restart MiXolume to
+            finish updating.
+          </p>
+        )}
+        {updateStatus.kind === "error" && (
+          <p className="text-muted-foreground text-xs">
+            Couldn't check for updates. Try again later.
+          </p>
+        )}
       </div>
 
       <div className="mt-auto flex flex-col items-center gap-1 border-t border-border p-4 text-center">

@@ -67,6 +67,44 @@ fn set_balance(state: State<MixerState>, session_id: String, balance: f32) -> Re
         .map_err(mixer_error_to_string)
 }
 
+/// What a completed update check found, reported to the frontend as `{ "status": "upToDate" }`
+/// or `{ "status": "installed", "version": "..." }` -- distinct from a plain bool so the Settings
+/// UI can tell the user something actionable instead of "check the console" (see PLAN.md's
+/// auto-update section for why that's the bar).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase", tag = "status")]
+enum UpdateCheckOutcome {
+    UpToDate,
+    Installed { version: String },
+}
+
+/// Checks the GitHub-hosted `latest.json` manifest and, if a newer version exists, downloads and
+/// installs it immediately -- the install only *takes effect* on the next launch (Tauri's
+/// updater replaces the on-disk app bundle/installer but doesn't restart the running process),
+/// so this is safe to run silently while the app is in active use. Shared by the silent
+/// startup check and the frontend's manual "Check for Updates" button.
+async fn run_update_check(app: AppHandle) -> Result<UpdateCheckOutcome, String> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    let updater = app.updater().map_err(|err| err.to_string())?;
+    match updater.check().await.map_err(|err| err.to_string())? {
+        Some(update) => {
+            let version = update.version.clone();
+            update
+                .download_and_install(|_chunk_len, _content_len| {}, || {})
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok(UpdateCheckOutcome::Installed { version })
+        }
+        None => Ok(UpdateCheckOutcome::UpToDate),
+    }
+}
+
+#[tauri::command]
+async fn check_for_updates(app: AppHandle) -> Result<UpdateCheckOutcome, String> {
+    run_update_check(app).await
+}
+
 /// How often we re-poll the platform backend for session changes. WASAPI/PulseAudio don't give
 /// us a cheap cross-platform push notification in v1, so we poll and only emit to the frontend
 /// when the list actually differs from what we last sent (see `mixer::AppSession`'s `PartialEq`).
@@ -230,6 +268,7 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         // Auto-hide on focus loss, like a native menu-bar popover (Control Center, Wi-Fi/
         // Bluetooth menu extras): clicking anywhere outside the window closes it instead of
         // leaving it stranded on screen behind whatever the user clicked into next.
@@ -278,13 +317,38 @@ pub fn run() {
             });
             spawn_session_poll_loop(app.handle().clone(), backend);
             setup_tray(app)?;
+
+            // Silent background update check, like Sparkle on macOS -- release builds only (a
+            // dev build has no meaningful "latest.json" to compare against, and would just spam
+            // the log). The delay lets startup (session polling, tray) finish first; a failed or
+            // slow update check should never be why the app feels sluggish to open.
+            #[cfg(not(debug_assertions))]
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    match run_update_check(handle).await {
+                        Ok(UpdateCheckOutcome::Installed { version }) => {
+                            log::info!("Installed update to {version}; takes effect next launch");
+                        }
+                        Ok(UpdateCheckOutcome::UpToDate) => {
+                            log::info!("Already on the latest version");
+                        }
+                        Err(err) => {
+                            log::warn!("Background update check failed: {err}");
+                        }
+                    }
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             list_sessions,
             set_volume,
             set_muted,
-            set_balance
+            set_balance,
+            check_for_updates
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

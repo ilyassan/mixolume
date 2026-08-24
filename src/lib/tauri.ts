@@ -28,6 +28,13 @@ const PERMISSION_ERROR_MARKER = "screen & system audio recording permission";
 export const isPermissionError = (error: unknown): boolean =>
   typeof error === "string" && error.includes(PERMISSION_ERROR_MARKER);
 
+// Mirrors the Rust `UpdateCheckOutcome` enum (serde `tag = "status"`, `rename_all =
+// "camelCase"`). A found update is downloaded and installed before this resolves -- the install
+// only takes effect on the next launch, so `installed` here means "ready", not "applied yet".
+export type UpdateCheckOutcome =
+  | { status: "upToDate" }
+  | { status: "installed"; version: string };
+
 // ===== TAURI COMMANDS =====
 
 export const listSessions = () => invoke<AppSession[]>("list_sessions");
@@ -40,6 +47,9 @@ export const setMuted = (sessionId: string, muted: boolean) =>
 
 export const setBalance = (sessionId: string, balance: number) =>
   invoke<void>("set_balance", { sessionId, balance });
+
+export const checkForUpdates = () =>
+  invoke<UpdateCheckOutcome>("check_for_updates");
 
 // ===== EVENTS =====
 
