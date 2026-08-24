@@ -502,8 +502,9 @@ const MAX_PARENT_WALK_DEPTH: u8 = 8;
 fn resolve_named_running_app(pid: i32) -> Option<Retained<NSRunningApplication>> {
     let mut current_pid = pid;
     for _ in 0..MAX_PARENT_WALK_DEPTH {
-        let running_app =
-            NSRunningApplication::runningApplicationWithProcessIdentifier(current_pid as libc::pid_t);
+        let running_app = NSRunningApplication::runningApplicationWithProcessIdentifier(
+            current_pid as libc::pid_t,
+        );
         let has_name = running_app
             .as_ref()
             .and_then(|app| app.localizedName())

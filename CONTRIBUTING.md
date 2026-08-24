@@ -49,6 +49,7 @@ required in CI:
 
 ```sh
 npx tsc --noEmit
+npm run lint
 cargo check   # from src-tauri/
 ```
 
@@ -85,7 +86,7 @@ Example: `fix: correct per-app mute state on Windows sleep/resume`
 
 ## Code style
 
-- TypeScript/React: keep changes type-safe (`tsc --noEmit` must pass).
+- TypeScript/React: keep changes type-safe (`tsc --noEmit` must pass) and lint-clean (`npm run lint`).
 - Rust: run `cargo fmt` and keep `cargo check` clean before submitting.
 
 ## Questions

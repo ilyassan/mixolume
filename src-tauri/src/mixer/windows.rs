@@ -362,7 +362,9 @@ mod tests {
     #[ignore]
     fn manual_list_real_sessions() {
         let backend = WindowsMixerBackend::new();
-        let sessions = backend.list_sessions().expect("list_sessions should succeed");
+        let sessions = backend
+            .list_sessions()
+            .expect("list_sessions should succeed");
         for s in &sessions {
             println!(
                 "{} (id={}, volume={:.2}, muted={}, active={})",
