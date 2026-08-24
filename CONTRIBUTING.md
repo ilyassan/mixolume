@@ -67,8 +67,10 @@ cargo check   # from src-tauri/
   stable release, fast-forward `beta` to that commit and push a
   `vX.Y.Z-beta.N` tag from it. A stable release is a `vX.Y.Z` tag pushed
   directly from `main`. Either tag triggers
-  [`.github/workflows/release.yml`](.github/workflows/release.yml), which
-  marks the GitHub Release as a prerelease automatically whenever the tag
+  the three `.github/workflows/release-*.yml` workflows (macOS, Windows,
+  Linux — one file each so each platform's build/re-run status is
+  independent), which build in parallel and attach their installers to the
+  same GitHub Release, marked as a prerelease automatically whenever the tag
   contains a `-`.
 
 ## Commit message convention

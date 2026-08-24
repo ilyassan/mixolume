@@ -42,12 +42,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI (paths-filtered frontend/backend jobs across Windows/macOS/Linux) now
   also runs on the `beta` branch, plus Dependabot, issue/PR templates,
   contributing guide, security policy, code of conduct, and license.
-- Tag-triggered cross-platform release workflow
-  (`.github/workflows/release.yml`) building signed-but-not-yet-notarized
-  macOS, unsigned Windows, and unsigned Linux installers and attaching them
-  to a draft GitHub Release.
-- `main`/`beta` branching model: feature branches PR into `beta`; stable
-  releases are cut by merging `beta` into `main` and pushing a version tag.
+- Tag-triggered cross-platform release workflows
+  (`.github/workflows/release-{macos,windows,linux}.yml`, one file per
+  platform) building signed-but-not-yet-notarized macOS, unsigned Windows,
+  and unsigned Linux installers in parallel and attaching them all to the
+  same draft GitHub Release.
+- `main`/`beta` branching model: `main` is the trunk; `beta` is a
+  fast-forwarded prerelease checkpoint for `vX.Y.Z-beta.N` tags.
 
 ### Changed
 

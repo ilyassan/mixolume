@@ -1,0 +1,85 @@
+name: Release macOS
+
+# Tag-triggered macOS release: push a `vX.Y.Z` tag (or `vX.Y.Z-beta.N` for a prerelease) and this
+# builds a universal (Apple Silicon + Intel) .dmg and attaches it to a GitHub Release matching the
+# tag -- shared with release-windows.yml and release-linux.yml, which build the same tag in
+# parallel and attach their own installers to that same release.
+#
+# Signing status: signed with a self-signed "MiXolume Release" certificate (imported from the
+# APPLE_CERTIFICATE secret below), NOT notarized -- an Apple Developer account is pending
+# enrollment. This is still worth doing rather than shipping unsigned: using the *same*
+# certificate identity across every release gives the app a stable code-signing identity, so
+# macOS's TCC permission grants (Screen & System Audio Recording) survive version upgrades
+# instead of re-prompting on every update -- the same reasoning that made per-app volume control
+# reliable in local dev (see PLAN.md). Gatekeeper will still show an "unidentified developer"
+# warning until real notarization replaces this -- see the release body text below for the bypass
+# instructions shown to users. Once the Apple Developer Program membership is active, swap
+# APPLE_CERTIFICATE/APPLE_CERTIFICATE_PASSWORD for a real Developer ID Application certificate,
+# add a notarization step, and this workflow needs no other changes.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  release:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Import macOS signing certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+
+          echo -n "$APPLE_CERTIFICATE" | base64 --decode -o "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+      - name: Build and release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_SIGNING_IDENTITY: "MiXolume Release"
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "MiXolume ${{ github.ref_name }}"
+          releaseBody: |
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for what's new.
+
+            **macOS:** signed but not yet notarized (Apple Developer Program enrollment pending)
+            -- Gatekeeper will call it "unidentified developer" on first launch. Right-click the
+            app and choose **Open**, or run `xattr -d com.apple.quarantine /path/to/MiXolume.app`.
+            Requires macOS 14.4+.
+
+            **Windows:** unsigned -- SmartScreen may warn on first run. Click **More info → Run
+            anyway**.
+          releaseDraft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          args: --target universal-apple-darwin

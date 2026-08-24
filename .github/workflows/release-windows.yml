@@ -1,0 +1,55 @@
+name: Release Windows
+
+# Tag-triggered Windows release: push a `vX.Y.Z` tag (or `vX.Y.Z-beta.N` for a prerelease) and
+# this builds an NSIS installer and attaches it to a GitHub Release matching the tag -- shared
+# with release-macos.yml and release-linux.yml, which build the same tag in parallel and attach
+# their own installers to that same release.
+#
+# Unsigned: users will see a SmartScreen "Windows protected your PC" warning until the binary
+# earns enough download reputation, or until we buy an EV code-signing cert / ship through the
+# Microsoft Store -- both deferred until there's real user traffic.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "MiXolume ${{ github.ref_name }}"
+          releaseBody: |
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for what's new.
+
+            **macOS:** signed but not yet notarized (Apple Developer Program enrollment pending)
+            -- Gatekeeper will call it "unidentified developer" on first launch. Right-click the
+            app and choose **Open**, or run `xattr -d com.apple.quarantine /path/to/MiXolume.app`.
+            Requires macOS 14.4+.
+
+            **Windows:** unsigned -- SmartScreen may warn on first run. Click **More info → Run
+            anyway**.
+          releaseDraft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
