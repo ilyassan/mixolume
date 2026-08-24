@@ -1385,16 +1385,24 @@ mod screen_capture_permission {
 /// output. Torn down and rebuilt (via `Drop`, then a fresh [`TapEngine::new`]) whenever that set
 /// changes -- Core Audio has no documented way to add/remove a tap from a running aggregate
 /// device, matching both reference repos' own architecture.
+///
+/// Field order matters here: a struct with no custom `Drop` impl drops its fields in declaration
+/// order, and `taps` is declared *last* on purpose. `ProcessTap::drop` un-mutes the tapped
+/// process's normal output path immediately (`CATapMuteBehavior::MutedWhenTapped`), so dropping
+/// `capture`/`playback` first -- stopping the mixed pipeline cleanly -- before any native path
+/// unmutes means teardown is a clean stop-then-resume instead of a brief double-audio overlap
+/// (the mixed pipeline's tail still flowing to the speakers at the same moment the native path
+/// wakes back up).
 struct TapEngine {
     /// session_id -> index into `taps`/`gain_slots`, in tap-creation order.
     slot_of: HashMap<String, usize>,
-    #[allow(dead_code)] // kept alive so the taps aren't destroyed out from under the aggregate
-    taps: Vec<ProcessTap>,
     gain_slots: Arc<Vec<AtomicGainSlot>>,
     #[allow(dead_code)]
     capture: CaptureAggregate,
     #[allow(dead_code)]
     playback: PlaybackTap,
+    #[allow(dead_code)] // kept alive so the taps aren't destroyed out from under the aggregate
+    taps: Vec<ProcessTap>,
 }
 
 impl TapEngine {
@@ -1709,6 +1717,19 @@ impl AudioMixerBackend for MacosMixerBackend {
             engine.set_gain(session_id, effective);
         }
         Ok(())
+    }
+
+    /// Called from the "Quit" menu handler before `app.exit()`. `app.exit()` calls
+    /// `std::process::exit()` under the hood and does *not* run `Drop` for arbitrary managed
+    /// state (confirmed against Tauri's own exit-handling behavior) -- without this, quitting
+    /// while any app is tapped would leave that app's normal output path muted (per
+    /// `CATapMuteBehavior::MutedWhenTapped`) until macOS separately notices the dead process and
+    /// reclaims its Core Audio objects, which is an audible extra gap on top of the already
+    /// short one a clean `Drop` produces. Dropping `engine` here runs exactly the same
+    /// `TapEngine` teardown `reconcile_engine` already relies on, just synchronously and on
+    /// purpose instead of leaving it to chance.
+    fn shutdown(&self) {
+        self.inner.lock().unwrap().engine = None;
     }
 }
 

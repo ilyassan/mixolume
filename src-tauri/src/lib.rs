@@ -184,7 +184,14 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
-            "quit" => app.exit(0),
+            // `app.exit()` calls `std::process::exit()` and does not run `Drop` for managed
+            // state, so the mixer backend's OS-level cleanup (unmuting any macOS-tapped app's
+            // normal output path) needs to happen explicitly and synchronously first -- see
+            // `AudioMixerBackend::shutdown`'s doc comment.
+            "quit" => {
+                app.state::<MixerState>().backend.shutdown();
+                app.exit(0);
+            }
             "show" => {
                 let show_state = app.state::<WindowShowState>();
                 show_main_window_near_tray(app, &show_state, None);

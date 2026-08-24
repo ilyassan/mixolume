@@ -59,6 +59,16 @@ pub trait AudioMixerBackend: Send + Sync {
     fn set_muted(&self, session_id: &str, muted: bool) -> Result<(), MixerError>;
     /// -1.0 (full left) to 1.0 (full right), 0.0 centered.
     fn set_balance(&self, session_id: &str, balance: f32) -> Result<(), MixerError>;
+
+    /// Release any OS-level audio resources this backend is holding, synchronously, before the
+    /// app process exits. Only macOS needs this: its backend reroutes audio through process
+    /// taps + a private aggregate device, and `Drop`ping that cleanly un-mutes every tapped
+    /// app's normal output path immediately instead of leaving it muted until macOS notices the
+    /// (now-dead) tapping process and reclaims its Core Audio objects on its own -- which still
+    /// happens, but with an audible extra gap first. Windows/Linux never mute or reroute
+    /// anything; they only poke a volume/mute value on the OS's own already-persistent audio
+    /// session, so there's nothing to release and the default no-op is correct for them.
+    fn shutdown(&self) {}
 }
 
 /// Construct the real backend for whichever OS this binary is compiled for.
