@@ -7,7 +7,7 @@ import {
 } from "@tauri-apps/plugin-autostart";
 import { Button } from "@/components/ui/button";
 import { Wordmark } from "@/components/Wordmark";
-import logo from "@/assets/logo.png";
+import icon from "@/assets/icon.svg";
 import pkg from "../../package.json";
 
 interface SettingsViewProps {
@@ -15,20 +15,20 @@ interface SettingsViewProps {
 }
 
 export function SettingsView({ onBack }: SettingsViewProps) {
-  const [launchAtLogin, setLaunchAtLogin] = useState(false);
+  const [openAtStartup, setOpenAtStartup] = useState(false);
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
     isAutostartEnabled()
-      .then(setLaunchAtLogin)
+      .then(setOpenAtStartup)
       .finally(() => setLoaded(true));
   }, []);
 
-  const toggleLaunchAtLogin = async () => {
-    const next = !launchAtLogin;
+  const toggleOpenAtStartup = async () => {
+    const next = !openAtStartup;
     // Optimistic update, like the volume/mute controls elsewhere in the app -- reverted below
-    // if the underlying call actually fails (e.g. sandboxing denies the login-item write).
-    setLaunchAtLogin(next);
+    // if the underlying call actually fails (e.g. sandboxing denies the startup-item write).
+    setOpenAtStartup(next);
     try {
       if (next) {
         await enableAutostart();
@@ -36,8 +36,8 @@ export function SettingsView({ onBack }: SettingsViewProps) {
         await disableAutostart();
       }
     } catch (error) {
-      console.error("Failed to update launch-at-login:", error);
-      setLaunchAtLogin(!next);
+      console.error("Failed to update open-at-startup:", error);
+      setOpenAtStartup(!next);
     }
   };
 
@@ -52,20 +52,20 @@ export function SettingsView({ onBack }: SettingsViewProps) {
 
       <div className="flex flex-col gap-4 p-4">
         <label className="flex items-center justify-between gap-3">
-          <span className="text-sm">Launch at login</span>
+          <span className="text-sm">Open at startup</span>
           <button
             type="button"
             role="switch"
-            aria-checked={launchAtLogin}
+            aria-checked={openAtStartup}
             disabled={!loaded}
-            onClick={toggleLaunchAtLogin}
+            onClick={toggleOpenAtStartup}
             className={`relative h-5 w-9 shrink-0 rounded-full transition-colors disabled:opacity-50 ${
-              launchAtLogin ? "bg-primary" : "bg-input"
+              openAtStartup ? "bg-primary" : "bg-input"
             }`}
           >
             <span
               className={`absolute top-0.5 left-0.5 size-4 rounded-full bg-white shadow transition-transform ${
-                launchAtLogin ? "translate-x-4" : "translate-x-0"
+                openAtStartup ? "translate-x-4" : "translate-x-0"
               }`}
             />
           </button>
@@ -73,7 +73,7 @@ export function SettingsView({ onBack }: SettingsViewProps) {
       </div>
 
       <div className="mt-auto flex flex-col items-center gap-1 border-t border-border p-4 text-center">
-        <img src={logo} alt="" className="size-8" />
+        <img src={icon} alt="" className="size-8 rounded-[8px]" />
         <Wordmark className="text-sm" />
         <span className="text-muted-foreground text-xs">
           Version {pkg.version}

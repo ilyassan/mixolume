@@ -7,6 +7,7 @@ import { SettingsView } from "@/components/SettingsView";
 import { PermissionNeededView } from "@/components/PermissionNeededView";
 import { Wordmark } from "@/components/Wordmark";
 import { Button } from "@/components/ui/button";
+import icon from "@/assets/icon.svg";
 
 const FADE_HOLD_MS = 1500;
 
@@ -46,7 +47,10 @@ function App() {
   return (
     <main className="bg-background text-foreground flex h-full min-h-[120px] flex-col overflow-y-auto p-2">
       <div className="mb-1 flex items-center justify-between px-1">
-        <Wordmark className="text-muted-foreground text-xs" />
+        <div className="flex items-center gap-1.5">
+          <img src={icon} alt="" className="size-4 rounded-[4px]" />
+          <Wordmark className="text-muted-foreground text-xs" />
+        </div>
         <Button
           variant="ghost"
           size="icon"
