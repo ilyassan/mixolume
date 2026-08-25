@@ -5,17 +5,14 @@ name: Release macOS
 # tag -- shared with release-windows.yml and release-linux.yml, which build the same tag in
 # parallel and attach their own installers to that same release.
 #
-# Signing status: signed with a self-signed "MiXolume Release" certificate (imported from the
-# APPLE_CERTIFICATE secret below), NOT notarized -- an Apple Developer account is pending
-# enrollment. This is still worth doing rather than shipping unsigned: using the *same*
-# certificate identity across every release gives the app a stable code-signing identity, so
-# macOS's TCC permission grants (Screen & System Audio Recording) survive version upgrades
-# instead of re-prompting on every update -- the same reasoning that made per-app volume control
-# reliable in local dev (see PLAN.md). Gatekeeper will still show an "unidentified developer"
-# warning until real notarization replaces this -- see the release body text below for the bypass
-# instructions shown to users. Once the Apple Developer Program membership is active, swap
-# APPLE_CERTIFICATE/APPLE_CERTIFICATE_PASSWORD for a real Developer ID Application certificate,
-# add a notarization step, and this workflow needs no other changes.
+# Signing status: signed with a real Apple-issued "Developer ID Application: ILYASS ANIDA
+# (87G5QNR3X3)" certificate (Apple Developer Program membership went active 2026-08-25) --
+# APPLE_CERTIFICATE/APPLE_CERTIFICATE_PASSWORD hold this real certificate now, superseding the
+# earlier self-signed "MiXolume Release" placeholder used while enrollment was pending. NOT YET
+# NOTARIZED, though -- signing alone does not remove Gatekeeper's "unidentified developer"
+# warning, only notarization does (see the release body text below for the bypass instructions
+# still needed until that's added). Notarization needs an App Store Connect API key, which is a
+# separate step from the certificate above.
 #
 # Separately, TAURI_SIGNING_PRIVATE_KEY/_PASSWORD sign the tauri-plugin-updater artifact
 # (MiXolume_universal.app.tar.gz.sig) -- an unrelated Ed25519 keypair used only to prove to a
@@ -72,7 +69,7 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_SIGNING_IDENTITY: "MiXolume Release"
+          APPLE_SIGNING_IDENTITY: "Developer ID Application: ILYASS ANIDA (87G5QNR3X3)"
           # Separate from the certificate above: signs the updater artifact
           # (MiXolume_universal.app.tar.gz.sig) so tauri-plugin-updater can verify it.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
