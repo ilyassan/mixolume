@@ -454,15 +454,43 @@ const SYSTEM_BUNDLE_PREFIXES_TO_HIDE: &[&str] = &[
     "com.apple.controlcenter",
     "com.apple.WebKit.GPU",
     "com.apple.cmio",
-    // System alert/UI sound player (login chime, volume-change beep, etc.) -- not something a
-    // user would ever want to individually mute/adjust from a per-app mixer.
-    "com.apple.systemsoundserverd",
 ];
 
 fn is_hidden_system_bundle(bundle_id: &str) -> bool {
     SYSTEM_BUNDLE_PREFIXES_TO_HIDE
         .iter()
         .any(|prefix| bundle_id.starts_with(prefix))
+}
+
+/// Bare `/usr/sbin`-style daemons hidden by process name rather than bundle id, since they have
+/// no `.app` bundle (and therefore no `CFBundleIdentifier` for [`is_hidden_system_bundle`] to
+/// even see) -- confirmed live: `systemsoundserverd` (the login-chime/volume-beep player) showed
+/// up in the session list because `p.bundle_id` was `None` for it, so the bundle-prefix check
+/// never ran at all. Matched against [`process_short_name`]'s `pbi_name`, not `pbi_comm` --
+/// `pbi_comm` truncates to 15 characters, which would cut "systemsoundserverd" short.
+const SYSTEM_PROCESS_NAMES_TO_HIDE: &[&str] = &["systemsoundserverd"];
+
+/// `proc_bsdinfo.pbi_name` for `pid` -- a C string up to 31 bytes, read via the same
+/// `libproc::pidinfo::<BSDInfo>` call [`resolve_named_running_app`] already uses for parent-pid
+/// walking. `None` if the process has already exited or the syscall otherwise fails.
+fn process_short_name(pid: i32) -> Option<String> {
+    let info = libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(pid, 0).ok()?;
+    let bytes: Vec<u8> = info
+        .pbi_name
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    let name = String::from_utf8(bytes).ok()?;
+    (!name.is_empty()).then_some(name)
+}
+
+fn is_hidden_system_process(bundle_id: Option<&str>, pid: i32) -> bool {
+    if bundle_id.is_some_and(is_hidden_system_bundle) {
+        return true;
+    }
+    process_short_name(pid)
+        .is_some_and(|name| SYSTEM_PROCESS_NAMES_TO_HIDE.contains(&name.as_str()))
 }
 
 // =================================================================================================
@@ -1631,10 +1659,8 @@ impl AudioMixerBackend for MacosMixerBackend {
 
         let mut sessions = Vec::with_capacity(processes.len());
         for p in &processes {
-            if let Some(bundle_id) = &p.bundle_id {
-                if is_hidden_system_bundle(bundle_id) {
-                    continue;
-                }
+            if is_hidden_system_process(p.bundle_id.as_deref(), p.pid) {
+                continue;
             }
             let id = session_id_for_pid(p.pid);
             // Copy out before touching `app_info_cache` below -- `state` borrows
@@ -1955,6 +1981,27 @@ mod tests {
     fn does_not_hide_ordinary_apps() {
         assert!(!is_hidden_system_bundle("com.spotify.client"));
         assert!(!is_hidden_system_bundle("com.google.Chrome"));
+    }
+
+    #[test]
+    fn process_name_lookup_resolves_this_process_own_pid() {
+        // `process_short_name`/`is_hidden_system_process`'s no-bundle-id path needs a real live
+        // pid (no way to fake `pbi_name` without a real syscall) -- this test process's own pid
+        // is the only "real" one a unit test has on hand.
+        let own_pid = std::process::id() as i32;
+        assert!(process_short_name(own_pid).is_some());
+        // The cargo test binary is obviously not named "systemsoundserverd" -- proves the
+        // no-bundle-id path doesn't spuriously hide arbitrary processes it doesn't recognize.
+        assert!(!is_hidden_system_process(None, own_pid));
+    }
+
+    #[test]
+    fn bundle_id_hide_list_short_circuits_before_any_process_name_lookup() {
+        // A hidden bundle id should be caught without needing a valid pid at all -- pid 0 would
+        // make `process_short_name` fail/return `None`, so this only passes if the bundle check
+        // runs (and short-circuits) first.
+        assert!(is_hidden_system_process(Some("com.apple.coreaudiod"), 0));
+        assert!(!is_hidden_system_process(Some("com.spotify.client"), 0));
     }
 
     // ---------------------------------------------------------------------------------------
