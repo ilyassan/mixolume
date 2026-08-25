@@ -187,10 +187,11 @@
 //!   not a shortcut unique to this port.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::{clamp_volume, AppSession, AudioMixerBackend, MixerError};
+use super::macos_ducking::{self, DuckingRuntime};
+use super::{clamp_volume, AppSession, AudioMixerBackend, DuckingSettings, MixerError};
 
 // =================================================================================================
 // Pure logic -- no Core Audio / objc2 involved. Fully unit-testable on any OS, which is why the
@@ -907,6 +908,11 @@ struct CaptureAggregate {
     /// Pre-allocated once here (not per-callback) so [`mix_capture_callback`] never touches the
     /// heap on the realtime thread. See [`Scratch`]'s doc comment.
     scratch: Arc<Scratch>,
+    /// A second pre-allocated scratch buffer, same reasoning as `scratch` -- holds one tap's
+    /// worth of mono-summed samples per callback, reused across taps and callbacks, purely so
+    /// [`macos_ducking::SpeechDetector::process_frame`] never sees a fresh allocation.
+    duck_mono_scratch: Arc<Scratch>,
+    duck: Arc<DuckingRuntime>,
     /// Kept alive for the aggregate's lifetime -- the block only borrows the `Arc`s it needs, but
     /// the `RcBlock` itself must outlive `io_proc_id`'s registration.
     #[allow(dead_code)]
@@ -927,6 +933,7 @@ impl CaptureAggregate {
         taps: &[ProcessTap],
         gain_slots: Arc<Vec<AtomicGainSlot>>,
         ring: Arc<FloatRingBuffer>,
+        duck: Arc<DuckingRuntime>,
     ) -> Result<Self, MixerError> {
         let description = build_aggregate_description(output_device_uid, taps)?;
 
@@ -952,6 +959,8 @@ impl CaptureAggregate {
             gain_slots,
             ring,
             scratch: Arc::new(Scratch::new(MIX_SCRATCH_CAPACITY)),
+            duck_mono_scratch: Arc::new(Scratch::new(MIX_SCRATCH_CAPACITY)),
+            duck,
             block: None,
         })
     }
@@ -960,6 +969,8 @@ impl CaptureAggregate {
         let gain_slots = Arc::clone(&self.gain_slots);
         let ring = Arc::clone(&self.ring);
         let scratch = Arc::clone(&self.scratch);
+        let duck_mono_scratch = Arc::clone(&self.duck_mono_scratch);
+        let duck = Arc::clone(&self.duck);
 
         // The real generated `AudioDeviceIOBlock` type (checked directly against
         // objc2-core-audio 0.3.2's source) takes `NonNull<..>`, not raw `*mut ..` pointers --
@@ -978,7 +989,8 @@ impl CaptureAggregate {
                 // SAFETY: called by Core Audio on its own realtime thread with valid, non-null
                 // pointers for the lifetime of the call. No allocation/locking happens in this
                 // closure body -- only atomic loads, raw pointer arithmetic, and reuse of the
-                // pre-allocated `scratch` buffer via `Scratch::as_mut_slice`.
+                // pre-allocated `scratch`/`duck_mono_scratch` buffers and `duck`'s per-app state
+                // (all single-owner, this closure being the sole owner -- see their doc comments).
                 unsafe {
                     mix_capture_callback(
                         input_data.as_ptr(),
@@ -986,6 +998,8 @@ impl CaptureAggregate {
                         &gain_slots,
                         &ring,
                         &scratch,
+                        &duck_mono_scratch,
+                        &duck,
                     );
                 }
             },
@@ -1044,6 +1058,8 @@ unsafe fn mix_capture_callback(
     gain_slots: &[AtomicGainSlot],
     ring: &FloatRingBuffer,
     scratch: &Scratch,
+    duck_mono_scratch: &Scratch,
+    duck: &DuckingRuntime,
 ) {
     // Zero the aggregate's own output buffer -- we never drive audio from this device directly,
     // only use it to receive tap input (mirrors sonicflow's capture callback).
@@ -1075,10 +1091,36 @@ unsafe fn mix_capture_callback(
         return;
     }
 
+    // --- Auto-duck analysis pass: classify each tap's audio before mixing anything, so the mix
+    // pass below already knows who (if anyone) is currently "talking". Entirely skipped, at
+    // zero cost beyond one atomic load, when the feature is off. ---
+    let ducking_enabled = duck.is_enabled();
+    if ducking_enabled {
+        // SAFETY: same single-owner discipline as `scratch` -- see `DuckingRuntime`'s doc comment.
+        let detectors = duck.detectors_mut();
+        let mono_buf = &mut duck_mono_scratch.as_mut_slice()[..mix_samples];
+        for (i, buf) in in_buffers.iter().take(tap_count).enumerate() {
+            if buf.mData.is_null() || i >= detectors.len() {
+                continue;
+            }
+            let in_samples =
+                (buf.mDataByteSize as usize / std::mem::size_of::<f32>()).min(mix_samples);
+            let frames = in_samples / 2;
+            let src = std::slice::from_raw_parts(buf.mData as *const f32, in_samples);
+            for f in 0..frames {
+                mono_buf[f] = 0.5 * (src[f * 2] + src[f * 2 + 1]);
+            }
+            detectors[i].process_frame(&mono_buf[..frames]);
+        }
+    }
+    let any_triggering = ducking_enabled && duck.detectors_mut().iter().any(|d| d.is_triggering());
+
     // SAFETY: this callback is the sole owner of `scratch` for the lifetime of the capture
     // aggregate (see `Scratch`'s doc comment) -- no other callback/thread touches it concurrently.
     let mix_buf = &mut scratch.as_mut_slice()[..mix_samples];
     mix_buf.fill(0.0);
+    let multipliers = duck.multipliers_mut();
+    let detectors = duck.detectors_mut();
     for (i, buf) in in_buffers.iter().take(tap_count).enumerate() {
         if buf.mData.is_null() {
             continue;
@@ -1087,13 +1129,31 @@ unsafe fn mix_capture_callback(
         if gain_l == 0.0 && gain_r == 0.0 {
             continue;
         }
+
+        // Ducked if something *else* is currently triggering and this app isn't itself the
+        // trigger -- an app that's actively talking is never ducked by its own speech. Smoothed
+        // toward the target rather than snapped, so engaging/releasing the duck is a gentle dip
+        // instead of an audible jump (see `DuckingRuntime::SMOOTHING_PER_CALLBACK`'s doc comment).
+        let duck_mult = if let Some(m) = multipliers.get_mut(i) {
+            let is_self_triggering = detectors.get(i).is_some_and(|d| d.is_triggering());
+            let target = if any_triggering && !is_self_triggering {
+                macos_ducking::DUCK_GAIN_MULTIPLIER
+            } else {
+                1.0
+            };
+            *m += (target - *m) * DuckingRuntime::SMOOTHING_PER_CALLBACK;
+            *m
+        } else {
+            1.0
+        };
+
         let in_samples = buf.mDataByteSize as usize / std::mem::size_of::<f32>();
         let n = in_samples.min(mix_samples);
         let src = std::slice::from_raw_parts(buf.mData as *const f32, n);
         // Interleaved stereo (the tap is `initStereoMixdownOfProcesses`): even sample indices
         // are the left channel, odd indices are the right channel.
         for (f, sample) in src.iter().enumerate() {
-            let gain = if f % 2 == 0 { gain_l } else { gain_r };
+            let gain = (if f % 2 == 0 { gain_l } else { gain_r }) * duck_mult;
             mix_buf[f] += sample * gain;
         }
     }
@@ -1436,6 +1496,8 @@ struct TapEngine {
 impl TapEngine {
     fn new(
         active: &[(&AudioProcessInfo, String, (f32, f32))], // (process, session_id, initial (left, right) gain)
+        ducking_enabled_live: Arc<AtomicBool>,
+        ducking_excluded_flags: Vec<bool>,
     ) -> Result<Self, MixerError> {
         if !screen_capture_permission::ensure_granted() {
             return Err(MixerError::Platform(
@@ -1467,12 +1529,17 @@ impl TapEngine {
             Arc::new(initial_gains.into_iter().map(AtomicGainSlot::new).collect());
 
         let ring = Arc::new(FloatRingBuffer::new(8192));
+        let duck = Arc::new(DuckingRuntime::new(
+            ducking_enabled_live,
+            ducking_excluded_flags,
+        ));
 
         let mut capture = CaptureAggregate::new(
             &output_uid,
             &taps,
             Arc::clone(&gain_slots),
             Arc::clone(&ring),
+            duck,
         )?;
         capture.start()?;
 
@@ -1545,6 +1612,18 @@ struct Inner {
     /// reused, at which point removing the stale entry -- see `list_sessions` -- fixes it),
     /// which makes the leak negligible even without solving the underlying autorelease-pool gap.
     app_info_cache: HashMap<i32, (String, Option<Vec<u8>>)>,
+    /// Cross-app auto-duck settings, loaded from disk once at startup (see
+    /// [`macos_ducking::load_settings`]) and updated in place as the user changes them from
+    /// Settings. `enabled` is also mirrored into `ducking_enabled_live` for instant effect --
+    /// see that field's doc comment for why the two aren't the same thing.
+    ducking_settings: DuckingSettings,
+    /// The single source of truth [`DuckingRuntime`] actually reads every audio callback,
+    /// shared (via `Arc`, cloned in) across every engine rebuild so toggling the feature in
+    /// Settings takes effect on the very next callback instead of waiting for some app to
+    /// start/stop and trigger a rebuild. Per-app exclusion, in contrast, *is* only baked in at
+    /// rebuild time -- a much rarer settings change, where "takes effect shortly" is an
+    /// acceptable tradeoff for not needing a second live-update channel into the realtime state.
+    ducking_enabled_live: Arc<AtomicBool>,
 }
 
 /// macOS backend: per-app volume via Core Audio process taps + a private aggregate device +
@@ -1556,11 +1635,15 @@ pub struct MacosMixerBackend {
 
 impl MacosMixerBackend {
     pub fn new() -> Self {
+        let ducking_settings = macos_ducking::load_settings();
+        let ducking_enabled_live = Arc::new(AtomicBool::new(ducking_settings.enabled));
         Self {
             inner: Mutex::new(Inner {
                 gain_state: HashMap::new(),
                 engine: None,
                 app_info_cache: HashMap::new(),
+                ducking_settings,
+                ducking_enabled_live,
             }),
         }
     }
@@ -1613,7 +1696,30 @@ impl MacosMixerBackend {
             })
             .collect();
 
-        inner.engine = Some(TapEngine::new(&active_with_state)?);
+        // Best-effort only: reads whatever `app_info_cache` already has, never resolves a fresh
+        // name here. A brand-new app's very first engine build might not have its exclusion
+        // setting applied yet (the cache warms moments later, in `list_sessions`'s own loop
+        // right after this returns) -- self-corrects on the next rebuild, and avoids duplicating
+        // `resolve_app_info`'s NSRunningApplication/icon work (already a proven leak risk if
+        // called somewhere not covered by the cache, see `app_info_cache`'s doc comment).
+        let excluded_flags: Vec<bool> = active
+            .iter()
+            .map(|p| {
+                inner.app_info_cache.get(&p.pid).is_some_and(|(name, _)| {
+                    inner
+                        .ducking_settings
+                        .excluded_triggers
+                        .iter()
+                        .any(|e| e == name)
+                })
+            })
+            .collect();
+
+        inner.engine = Some(TapEngine::new(
+            &active_with_state,
+            Arc::clone(&inner.ducking_enabled_live),
+            excluded_flags,
+        )?);
         Ok(())
     }
 }
@@ -1756,6 +1862,37 @@ impl AudioMixerBackend for MacosMixerBackend {
     /// purpose instead of leaving it to chance.
     fn shutdown(&self) {
         self.inner.lock().unwrap().engine = None;
+    }
+
+    fn get_ducking_settings(&self) -> DuckingSettings {
+        self.inner.lock().unwrap().ducking_settings.clone()
+    }
+
+    fn set_ducking_enabled(&self, enabled: bool) -> Result<(), MixerError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.ducking_settings.enabled = enabled;
+        // Takes effect on the very next audio callback -- see `ducking_enabled_live`'s doc
+        // comment on `Inner` for why this is a live atomic rather than baked into the engine.
+        inner.ducking_enabled_live.store(enabled, Ordering::Relaxed);
+        macos_ducking::save_settings(&inner.ducking_settings);
+        Ok(())
+    }
+
+    fn set_duck_trigger_excluded(
+        &self,
+        display_name: &str,
+        excluded: bool,
+    ) -> Result<(), MixerError> {
+        let mut inner = self.inner.lock().unwrap();
+        let list = &mut inner.ducking_settings.excluded_triggers;
+        let already_excluded = list.iter().any(|n| n == display_name);
+        if excluded && !already_excluded {
+            list.push(display_name.to_string());
+        } else if !excluded {
+            list.retain(|n| n != display_name);
+        }
+        macos_ducking::save_settings(&inner.ducking_settings);
+        Ok(())
     }
 }
 

@@ -3,7 +3,7 @@ mod mixer;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use mixer::{AppSession, AudioMixerBackend, MixerError};
+use mixer::{AppSession, AudioMixerBackend, DuckingSettings, MixerError};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State};
@@ -64,6 +64,31 @@ fn set_balance(state: State<MixerState>, session_id: String, balance: f32) -> Re
     state
         .backend
         .set_balance(&session_id, balance)
+        .map_err(mixer_error_to_string)
+}
+
+#[tauri::command]
+fn get_ducking_settings(state: State<MixerState>) -> DuckingSettings {
+    state.backend.get_ducking_settings()
+}
+
+#[tauri::command]
+fn set_ducking_enabled(state: State<MixerState>, enabled: bool) -> Result<(), String> {
+    state
+        .backend
+        .set_ducking_enabled(enabled)
+        .map_err(mixer_error_to_string)
+}
+
+#[tauri::command]
+fn set_duck_trigger_excluded(
+    state: State<MixerState>,
+    display_name: String,
+    excluded: bool,
+) -> Result<(), String> {
+    state
+        .backend
+        .set_duck_trigger_excluded(&display_name, excluded)
         .map_err(mixer_error_to_string)
 }
 
@@ -348,7 +373,10 @@ pub fn run() {
             set_volume,
             set_muted,
             set_balance,
-            check_for_updates
+            check_for_updates,
+            get_ducking_settings,
+            set_ducking_enabled,
+            set_duck_trigger_excluded
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

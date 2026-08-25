@@ -35,6 +35,14 @@ export type UpdateCheckOutcome =
   | { status: "upToDate" }
   | { status: "installed"; version: string };
 
+// Mirrors the Rust `DuckingSettings` struct. Only meaningful on macOS -- every other backend's
+// default trait methods report `{ enabled: false, excludedTriggers: [] }` and ignore writes, so
+// the Settings UI can call these unconditionally without checking the platform itself.
+export interface DuckingSettings {
+  enabled: boolean;
+  excludedTriggers: string[];
+}
+
 // ===== TAURI COMMANDS =====
 
 export const listSessions = () => invoke<AppSession[]>("list_sessions");
@@ -50,6 +58,15 @@ export const setBalance = (sessionId: string, balance: number) =>
 
 export const checkForUpdates = () =>
   invoke<UpdateCheckOutcome>("check_for_updates");
+
+export const getDuckingSettings = () =>
+  invoke<DuckingSettings>("get_ducking_settings");
+
+export const setDuckingEnabled = (enabled: boolean) =>
+  invoke<void>("set_ducking_enabled", { enabled });
+
+export const setDuckTriggerExcluded = (displayName: string, excluded: boolean) =>
+  invoke<void>("set_duck_trigger_excluded", { displayName, excluded });
 
 // ===== EVENTS =====
 

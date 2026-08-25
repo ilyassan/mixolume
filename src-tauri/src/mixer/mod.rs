@@ -8,6 +8,8 @@
 pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(target_os = "macos")]
+pub mod macos_ducking;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
@@ -34,6 +36,19 @@ pub struct AppSession {
     pub balance: f32,
     /// Producing sound right now, as opposed to present-but-silent.
     pub is_active: bool,
+}
+
+/// Cross-app auto-duck settings: whether the feature runs at all, and which apps (by display
+/// name -- the only identity a relaunch can't change, unlike the pid-based session id) are
+/// opted out of being a duck *trigger*. An excluded app can still be ducked by something else;
+/// it just never causes ducking itself. Only macOS's tap-based backend can implement this (it
+/// needs each app's raw audio content, which Windows/Linux never have access to, only a volume
+/// knob) -- the trait's default methods make it an inert no-op everywhere else.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuckingSettings {
+    pub enabled: bool,
+    pub excluded_triggers: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -69,6 +84,22 @@ pub trait AudioMixerBackend: Send + Sync {
     /// anything; they only poke a volume/mute value on the OS's own already-persistent audio
     /// session, so there's nothing to release and the default no-op is correct for them.
     fn shutdown(&self) {}
+
+    /// Current auto-duck settings. Default: disabled, nothing excluded -- correct as-is for
+    /// every backend that doesn't override it.
+    fn get_ducking_settings(&self) -> DuckingSettings {
+        DuckingSettings::default()
+    }
+    fn set_ducking_enabled(&self, _enabled: bool) -> Result<(), MixerError> {
+        Ok(())
+    }
+    fn set_duck_trigger_excluded(
+        &self,
+        _display_name: &str,
+        _excluded: bool,
+    ) -> Result<(), MixerError> {
+        Ok(())
+    }
 }
 
 /// Construct the real backend for whichever OS this binary is compiled for.
