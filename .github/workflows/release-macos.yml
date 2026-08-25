@@ -8,11 +8,12 @@ name: Release macOS
 # Signing status: signed with a real Apple-issued "Developer ID Application: ILYASS ANIDA
 # (87G5QNR3X3)" certificate (Apple Developer Program membership went active 2026-08-25) --
 # APPLE_CERTIFICATE/APPLE_CERTIFICATE_PASSWORD hold this real certificate now, superseding the
-# earlier self-signed "MiXolume Release" placeholder used while enrollment was pending. NOT YET
-# NOTARIZED, though -- signing alone does not remove Gatekeeper's "unidentified developer"
-# warning, only notarization does (see the release body text below for the bypass instructions
-# still needed until that's added). Notarization needs an App Store Connect API key, which is a
-# separate step from the certificate above.
+# earlier self-signed "MiXolume Release" placeholder used while enrollment was pending. Also
+# notarized, via an App Store Connect API key (APPLE_API_KEY_ID/APPLE_API_ISSUER/APPLE_API_KEY_P8)
+# -- tauri-action/tauri-cli submits the build to Apple's notary service and staples the ticket
+# automatically as part of `tauri build` once APPLE_API_KEY/APPLE_API_ISSUER/APPLE_API_KEY_PATH
+# are set, no separate manual `notarytool` step needed. Together, signing + notarization mean
+# Gatekeeper should no longer show the "unidentified developer" warning at all.
 #
 # Separately, TAURI_SIGNING_PRIVATE_KEY/_PASSWORD sign the tauri-plugin-updater artifact
 # (MiXolume_universal.app.tar.gz.sig) -- an unrelated Ed25519 keypair used only to prove to a
@@ -65,11 +66,19 @@ jobs:
           security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
+      - name: Write App Store Connect API key
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: echo "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
+
       - name: Build and release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_SIGNING_IDENTITY: "Developer ID Application: ILYASS ANIDA (87G5QNR3X3)"
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/AuthKey.p8
           # Separate from the certificate above: signs the updater artifact
           # (MiXolume_universal.app.tar.gz.sig) so tauri-plugin-updater can verify it.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -80,9 +89,7 @@ jobs:
           releaseBody: |
             See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for what's new.
 
-            **macOS:** signed but not yet notarized (Apple Developer Program enrollment pending)
-            -- Gatekeeper will call it "unidentified developer" on first launch. Right-click the
-            app and choose **Open**, or run `xattr -d com.apple.quarantine /path/to/MiXolume.app`.
+            **macOS:** signed and notarized by Apple -- just open it like any other app.
             Requires macOS 14.4+.
 
             **Windows:** unsigned -- SmartScreen may warn on first run. Click **More info → Run
