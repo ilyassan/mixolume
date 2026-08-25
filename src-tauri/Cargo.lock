@@ -2273,7 +2273,7 @@ dependencies = [
 
 [[package]]
 name = "mixolume"
-version = "0.1.0-beta.3"
+version = "0.1.0-beta.4"
 dependencies = [
  "block2",
  "image",
