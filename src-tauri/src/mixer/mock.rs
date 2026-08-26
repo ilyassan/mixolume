@@ -64,9 +64,12 @@ mod tests {
             display_name: format!("App {id}"),
             icon_png: None,
             volume: 0.5,
+            effective_volume: 0.5,
             muted: false,
             balance: 0.0,
             is_active: true,
+            is_duck_trigger: false,
+            is_ducked: false,
         }
     }
 

@@ -101,7 +101,13 @@ export const useMixerStore = create<MixerState>((set, get) => ({
   setVolume: (sessionId, volume) => {
     set((state) => ({
       sessions: state.sessions.map((session) =>
-        session.id === sessionId ? { ...session, volume } : session,
+        // Optimistically assumes not currently ducked (the common case) so a normal drag feels
+        // immediate -- if the session actually is mid-duck, the next backend push (within
+        // ~700ms) corrects `effectiveVolume` back down. A duck happening to start/end in that
+        // exact window is a rare, self-correcting cosmetic blip, not a real bug.
+        session.id === sessionId
+          ? { ...session, volume, effectiveVolume: volume }
+          : session,
       ),
     }));
 

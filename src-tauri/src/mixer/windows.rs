@@ -259,9 +259,12 @@ impl AudioMixerBackend for WindowsMixerBackend {
                     display_name,
                     icon_png,
                     volume,
+                    effective_volume: volume,
                     muted,
                     balance,
                     is_active: state == AudioSessionStateActive,
+                    is_duck_trigger: false,
+                    is_ducked: false,
                 });
             }
         }

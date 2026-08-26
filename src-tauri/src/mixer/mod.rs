@@ -29,26 +29,44 @@ pub struct AppSession {
     pub display_name: String,
     /// PNG-encoded icon bytes, if one could be resolved.
     pub icon_png: Option<Vec<u8>>,
-    /// 0.0 (silent) to 1.0 (full scale). Platforms that allow boosting past unity may exceed 1.0.
+    /// The volume the user set -- what the slider drags from, unaffected by auto-duck. 0.0
+    /// (silent) to 1.0 (full scale). Platforms that allow boosting past unity may exceed 1.0.
     pub volume: f32,
+    /// What's actually coming out right now: equal to `volume` normally, or `volume` scaled down
+    /// by the duck multiplier while `is_ducked` is true. This -- not `volume` -- is what the UI
+    /// should actually display, so a ducked app visibly reads quieter instead of showing its
+    /// full target volume while it's audibly not playing at that level.
+    pub effective_volume: f32,
     pub muted: bool,
     /// Left/right stereo balance: -1.0 is full left, 0.0 is centered, 1.0 is full right.
     pub balance: f32,
     /// Producing sound right now, as opposed to present-but-silent.
     pub is_active: bool,
+    /// Auto-duck currently has this app pegged as the reason everything else is quieter --
+    /// macOS-only (see `DuckingSettings`'s doc comment for why), always `false` elsewhere.
+    pub is_duck_trigger: bool,
+    /// Auto-duck is currently lowering this app's volume because some *other* app is triggering
+    /// it -- macOS-only, always `false` elsewhere.
+    pub is_ducked: bool,
 }
 
 /// Cross-app auto-duck settings: whether the feature runs at all, and which apps (by display
 /// name -- the only identity a relaunch can't change, unlike the pid-based session id) are
-/// opted out of being a duck *trigger*. An excluded app can still be ducked by something else;
-/// it just never causes ducking itself. Only macOS's tap-based backend can implement this (it
+/// explicitly allowed to be a duck *trigger*. Opt-in, not opt-out: an app not in this list can
+/// still be *ducked* by something else, it just never *causes* ducking itself -- with an empty
+/// list (the default), the feature does nothing at all until the user adds at least one app.
+/// Deliberately not "everyone's a trigger by default, uncheck the ones you don't want" -- with
+/// real usage, most apps someone has open are never going to be a call/voice-note source, so a
+/// short curated allow-list is both the simpler mental model and the one that actually scales in
+/// the Settings UI (a handful of added apps with icons, not a scrolling checklist of everything
+/// that's ever played audio this session). Only macOS's tap-based backend can implement this (it
 /// needs each app's raw audio content, which Windows/Linux never have access to, only a volume
 /// knob) -- the trait's default methods make it an inert no-op everywhere else.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DuckingSettings {
     pub enabled: bool,
-    pub excluded_triggers: Vec<String>,
+    pub priority_triggers: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -85,7 +103,7 @@ pub trait AudioMixerBackend: Send + Sync {
     /// session, so there's nothing to release and the default no-op is correct for them.
     fn shutdown(&self) {}
 
-    /// Current auto-duck settings. Default: disabled, nothing excluded -- correct as-is for
+    /// Current auto-duck settings. Default: disabled, no priority apps -- correct as-is for
     /// every backend that doesn't override it.
     fn get_ducking_settings(&self) -> DuckingSettings {
         DuckingSettings::default()
@@ -93,13 +111,27 @@ pub trait AudioMixerBackend: Send + Sync {
     fn set_ducking_enabled(&self, _enabled: bool) -> Result<(), MixerError> {
         Ok(())
     }
-    fn set_duck_trigger_excluded(
+    /// Adds (`is_priority: true`) or removes (`false`) an app from the duck-trigger allow-list.
+    fn set_duck_trigger_priority(
         &self,
         _display_name: &str,
-        _excluded: bool,
+        _is_priority: bool,
     ) -> Result<(), MixerError> {
         Ok(())
     }
+}
+
+/// One currently-running app, by name -- macOS-only internal use (matching well-known
+/// communication apps for auto-duck's default-seeding, see `set_ducking_enabled` in macos.rs),
+/// not exposed through [`AudioMixerBackend`] or to the frontend. The Settings "add app" picker
+/// searches [`AppSession`]s instead (apps MiXolume has actually seen making sound) -- an earlier
+/// version searched every running app via this type (with an icon per app), but resolving icons
+/// for many apps at once turned out to be inherently slow (real per-icon AppKit decode cost) and
+/// caused a multi-second/-minute Settings freeze, so it was reverted; only the name is needed
+/// for matching against a known-apps list, so that's all this carries now.
+#[derive(Debug, Clone)]
+pub struct RunningAppInfo {
+    pub name: String,
 }
 
 /// Construct the real backend for whichever OS this binary is compiled for.

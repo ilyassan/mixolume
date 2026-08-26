@@ -10,11 +10,18 @@ export interface AppSession {
   id: string;
   displayName: string;
   iconPng: number[] | null;
+  /** The volume the user set -- what the slider drags from, unaffected by auto-duck. */
   volume: number;
+  /** What's actually coming out right now -- lower than `volume` while `isDucked` is true. */
+  effectiveVolume: number;
   muted: boolean;
   /** -1.0 (full left) to 1.0 (full right), 0.0 centered. */
   balance: number;
   isActive: boolean;
+  /** Auto-duck currently has this app pegged as why everything else is quieter. macOS-only. */
+  isDuckTrigger: boolean;
+  /** Auto-duck is currently lowering this app's volume because another app is triggering it. */
+  isDucked: boolean;
 }
 
 // Substring of the Rust error returned while Screen & System Audio Recording permission hasn't
@@ -35,12 +42,14 @@ export type UpdateCheckOutcome =
   | { status: "upToDate" }
   | { status: "installed"; version: string };
 
-// Mirrors the Rust `DuckingSettings` struct. Only meaningful on macOS -- every other backend's
-// default trait methods report `{ enabled: false, excludedTriggers: [] }` and ignore writes, so
-// the Settings UI can call these unconditionally without checking the platform itself.
+// Mirrors the Rust `DuckingSettings` struct. Opt-in, not opt-out: `priorityTriggers` is the list
+// of apps explicitly allowed to trigger a duck -- an empty list means the feature does nothing
+// yet, not "everything triggers." Only meaningful on macOS -- every other backend's default
+// trait methods report `{ enabled: false, priorityTriggers: [] }` and ignore writes, so the
+// Settings UI can call these unconditionally without checking the platform itself.
 export interface DuckingSettings {
   enabled: boolean;
-  excludedTriggers: string[];
+  priorityTriggers: string[];
 }
 
 // ===== TAURI COMMANDS =====
@@ -65,8 +74,8 @@ export const getDuckingSettings = () =>
 export const setDuckingEnabled = (enabled: boolean) =>
   invoke<void>("set_ducking_enabled", { enabled });
 
-export const setDuckTriggerExcluded = (displayName: string, excluded: boolean) =>
-  invoke<void>("set_duck_trigger_excluded", { displayName, excluded });
+export const setDuckTriggerPriority = (displayName: string, isPriority: boolean) =>
+  invoke<void>("set_duck_trigger_priority", { displayName, isPriority });
 
 // ===== EVENTS =====
 

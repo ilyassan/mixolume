@@ -191,7 +191,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::macos_ducking::{self, DuckingRuntime};
-use super::{clamp_volume, AppSession, AudioMixerBackend, DuckingSettings, MixerError};
+use super::{
+    clamp_volume, AppSession, AudioMixerBackend, DuckingSettings, MixerError, RunningAppInfo,
+};
 
 // =================================================================================================
 // Pure logic -- no Core Audio / objc2 involved. Fully unit-testable on any OS, which is why the
@@ -502,11 +504,12 @@ fn is_hidden_system_process(bundle_id: Option<&str>, pid: i32) -> bool {
 
 use block2::RcBlock;
 use objc2::rc::Retained;
+use objc2_foundation::NSInteger;
 // `AnyThread` brings `CATapDescription::alloc()` into scope -- objc2's alloc/init pattern puts
 // `alloc()` on this trait (implemented for every objc2 class) rather than directly on each class,
 // which the compiler doesn't surface unless the trait itself is imported.
 use objc2::AnyThread;
-use objc2_app_kit::NSRunningApplication;
+use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication, NSWorkspace};
 use objc2_core_audio::{
     self as ca, AudioDeviceIOProcID, AudioObjectID, AudioObjectPropertyAddress, CATapDescription,
     CATapMuteBehavior,
@@ -569,40 +572,90 @@ fn resolve_named_running_app(pid: i32) -> Option<Retained<NSRunningApplication>>
 /// ancestor can be resolved (e.g. it already exited); icon falls back to `None` (the frontend
 /// already renders a placeholder for that -- see `SessionIcon.tsx`).
 fn resolve_app_info(pid: i32, bundle_id: Option<&str>) -> (String, Option<Vec<u8>>) {
-    let running_app = resolve_named_running_app(pid);
+    // Belt-and-suspenders alongside `app_info_cache`'s once-per-pid caching (which is what
+    // actually keeps this leak-free in practice -- see that field's doc comment): draining the
+    // pool here means even an uncached call site doesn't reproduce it.
+    objc2::rc::autoreleasepool(|_pool| {
+        let running_app = resolve_named_running_app(pid);
 
-    let name = running_app
-        .as_ref()
-        .and_then(|app| app.localizedName())
-        .map(|name| name.to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| bundle_id.map(str::to_string))
-        .unwrap_or_else(|| format!("pid {pid}"));
+        let name = running_app
+            .as_ref()
+            .and_then(|app| app.localizedName())
+            .map(|name| name.to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| bundle_id.map(str::to_string))
+            .unwrap_or_else(|| format!("pid {pid}"));
 
-    let icon_png = running_app.and_then(|app| app.icon()).and_then(|icon| {
-        // SAFETY: `representationUsingType_properties`'s only documented precondition is that
-        // `properties`' value type matches what the chosen `storage_type` expects -- for `.PNG`
-        // with no per-key options, an empty dictionary is always valid (this mirrors how
-        // AppKit's own `NSBitmapImageRep` sample code calls it with `[:]`).
-        unsafe { icon_to_png(&icon) }
-    });
+        let icon_png = running_app.and_then(|app| app.icon()).and_then(|icon| {
+            // SAFETY: `representationUsingType_properties`'s only documented precondition is
+            // that `properties`' value type matches what the chosen `storage_type` expects --
+            // for `.PNG` with no per-key options, an empty dictionary is always valid (this
+            // mirrors how AppKit's own `NSBitmapImageRep` sample code calls it with `[:]`).
+            unsafe { icon_to_png(&icon) }
+        });
 
-    (name, icon_png)
+        (name, icon_png)
+    })
 }
 
-/// `NSImage` -> PNG bytes, via the standard AppKit round-trip (TIFF representation -> bitmap rep
-/// -> re-encode as PNG). There's no direct "give me PNG bytes" method on `NSImage` itself.
+/// App icons the UI ever draws top out around 32-40 logical px (see `SessionIcon.tsx`); even at
+/// a generous 3x for Retina headroom, nothing bigger than this is ever useful. Standard `.icns`
+/// icon sets bundle several `NSBitmapImageRep`s at fixed sizes (16/32/128/256/512/1024...) --
+/// picking the smallest one at or above this bound avoids ever encoding the full 1024x1024 (or
+/// larger) master representation just to hand the frontend something it immediately downscales.
+const ICON_MAX_PIXELS_WIDE: NSInteger = 128;
+
+/// `NSImage` -> PNG bytes, sized down to [`ICON_MAX_PIXELS_WIDE`] first. There's no direct "give
+/// me PNG bytes" method on `NSImage` itself, and its default `TIFFRepresentation` bundles
+/// whichever representation is "best" for the image's nominal size -- for a Dock/Force-Quit-style
+/// icon that's usually the full native resolution (1024x1024 isn't unusual), which is wasteful to
+/// encode and bloats the resulting JSON (each byte becomes several characters as a `number[]`
+/// array) for no visual benefit, since the frontend immediately downscales it anyway.
 ///
 /// # Safety
 /// `representationUsingType_properties` requires `properties`'s value type to match what
 /// `storage_type` expects; passing an empty dictionary for `.PNG` (no per-format options) is
 /// always valid.
 unsafe fn icon_to_png(icon: &objc2_app_kit::NSImage) -> Option<Vec<u8>> {
-    let tiff = icon.TIFFRepresentation()?;
-    let bitmap = objc2_app_kit::NSBitmapImageRep::initWithData(
-        objc2_app_kit::NSBitmapImageRep::alloc(),
-        &tiff,
-    )?;
+    let reps = icon.representations();
+
+    // Prefer whichever bundled bitmap representation is smallest while still >= our target --
+    // no drawing/resizing needed, just picking a differently-sized copy the icon set already
+    // has. Reps below the target are only used as a last resort (so a tiny icon set still
+    // produces *something* rather than nothing), and the full TIFF/master representation is
+    // the final fallback for icons with no bitmap reps at all (synthesized/vector-only images).
+    let mut best_at_or_above: Option<(NSInteger, Retained<objc2_app_kit::NSBitmapImageRep>)> = None;
+    let mut best_below: Option<(NSInteger, Retained<objc2_app_kit::NSBitmapImageRep>)> = None;
+    for rep in reps.iter() {
+        let Some(bitmap) = rep.downcast_ref::<objc2_app_kit::NSBitmapImageRep>() else {
+            continue;
+        };
+        let width = bitmap.pixelsWide();
+        if width >= ICON_MAX_PIXELS_WIDE {
+            if best_at_or_above
+                .as_ref()
+                .is_none_or(|(best_width, _)| width < *best_width)
+            {
+                best_at_or_above = Some((width, Retained::from(bitmap)));
+            }
+        } else if best_below
+            .as_ref()
+            .is_none_or(|(best_width, _)| width > *best_width)
+        {
+            best_below = Some((width, Retained::from(bitmap)));
+        }
+    }
+
+    let bitmap = if let Some((_, bitmap)) = best_at_or_above.or(best_below) {
+        bitmap
+    } else {
+        let tiff = icon.TIFFRepresentation()?;
+        objc2_app_kit::NSBitmapImageRep::initWithData(
+            objc2_app_kit::NSBitmapImageRep::alloc(),
+            &tiff,
+        )?
+    };
+
     // `CopiedKey = NSString` explicitly: an empty slice gives the compiler nothing to infer it
     // from, and `NSBitmapImageRepPropertyKey` (the dictionary's `KeyType`) is itself `NSString`,
     // so `NSString` is the natural (and only sensible) choice satisfying `NSCopying` here.
@@ -614,6 +667,43 @@ unsafe fn icon_to_png(icon: &objc2_app_kit::NSImage) -> Option<Vec<u8>> {
         &empty_properties,
     )?;
     Some(png_data.to_vec())
+}
+
+/// Every currently-running "regular" (dock-visible) app, by name -- used only to check which
+/// [`WELL_KNOWN_COMMUNICATION_APPS`] are running for the auto-duck default-seeding done in
+/// `set_ducking_enabled`. Deliberately broader than `AppSession`'s list (which only ever contains
+/// apps the HAL has seen actually producing audio): a call app sitting open but silent should
+/// still count as "running" for seeding purposes.
+///
+/// Names only, no icons -- an earlier version of this also resolved and returned each app's icon
+/// for a Settings "add app" picker that searched every running app. That picker was reverted back
+/// to searching [`AppSession`]s only (apps MiXolume has actually seen making sound) after
+/// confirming live that resolving icons for many running apps was inherently expensive (Apple
+/// Developer Forums thread 735213 documents the same `NSImage`/`.icns` round-trip taking multiple
+/// seconds per icon the first time) and that no caching/budgeting strategy made it feel fast
+/// enough to justify the complexity. The only remaining caller here only ever needs the name, so
+/// there's nothing left to resolve.
+fn list_running_applications() -> Vec<RunningAppInfo> {
+    let own_pid = std::process::id() as i32;
+    // AppKit enumeration/`localizedName` calls create autoreleased temporaries -- see
+    // `Inner::app_info_cache`'s doc comment for the confirmed-on-real-hardware leak this avoids.
+    objc2::rc::autoreleasepool(|_pool| {
+        NSWorkspace::sharedWorkspace()
+            .runningApplications()
+            .iter()
+            .filter(|app| {
+                app.activationPolicy() == NSApplicationActivationPolicy::Regular
+                    && app.processIdentifier() != own_pid
+            })
+            .filter_map(|app| {
+                let name = app.localizedName()?.to_string();
+                if name.is_empty() {
+                    return None;
+                }
+                Some(RunningAppInfo { name })
+            })
+            .collect()
+    })
 }
 
 /// Makes an `RcBlock` `Send`/`Sync` so it can live inside `Mutex<Inner>` -- required because
@@ -1130,31 +1220,45 @@ unsafe fn mix_capture_callback(
             continue;
         }
 
+        let in_samples = buf.mDataByteSize as usize / std::mem::size_of::<f32>();
+        let n = in_samples.min(mix_samples);
+        let src = std::slice::from_raw_parts(buf.mData as *const f32, n);
+        let total_frames = n / 2;
+
         // Ducked if something *else* is currently triggering and this app isn't itself the
-        // trigger -- an app that's actively talking is never ducked by its own speech. Smoothed
-        // toward the target rather than snapped, so engaging/releasing the duck is a gentle dip
-        // instead of an audible jump (see `DuckingRuntime::SMOOTHING_PER_CALLBACK`'s doc comment).
-        let duck_mult = if let Some(m) = multipliers.get_mut(i) {
+        // trigger -- an app that's actively talking is never ducked by its own speech.
+        // `start_mult`/`end_mult` are only the per-*callback* endpoints (same one-pole smoothing
+        // as before, toward `target`); the per-frame loop below linearly ramps between them
+        // *within* this buffer instead of applying `end_mult` flat across every sample. Without
+        // that, the biggest single step of the whole exponential curve (the very first callback
+        // after a trigger/release) landed all at once at the start of a ~10ms buffer -- audible
+        // as a faint click, confirmed live. Interpolating per frame removes that step entirely.
+        let (start_mult, end_mult) = if let Some(m) = multipliers.get_mut(i) {
             let is_self_triggering = detectors.get(i).is_some_and(|d| d.is_triggering());
             let target = if any_triggering && !is_self_triggering {
                 macos_ducking::DUCK_GAIN_MULTIPLIER
             } else {
                 1.0
             };
-            *m += (target - *m) * DuckingRuntime::SMOOTHING_PER_CALLBACK;
-            *m
+            let start = *m;
+            let end = start + (target - start) * DuckingRuntime::SMOOTHING_PER_CALLBACK;
+            *m = end;
+            (start, end)
         } else {
-            1.0
+            (1.0, 1.0)
         };
 
-        let in_samples = buf.mDataByteSize as usize / std::mem::size_of::<f32>();
-        let n = in_samples.min(mix_samples);
-        let src = std::slice::from_raw_parts(buf.mData as *const f32, n);
         // Interleaved stereo (the tap is `initStereoMixdownOfProcesses`): even sample indices
         // are the left channel, odd indices are the right channel.
-        for (f, sample) in src.iter().enumerate() {
-            let gain = (if f % 2 == 0 { gain_l } else { gain_r }) * duck_mult;
-            mix_buf[f] += sample * gain;
+        for frame in 0..total_frames {
+            let t = if total_frames > 1 {
+                frame as f32 / (total_frames - 1) as f32
+            } else {
+                1.0
+            };
+            let duck_mult = start_mult + (end_mult - start_mult) * t;
+            mix_buf[frame * 2] += src[frame * 2] * gain_l * duck_mult;
+            mix_buf[frame * 2 + 1] += src[frame * 2 + 1] * gain_r * duck_mult;
         }
     }
 
@@ -1498,6 +1602,7 @@ impl TapEngine {
         active: &[(&AudioProcessInfo, String, (f32, f32))], // (process, session_id, initial (left, right) gain)
         ducking_enabled_live: Arc<AtomicBool>,
         ducking_excluded_flags: Vec<bool>,
+        ducking_persisted_states: Vec<macos_ducking::PersistedDuckState>,
     ) -> Result<Self, MixerError> {
         if !screen_capture_permission::ensure_granted() {
             return Err(MixerError::Platform(
@@ -1532,6 +1637,7 @@ impl TapEngine {
         let duck = Arc::new(DuckingRuntime::new(
             ducking_enabled_live,
             ducking_excluded_flags,
+            ducking_persisted_states,
         ));
 
         let mut capture = CaptureAggregate::new(
@@ -1553,6 +1659,24 @@ impl TapEngine {
             capture,
             playback,
         })
+    }
+
+    /// Reads back the current ducking hysteresis state for every tapped app, keyed by session
+    /// id -- called by `reconcile_engine` on the *outgoing* engine, right before it's replaced,
+    /// so the incoming one can seed its detectors from where these left off instead of resetting
+    /// to zero. Safe to call at any point in this engine's life (including while its realtime
+    /// callback might still be running) -- see [`macos_ducking::HysteresisCounters`]'s doc
+    /// comment for why that's actually true and not just hoped-for.
+    fn snapshot_ducking_state(&self) -> HashMap<String, macos_ducking::PersistedDuckState> {
+        let snapshots = self.capture.duck.snapshot_all();
+        self.slot_of
+            .iter()
+            .filter_map(|(session_id, &index)| {
+                snapshots
+                    .get(index)
+                    .map(|state| (session_id.clone(), *state))
+            })
+            .collect()
     }
 
     fn set_gain(&self, session_id: &str, effective_gains: (f32, f32)) {
@@ -1624,6 +1748,12 @@ struct Inner {
     /// rebuild time -- a much rarer settings change, where "takes effect shortly" is an
     /// acceptable tradeoff for not needing a second live-update channel into the realtime state.
     ducking_enabled_live: Arc<AtomicBool>,
+    /// Per-app ducking hysteresis, keyed by session id -- survives engine rebuilds the same way
+    /// `gain_state` does (seeded into each fresh engine, refreshed from the outgoing one right
+    /// before it's replaced). Without this, a rebuild would reset every app's "how long has this
+    /// been speech" counter to zero, which is exactly the real bug `HysteresisCounters`'s doc
+    /// comment describes -- confirmed live, not hypothetical.
+    ducking_state: HashMap<String, macos_ducking::PersistedDuckState>,
 }
 
 /// macOS backend: per-app volume via Core Audio process taps + a private aggregate device +
@@ -1644,6 +1774,7 @@ impl MacosMixerBackend {
                 app_info_cache: HashMap::new(),
                 ducking_settings,
                 ducking_enabled_live,
+                ducking_state: HashMap::new(),
             }),
         }
     }
@@ -1674,6 +1805,16 @@ impl MacosMixerBackend {
             return Ok(());
         }
 
+        // Read back the outgoing engine's ducking hysteresis *before* dropping it, so the new
+        // engine can seed its detectors from where these left off instead of resetting every
+        // app's "how long has this been speech" counter to zero on every single rebuild -- see
+        // `Inner::ducking_state`'s doc comment for why that used to be a real, confirmed bug.
+        if let Some(old_engine) = inner.engine.as_ref() {
+            inner
+                .ducking_state
+                .extend(old_engine.snapshot_ducking_state());
+        }
+
         // Drop the old engine (if any) before building the new one -- Core Audio aggregate/tap
         // ids aren't reusable, and we don't want two aggregates fighting over the same real
         // output device even briefly.
@@ -1697,21 +1838,33 @@ impl MacosMixerBackend {
             .collect();
 
         // Best-effort only: reads whatever `app_info_cache` already has, never resolves a fresh
-        // name here. A brand-new app's very first engine build might not have its exclusion
-        // setting applied yet (the cache warms moments later, in `list_sessions`'s own loop
-        // right after this returns) -- self-corrects on the next rebuild, and avoids duplicating
-        // `resolve_app_info`'s NSRunningApplication/icon work (already a proven leak risk if
-        // called somewhere not covered by the cache, see `app_info_cache`'s doc comment).
+        // name here. Defaults to excluded (not a priority app) when the name isn't cached yet --
+        // matches the opt-in model's own default (nothing triggers until explicitly added), and
+        // self-corrects on the next rebuild once `list_sessions`'s own loop warms the cache right
+        // after this returns. Avoids duplicating `resolve_app_info`'s NSRunningApplication/icon
+        // work (already a proven leak risk if called somewhere not covered by the cache, see
+        // `app_info_cache`'s doc comment).
         let excluded_flags: Vec<bool> = active
             .iter()
             .map(|p| {
-                inner.app_info_cache.get(&p.pid).is_some_and(|(name, _)| {
+                let is_priority = inner.app_info_cache.get(&p.pid).is_some_and(|(name, _)| {
                     inner
                         .ducking_settings
-                        .excluded_triggers
+                        .priority_triggers
                         .iter()
                         .any(|e| e == name)
-                })
+                });
+                !is_priority
+            })
+            .collect();
+        let persisted_ducking_states: Vec<macos_ducking::PersistedDuckState> = active
+            .iter()
+            .map(|p| {
+                inner
+                    .ducking_state
+                    .get(&session_id_for_pid(p.pid))
+                    .copied()
+                    .unwrap_or_default()
             })
             .collect();
 
@@ -1719,6 +1872,7 @@ impl MacosMixerBackend {
             &active_with_state,
             Arc::clone(&inner.ducking_enabled_live),
             excluded_flags,
+            persisted_ducking_states,
         )?);
         Ok(())
     }
@@ -1763,6 +1917,25 @@ impl AudioMixerBackend for MacosMixerBackend {
 
         Self::reconcile_engine(&mut inner, &processes)?;
 
+        // Read back current ducking state for the UI -- safe to call any time (see
+        // `TapEngine::snapshot_ducking_state`'s doc comment), and cheap (atomic loads only, no
+        // realtime-thread coordination needed).
+        // Gated on the settings flag, not just derived from the atomics: toggling the feature
+        // off doesn't retroactively clear an in-progress trigger's state (nothing needs it to,
+        // since the realtime mixing pass already independently checks the live `enabled` flag
+        // before ever applying a duck), so an un-gated read here could keep reporting a stale
+        // "still ducking" to the UI for a session or two after the user turns it off.
+        let duck_states = if inner.ducking_settings.enabled {
+            inner
+                .engine
+                .as_ref()
+                .map(|e| e.snapshot_ducking_state())
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+        let any_duck_triggering = duck_states.values().any(|s| s.is_triggering);
+
         let mut sessions = Vec::with_capacity(processes.len());
         for p in &processes {
             if is_hidden_system_process(p.bundle_id.as_deref(), p.pid) {
@@ -1789,14 +1962,28 @@ impl AudioMixerBackend for MacosMixerBackend {
                 .entry(p.pid)
                 .or_insert_with(|| resolve_app_info(p.pid, p.bundle_id.as_deref()))
                 .clone();
+            let is_duck_trigger = duck_states.get(&id).is_some_and(|s| s.is_triggering);
+            // Ducked by *someone else* -- an app currently triggering never ducks itself,
+            // matching the exact same condition `mix_capture_callback`'s mixing pass applies to
+            // the real audio.
+            let is_ducked = any_duck_triggering && !is_duck_trigger;
             sessions.push(AppSession {
                 id,
                 display_name,
                 icon_png,
                 volume,
+                // Matches `mix_capture_callback`'s own duck multiplier exactly -- this is what's
+                // actually coming out of the speakers right now, not the target `volume`.
+                effective_volume: if is_ducked {
+                    volume * macos_ducking::DUCK_GAIN_MULTIPLIER
+                } else {
+                    volume
+                },
                 muted,
                 balance,
                 is_active: p.is_running_output,
+                is_duck_trigger,
+                is_ducked,
             });
         }
         // Drop cache entries for pids that no longer exist -- keeps this bounded over a long
@@ -1870,31 +2057,74 @@ impl AudioMixerBackend for MacosMixerBackend {
 
     fn set_ducking_enabled(&self, enabled: bool) -> Result<(), MixerError> {
         let mut inner = self.inner.lock().unwrap();
+        let was_enabled = inner.ducking_settings.enabled;
         inner.ducking_settings.enabled = enabled;
         // Takes effect on the very next audio callback -- see `ducking_enabled_live`'s doc
         // comment on `Inner` for why this is a live atomic rather than baked into the engine.
         inner.ducking_enabled_live.store(enabled, Ordering::Relaxed);
+
+        // First-ever enable (an empty list, not just "currently off"): pre-fill with whichever
+        // well-known communication apps are already running, so the feature does something
+        // useful immediately instead of silently doing nothing until the user manually finds and
+        // adds WhatsApp themselves. Only fires on the false -> true transition with nothing
+        // already configured -- reusing "empty list" as the signal rather than a separate
+        // "have we ever seeded this" flag is a deliberate simplification: the only way it
+        // mis-fires is a user who deliberately emptied the list getting it re-seeded on the next
+        // toggle, which is a minor, easily-undone edge case, not worth a whole extra persisted
+        // field to prevent.
+        if enabled && !was_enabled && inner.ducking_settings.priority_triggers.is_empty() {
+            let running_names: Vec<String> = list_running_applications()
+                .into_iter()
+                .map(|app| app.name)
+                .collect();
+            for well_known in WELL_KNOWN_COMMUNICATION_APPS {
+                if running_names.iter().any(|n| n == well_known) {
+                    inner
+                        .ducking_settings
+                        .priority_triggers
+                        .push((*well_known).to_string());
+                }
+            }
+        }
+
         macos_ducking::save_settings(&inner.ducking_settings);
         Ok(())
     }
 
-    fn set_duck_trigger_excluded(
+    fn set_duck_trigger_priority(
         &self,
         display_name: &str,
-        excluded: bool,
+        is_priority: bool,
     ) -> Result<(), MixerError> {
         let mut inner = self.inner.lock().unwrap();
-        let list = &mut inner.ducking_settings.excluded_triggers;
-        let already_excluded = list.iter().any(|n| n == display_name);
-        if excluded && !already_excluded {
+        let list = &mut inner.ducking_settings.priority_triggers;
+        let already_present = list.iter().any(|n| n == display_name);
+        if is_priority && !already_present {
             list.push(display_name.to_string());
-        } else if !excluded {
+        } else if !is_priority {
             list.retain(|n| n != display_name);
         }
         macos_ducking::save_settings(&inner.ducking_settings);
         Ok(())
     }
 }
+
+/// Recognized by exact `NSRunningApplication.localizedName` match against the *default* macOS
+/// app name for each -- not exhaustive, not locale-aware (a non-English system's Finder might
+/// show a different localized name for some of these), just a reasonable starting set for the
+/// common case. The user can always add/remove anything regardless of this list.
+const WELL_KNOWN_COMMUNICATION_APPS: &[&str] = &[
+    "WhatsApp",
+    "Zoom",
+    "Discord",
+    "FaceTime",
+    "Microsoft Teams",
+    "Slack",
+    "Messages",
+    "Skype",
+    "Telegram",
+    "Signal",
+];
 
 #[cfg(test)]
 mod tests {

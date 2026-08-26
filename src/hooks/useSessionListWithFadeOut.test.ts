@@ -10,9 +10,12 @@ const makeSession = (overrides: Partial<AppSession> = {}): AppSession => ({
   displayName: "App A",
   iconPng: null,
   volume: 0.5,
+  effectiveVolume: 0.5,
   muted: false,
   balance: 0,
   isActive: true,
+  isDuckTrigger: false,
+  isDucked: false,
   ...overrides,
 });
 

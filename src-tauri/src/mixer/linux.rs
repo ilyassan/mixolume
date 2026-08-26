@@ -256,9 +256,12 @@ fn parse_block(id: &str, lines: &[&str]) -> AppSession {
         // bytes. Resolving an icon-theme name to actual image bytes is out of scope for v1.
         icon_png: None,
         volume,
+        effective_volume: volume,
         muted,
         balance,
         is_active,
+        is_duck_trigger: false,
+        is_ducked: false,
     }
 }
 

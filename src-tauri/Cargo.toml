@@ -104,6 +104,13 @@ objc2-app-kit = { version = "0.3", features = [
     "libc",
     "NSImage",
     "NSBitmapImageRep",
+    # NSWorkspace.sharedWorkspace().runningApplications() -- lists every currently-running app
+    # (filtered to NSApplicationActivationPolicy::Regular, i.e. normal dock-visible apps), for
+    # the auto-duck "add app" picker. Deliberately not scanning /Applications for *installed*
+    # apps that aren't currently running -- that needs Launch Services / bundle-icon resolution
+    # this project doesn't otherwise touch, for a case (add an app before it's ever been opened)
+    # that's a much rarer real need than "it's open right now but hasn't made sound yet".
+    "NSWorkspace",
 ] }
 libc = "0.2"
 # For walking up a process's parent chain when resolving app names -- some audio-producing
@@ -114,6 +121,17 @@ libc = "0.2"
 # bindings (docs_rs/osx_libproc_bindings.rs) since `libc` itself doesn't expose Darwin's private
 # `kinfo_proc` layout.
 libproc = "0.14"
+# Real speech/music discrimination for the auto-duck feature (src/mixer/macos_ducking.rs),
+# replacing an earlier hand-rolled energy+zero-crossing-rate heuristic that -- confirmed live,
+# not assumed -- classified ordinary music as speech almost continuously. This wraps libfvad,
+# the actual WebRTC project's Voice-Activity-Detection module (a classic Gaussian Mixture Model,
+# not a neural net): the same code literally every WebRTC video call uses to decide when someone
+# is talking, vendored as C source and compiled by `cc` at build time -- no bundled ML runtime,
+# no model file, no new heavyweight dependency. Requires a C compiler (already needed for this
+# project's Xcode/Tauri toolchain) but no external system library. `is_voice_segment` requires
+# audio in exact 10/20/30ms i16 chunks at a fixed sample rate -- see `macos_ducking.rs`'s frame
+# accumulator for why that doesn't just line up with Core Audio's own callback size.
+webrtc-vad = "0.4"
 
 [dev-dependencies]
 tokio-test = "0.4"

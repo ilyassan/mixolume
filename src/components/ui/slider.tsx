@@ -38,6 +38,13 @@ function Slider({
         data-slot="slider-track"
         className="bg-secondary relative h-1.5 w-full grow overflow-hidden rounded-full"
       >
+        {/* No CSS transition here -- Radix positions this element and the thumb below via two
+            *independent* inline `left`/`right` styles. CSS-transitioning each separately let them
+            visibly fall out of sync under rapid updates (confirmed live, including during an
+            ordinary manual drag: the fill and the thumb briefly disagreed on the actual value).
+            `value` is fed a single already-smoothed number from `useSmoothedNumber` (see
+            `SessionRow.tsx`) instead, so both this and the thumb always read the exact same value
+            on the exact same render -- they can't desync from something that's the same number. */}
         <SliderPrimitive.Range
           data-slot="slider-range"
           className="bg-primary absolute h-full"

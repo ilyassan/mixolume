@@ -35,6 +35,19 @@ export function useSessionListWithFadeOut(
     sessions.map((session) => ({ ...session, removing: false })),
   );
   const removalTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  // Reuses the previous `FadingSession` wrapper object when nothing about it actually needs to
+  // change, instead of unconditionally spreading a fresh `{ ...session, removing: false }` every
+  // single call (every poll tick, every drag update to *any* session). The mixer store already
+  // takes care to keep a session's object reference stable when that specific session hasn't
+  // changed (`mixer-store.ts`'s `setVolume` etc. only replace the one entry being updated) --
+  // spreading unconditionally here threw that away, handing every `SessionRow` a brand new
+  // `session` prop on every render regardless of whether its own data moved at all, which meant
+  // every row re-rendered (and re-ran its own layout/animation work) on every other row's update.
+  // Confirmed live as a real, measurable cause of dragging one app's slider spiking CPU and
+  // dropping frames project-wide, not just a theoretical inefficiency.
+  const wrappedCacheRef = useRef(
+    new Map<string, { raw: AppSession; wrapped: FadingSession }>(),
+  );
 
   // Wall-clock time each session id was last reported `isActive: true`. A
   // deactivation timer (below) flips `rendered` directly once a session's
@@ -101,13 +114,30 @@ export function useSessionListWithFadeOut(
           clearTimeout(pendingTimer);
           removalTimersRef.current.delete(session.id);
         }
-        if (session.isActive) {
-          return { ...session, removing: false };
+        const isActive = session.isActive
+          ? true
+          : (() => {
+              const lastActiveAt = lastActiveAtRef.current.get(session.id);
+              return lastActiveAt !== undefined && now - lastActiveAt < holdMs;
+            })();
+
+        // Reuse the previous wrapper only if it came from this *exact* session object (the
+        // store didn't touch this session since last time) and would resolve to the same
+        // `isActive` -- `removing` is always `false` on this path (the session is present in
+        // the new list), so a cached wrapper that was mid-fade-out can't be reused as-is.
+        const cached = wrappedCacheRef.current.get(session.id);
+        if (
+          cached &&
+          cached.raw === session &&
+          cached.wrapped.isActive === isActive &&
+          !cached.wrapped.removing
+        ) {
+          return cached.wrapped;
         }
-        const lastActiveAt = lastActiveAtRef.current.get(session.id);
-        const stillHeldActive =
-          lastActiveAt !== undefined && now - lastActiveAt < holdMs;
-        return { ...session, isActive: stillHeldActive, removing: false };
+
+        const wrapped: FadingSession = { ...session, isActive, removing: false };
+        wrappedCacheRef.current.set(session.id, { raw: session, wrapped });
+        return wrapped;
       });
 
       // Was rendered before but is missing from the new list: keep its last
@@ -124,6 +154,7 @@ export function useSessionListWithFadeOut(
               latest.filter((session) => session.id !== prevSession.id),
             );
             removalTimersRef.current.delete(prevSession.id);
+            wrappedCacheRef.current.delete(prevSession.id);
           }, holdMs);
           removalTimersRef.current.set(prevSession.id, timer);
         }

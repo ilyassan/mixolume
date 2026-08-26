@@ -81,14 +81,14 @@ fn set_ducking_enabled(state: State<MixerState>, enabled: bool) -> Result<(), St
 }
 
 #[tauri::command]
-fn set_duck_trigger_excluded(
+fn set_duck_trigger_priority(
     state: State<MixerState>,
     display_name: String,
-    excluded: bool,
+    is_priority: bool,
 ) -> Result<(), String> {
     state
         .backend
-        .set_duck_trigger_excluded(&display_name, excluded)
+        .set_duck_trigger_priority(&display_name, is_priority)
         .map_err(mixer_error_to_string)
 }
 
@@ -130,10 +130,17 @@ async fn check_for_updates(app: AppHandle) -> Result<UpdateCheckOutcome, String>
     run_update_check(app).await
 }
 
-/// How often we re-poll the platform backend for session changes. WASAPI/PulseAudio don't give
-/// us a cheap cross-platform push notification in v1, so we poll and only emit to the frontend
-/// when the list actually differs from what we last sent (see `mixer::AppSession`'s `PartialEq`).
-const POLL_INTERVAL: Duration = Duration::from_millis(700);
+/// How often we re-poll the platform backend for session changes. WASAPI/PulseAudio/Core Audio
+/// don't give us a cheap cross-platform push notification in v1, so we poll and only emit to the
+/// frontend when the list actually differs from what we last sent (see `mixer::AppSession`'s
+/// `PartialEq`). 150ms rather than something even tighter: each tick does real work (enumerating
+/// HAL/session objects and reading properties on each), and this is a background menu-bar
+/// utility that should stay cheap to leave running -- but 150ms is still functionally free on
+/// modern hardware (a handful of lightweight reads, ~7 times a second) while keeping UI-visible
+/// state (notably auto-duck's badges/`effectiveVolume`) close enough behind the real audio
+/// decision to not feel laggy. Do not drop this to "instant"/0 -- that trades an imperceptible
+/// latency improvement for real, unnecessary CPU/battery cost on a process meant to run all day.
+const POLL_INTERVAL: Duration = Duration::from_millis(150);
 
 fn spawn_session_poll_loop(app_handle: AppHandle, backend: Arc<dyn AudioMixerBackend>) {
     tauri::async_runtime::spawn(async move {
@@ -376,7 +383,7 @@ pub fn run() {
             check_for_updates,
             get_ducking_settings,
             set_ducking_enabled,
-            set_duck_trigger_excluded
+            set_duck_trigger_priority
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
