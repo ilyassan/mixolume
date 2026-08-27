@@ -12,6 +12,15 @@ pub mod macos;
 pub mod macos_ducking;
 #[cfg(target_os = "windows")]
 pub mod windows;
+#[cfg(target_os = "windows")]
+pub mod windows_ducking;
+
+/// Voice-activity classification/debounce logic shared by macOS's and Windows' auto-duck
+/// backends -- pure `webrtc_vad` + atomics, no platform-specific code, so it's not behind a
+/// `cfg(target_os = ...)` gate like the backends that use it. See its own doc comment for the
+/// split rationale.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub mod duck_detect;
 
 #[cfg(test)]
 pub mod mock;
@@ -43,10 +52,11 @@ pub struct AppSession {
     /// Producing sound right now, as opposed to present-but-silent.
     pub is_active: bool,
     /// Auto-duck currently has this app pegged as the reason everything else is quieter --
-    /// macOS-only (see `DuckingSettings`'s doc comment for why), always `false` elsewhere.
+    /// implemented on macOS and Windows (see `DuckingSettings`'s doc comment), always `false` on
+    /// Linux, which has no auto-duck backend yet.
     pub is_duck_trigger: bool,
     /// Auto-duck is currently lowering this app's volume because some *other* app is triggering
-    /// it -- macOS-only, always `false` elsewhere.
+    /// it -- same platform support as `is_duck_trigger`.
     pub is_ducked: bool,
 }
 
@@ -59,9 +69,14 @@ pub struct AppSession {
 /// real usage, most apps someone has open are never going to be a call/voice-note source, so a
 /// short curated allow-list is both the simpler mental model and the one that actually scales in
 /// the Settings UI (a handful of added apps with icons, not a scrolling checklist of everything
-/// that's ever played audio this session). Only macOS's tap-based backend can implement this (it
-/// needs each app's raw audio content, which Windows/Linux never have access to, only a volume
-/// knob) -- the trait's default methods make it an inert no-op everywhere else.
+/// that's ever played audio this session).
+///
+/// Implementing this needs access to a trigger app's *raw audio content* (to tell speech from
+/// music/silence), not just a volume knob -- macOS gets that via Core Audio process taps
+/// (`macos.rs`), Windows via WASAPI's per-process loopback capture (`windows_ducking.rs`).
+/// PulseAudio (Linux's current backend, `linux.rs`) has no equivalent per-app capture mechanism
+/// without a bigger architecture change (routing each app through its own null-sink/monitor), so
+/// Linux still uses the trait's default no-op methods below.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DuckingSettings {

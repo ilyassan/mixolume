@@ -42,6 +42,13 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
 thiserror = "1"
 log = "0.4"
+# `log`'s macros (`log::warn!` etc., used throughout this crate, including auto-duck's capture
+# failure diagnostics) are no-ops without a subscriber -- nothing in this crate ever initialized
+# one before, so every warning/info log this app has ever emitted went nowhere, visible neither in
+# a terminal nor anywhere else. `env_logger::init()` in `run()` fixes that for `npm run tauri dev`
+# (prints to the terminal it's running in); controlled via `RUST_LOG` (defaults to showing
+# warn+error if unset -- see the `init()` call site for the exact default).
+env_logger = "0.11"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -59,7 +66,22 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_GdiPlus",
+    # `implement`: needed for the `windows::core::implement!` macro, which
+    # `windows_ducking.rs` uses to provide a COM `IActivateAudioInterfaceCompletionHandler` for
+    # Process Loopback Capture's async activation.
+    "implement",
 ] }
+# Real speech/music discrimination for auto-duck (src/mixer/duck_detect.rs, shared with macOS) --
+# see that file's and Cargo.toml's macOS-dependency-block comment for the full rationale (wraps
+# libfvad, the real WebRTC project's VAD, instead of a from-scratch classifier that was confirmed
+# live to misclassify music as speech almost continuously).
+webrtc-vad = "0.4"
+# Needed alongside `windows`'s own `implement` feature: the `#[implement(...)]` macro
+# (windows_ducking.rs's `IActivateAudioInterfaceCompletionHandler`) expands to code that
+# references the `windows_core` crate directly, not only through `windows::core`'s re-export --
+# confirmed by the build failing with "could not find `windows_core` in the list of imported
+# crates" until this was added as its own direct dependency.
+windows-core = "0.58"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 regex = "1"
