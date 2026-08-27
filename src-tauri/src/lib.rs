@@ -32,6 +32,13 @@ struct WindowShowState {
     /// window that's never been successfully positioned yet, is `tauri.conf.json`'s unset
     /// default, nowhere near the tray).
     last_tray_position: Mutex<Option<PhysicalPosition<f64>>>,
+    /// Whether the window has ever been shown before. On macOS it's re-anchored under the
+    /// menu-bar icon on *every* show (other menu extras coming and going shifts the icon, and
+    /// the window has no other persistent position to speak of). On Windows/Linux it's only
+    /// anchored there the first time -- the window is draggable and has a real taskbar entry
+    /// there (see `tauri.conf.json`'s `skipTaskbar: false`), so re-snapping it under the tray on
+    /// every open would fight the user's own placement of it.
+    has_shown_before: Mutex<bool>,
 }
 
 fn mixer_error_to_string(err: MixerError) -> String {
@@ -67,9 +74,39 @@ fn set_balance(state: State<MixerState>, session_id: String, balance: f32) -> Re
         .map_err(mixer_error_to_string)
 }
 
+/// Starts an OS-native window-move drag, for the frontend's draggable header (Windows/Linux
+/// only -- see `App.tsx`). Deliberately not just the frontend calling the built-in
+/// `getCurrentWindow().startDragging()` directly: on Windows, starting the drag posts a
+/// synthetic `WM_NCLBUTTONDOWN`/`HTCAPTION` message to make the OS treat the click as if it hit
+/// a real title bar, and handling that message hands focus briefly between the WebView2 child
+/// control and the frame window -- confirmed live, that blip alone was enough for the
+/// hide-on-blur handler below to read it as "the user clicked away" and hide the window before
+/// the drag could even start. Stamping `last_shown_at` first reuses the exact same
+/// `POST_SHOW_BLUR_GUARD` window `show_main_window_near_tray` uses for its own analogous
+/// focus-blip-right-after-a-window-state-change case.
+#[tauri::command]
+fn begin_window_drag(
+    window: tauri::WebviewWindow,
+    show_state: State<WindowShowState>,
+) -> Result<(), String> {
+    *show_state.last_shown_at.lock().unwrap() = Some(Instant::now());
+    window.start_dragging().map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn get_ducking_settings(state: State<MixerState>) -> DuckingSettings {
     state.backend.get_ducking_settings()
+}
+
+/// Whether auto-duck is actually implemented on this platform -- it needs each priority app's
+/// raw audio content to tell speech from music, which macOS gets via Core Audio process taps and
+/// Windows via WASAPI process-loopback capture (see `DuckingSettings`'s doc comment). Linux has
+/// no such backend yet. The Settings UI uses this to hide the toggle entirely where it's
+/// unsupported instead of showing a control that looks live but silently no-ops against the
+/// trait's default methods.
+#[tauri::command]
+fn ducking_supported() -> bool {
+    cfg!(any(target_os = "macos", target_os = "windows"))
 }
 
 #[tauri::command]
@@ -167,7 +204,22 @@ fn spawn_session_poll_loop(app_handle: AppHandle, backend: Arc<dyn AudioMixerBac
 /// handler only gets an `AppHandle`, not the `&TrayIcon` a direct tray-icon click gives for free.
 const TRAY_ICON_ID: &str = "mixolume-tray";
 
-/// Moves the main window so it appears directly under the tray icon, like a native menu-bar
+/// The monitor (if any) whose bounds contain the given physical point -- used to find which
+/// screen the tray icon is actually on, since a multi-monitor setup means `primary_monitor()`
+/// or the window's own (not-yet-positioned) `current_monitor()` can easily be the wrong one.
+fn monitor_containing(window: &tauri::WebviewWindow, x: f64, y: f64) -> Option<tauri::window::Monitor> {
+    let monitors = window.available_monitors().ok()?;
+    monitors.into_iter().find(|monitor| {
+        let pos = monitor.position();
+        let size = monitor.size();
+        x >= pos.x as f64
+            && x < pos.x as f64 + size.width as f64
+            && y >= pos.y as f64
+            && y < pos.y as f64 + size.height as f64
+    })
+}
+
+/// Moves the main window so it appears directly next to the tray icon, like a native menu-bar
 /// app (Control Center, Wi-Fi/Bluetooth menu extras, etc.) rather than wherever the window
 /// manager last happened to place it. Returns the computed position so the caller can cache it
 /// as the fallback for the next click, in case that one can't get a tray rect at all.
@@ -176,6 +228,16 @@ const TRAY_ICON_ID: &str = "mixolume-tray";
 /// pixels) -- converted via the window's own `scale_factor()` before arithmetic, since mixing a
 /// logical tray-icon rect with a physical window size would misplace the window on any non-1x
 /// display.
+///
+/// Which *side* of the icon to open on is not a `target_os` fact -- it depends on which edge of
+/// the screen the tray/panel sits on, which varies even within one OS (a Linux panel can be
+/// top or bottom depending on the desktop environment; users occasionally move the Windows
+/// taskbar too). So this looks at where the icon actually sits on its monitor: near the top
+/// (macOS's menu bar) opens downward, near the bottom (the Windows/most-Linux default) opens
+/// upward. Without that check, opening downward unconditionally -- correct for macOS -- pushed
+/// the window off the bottom of the screen on Windows, where the window manager then clamped it
+/// back on-screen at whatever fixed spot it clamps off-screen windows to, making it look "stuck"
+/// in one place instead of tracking the tray icon.
 fn position_window_under_tray(
     window: &tauri::WebviewWindow,
     tray_rect: tauri::Rect,
@@ -184,10 +246,53 @@ fn position_window_under_tray(
     let window_size = window.outer_size().ok()?;
     let icon_pos = tray_rect.position.to_physical::<f64>(scale);
     let icon_size = tray_rect.size.to_physical::<f64>(scale);
+    let icon_center_x = icon_pos.x + icon_size.width / 2.0;
+    let icon_center_y = icon_pos.y + icon_size.height / 2.0;
 
-    let x = icon_pos.x + (icon_size.width / 2.0) - (window_size.width as f64 / 2.0);
-    // A few points of gap below the icon, same idea as a native menu-bar dropdown.
-    let y = icon_pos.y + icon_size.height + 4.0;
+    // A few points of gap between the window and the icon, same idea as a native dropdown.
+    const GAP: f64 = 4.0;
+
+    let monitor = monitor_containing(window, icon_center_x, icon_center_y)
+        .or_else(|| window.current_monitor().ok().flatten());
+
+    let (y, x_bounds, y_bounds) = match &monitor {
+        Some(monitor) => {
+            let m_pos = monitor.position();
+            let m_size = monitor.size();
+            let top = m_pos.y as f64;
+            let bottom = top + m_size.height as f64;
+            let left = m_pos.x as f64;
+            let right = left + m_size.width as f64;
+
+            // Closer to the monitor's top edge than its bottom edge -> menu-bar style (open
+            // below); otherwise -> taskbar/panel style (open above).
+            let opens_downward = (icon_center_y - top) <= (bottom - icon_center_y);
+            let y = if opens_downward {
+                icon_pos.y + icon_size.height + GAP
+            } else {
+                icon_pos.y - window_size.height as f64 - GAP
+            };
+            (y, Some((left, right)), Some((top, bottom)))
+        }
+        // No monitor info at all -- fall back to the old macOS-shaped assumption rather than
+        // leaving the window unpositioned.
+        None => (icon_pos.y + icon_size.height + GAP, None, None),
+    };
+
+    let mut x = icon_center_x - (window_size.width as f64 / 2.0);
+    let mut y = y;
+    // Keep the window fully on-screen horizontally/vertically -- relevant for icons near a
+    // screen edge/corner, where centering under the icon alone could hang part of the window
+    // off the monitor.
+    if let Some((left, right)) = x_bounds {
+        let max_x = (right - window_size.width as f64).max(left);
+        x = x.clamp(left, max_x);
+    }
+    if let Some((top, bottom)) = y_bounds {
+        let max_y = (bottom - window_size.height as f64).max(top);
+        y = y.clamp(top, max_y);
+    }
+
     let position = PhysicalPosition::new(x, y);
     let _ = window.set_position(position);
     Some(position)
@@ -207,6 +312,30 @@ fn nudge_repaint(window: &tauri::WebviewWindow) {
     let _ = window.set_size(tauri::Size::Physical(size));
 }
 
+/// "Get it out of the way" for this platform: fully hidden on macOS (the menu-bar-popover
+/// convention -- Control Center, Wi-Fi/Bluetooth extras, etc. -- which also has no Dock/taskbar
+/// entry to preserve), minimized everywhere else (Windows/Linux now have a real, persistent
+/// taskbar entry -- `tauri.conf.json`'s `skipTaskbar: false` -- and `hide()` would make that
+/// entry disappear too, since a hidden top-level window has no taskbar button; minimizing keeps
+/// the button while getting the window off-screen, exactly like Windows' own Volume Mixer/Action
+/// Center flyouts).
+fn dismiss_window(window: &tauri::WebviewWindow) {
+    if cfg!(target_os = "macos") {
+        let _ = window.hide();
+    } else {
+        let _ = window.minimize();
+    }
+}
+
+/// The inverse of [`dismiss_window`].
+fn restore_window(window: &tauri::WebviewWindow) {
+    if !cfg!(target_os = "macos") {
+        let _ = window.unminimize();
+    }
+    let _ = window.show();
+    let _ = window.set_focus();
+}
+
 fn show_main_window_near_tray(
     app: &AppHandle,
     show_state: &WindowShowState,
@@ -215,32 +344,43 @@ fn show_main_window_near_tray(
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
-    if window.is_visible().unwrap_or(false) {
-        let _ = window.hide();
+    // A minimized window still reports `is_visible() == true` in Win32 terms (visibility and
+    // iconic/minimized state are independent) -- `!is_minimized()` is what actually means "on
+    // screen right now" there. Harmless on macOS, which never minimizes this window at all.
+    let is_open =
+        window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(false);
+    if is_open {
+        dismiss_window(&window);
         return;
     }
-    let rect = tray_rect.or_else(|| {
-        app.tray_by_id(TRAY_ICON_ID)
-            .and_then(|tray| tray.rect().ok().flatten())
-    });
-    match rect {
-        Some(rect) => {
-            if let Some(position) = position_window_under_tray(&window, rect) {
-                *show_state.last_tray_position.lock().unwrap() = Some(position);
+
+    let mut has_shown_before = show_state.has_shown_before.lock().unwrap();
+    if cfg!(target_os = "macos") || !*has_shown_before {
+        let rect = tray_rect.or_else(|| {
+            app.tray_by_id(TRAY_ICON_ID)
+                .and_then(|tray| tray.rect().ok().flatten())
+        });
+        match rect {
+            Some(rect) => {
+                if let Some(position) = position_window_under_tray(&window, rect) {
+                    *show_state.last_tray_position.lock().unwrap() = Some(position);
+                }
             }
-        }
-        // The tray click definitely happened (we're in this function at all), but this
-        // particular event/lookup didn't carry a usable rect -- reuse the last position we
-        // successfully computed rather than leaving the window whatever position it last had
-        // (which, before the first successful positioning, is nowhere near the tray).
-        None => {
-            if let Some(position) = *show_state.last_tray_position.lock().unwrap() {
-                let _ = window.set_position(position);
+            // The tray click definitely happened (we're in this function at all), but this
+            // particular event/lookup didn't carry a usable rect -- reuse the last position we
+            // successfully computed rather than leaving the window whatever position it last had
+            // (which, before the first successful positioning, is nowhere near the tray).
+            None => {
+                if let Some(position) = *show_state.last_tray_position.lock().unwrap() {
+                    let _ = window.set_position(position);
+                }
             }
         }
     }
-    let _ = window.show();
-    let _ = window.set_focus();
+    *has_shown_before = true;
+    drop(has_shown_before);
+
+    restore_window(&window);
     *show_state.last_shown_at.lock().unwrap() = Some(Instant::now());
     nudge_repaint(&window);
 }
@@ -292,6 +432,15 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Default to `info`+ for this crate specifically (not every dependency -- those stay at
+    // `warn` unless `RUST_LOG` overrides it) so `npm run tauri dev`'s terminal actually shows
+    // this app's own `log::info!`/`log::warn!` calls, including auto-duck's capture
+    // activation/failure diagnostics, without needing `RUST_LOG` set by hand every time.
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("warn,mixolume_lib=info"),
+    )
+    .init();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         // Uses a real macOS Launch Agent (not an AppleScript login-item hack) -- the frontend
@@ -304,8 +453,16 @@ pub fn run() {
         // Auto-hide on focus loss, like a native menu-bar popover (Control Center, Wi-Fi/
         // Bluetooth menu extras): clicking anywhere outside the window closes it instead of
         // leaving it stranded on screen behind whatever the user clicked into next.
+        //
+        // macOS only: it's the only platform where this window has no taskbar/Dock entry to
+        // fall back on, so hiding it on any ordinary click-away is the only way to get it out of
+        // the way at all -- matching how every native macOS menu extra behaves. Windows/Linux
+        // now have a real taskbar entry (`tauri.conf.json`'s `skipTaskbar: false`) and are
+        // draggable, so they behave like a normal utility window instead: it stays open across
+        // focus changes and is dismissed by explicitly minimizing it (via the tray icon or the
+        // taskbar itself, see `dismiss_window`), not by clicking elsewhere.
         .on_window_event(|window, event| {
-            if window.label() == "main" {
+            if cfg!(target_os = "macos") && window.label() == "main" {
                 if let tauri::WindowEvent::Focused(false) = event {
                     let show_state = window.state::<WindowShowState>();
                     let recently_shown = show_state
@@ -321,10 +478,12 @@ pub fn run() {
         })
         .setup(|app| {
             // Menu-bar-only, like Control Center / Bluetooth / Wi-Fi menu extras -- no Dock icon,
-            // no Cmd+Tab entry. `skipTaskbar` in tauri.conf.json only hides the *window* from
-            // window-switcher-style UI; the Dock icon specifically is controlled by the app's
-            // activation policy, which defaults to `Regular` (a normal Dock-visible app) unless
-            // set otherwise here.
+            // no Cmd+Tab entry. This is entirely `ActivationPolicy`, not `skipTaskbar` -- confirmed
+            // via Tauri's own doc comment on `set_skip_taskbar` ("macOS: Unsupported"), so
+            // tauri.conf.json's `skipTaskbar: false` (needed so Windows/Linux show a normal
+            // taskbar entry, unlike macOS's menu-bar-only convention) has no effect here either
+            // way; the Dock icon is controlled purely by the activation policy, which defaults to
+            // `Regular` (a normal Dock-visible app) unless set otherwise here.
             #[cfg(target_os = "macos")]
             app.handle()
                 .set_activation_policy(tauri::ActivationPolicy::Accessory)?;
@@ -380,8 +539,10 @@ pub fn run() {
             set_volume,
             set_muted,
             set_balance,
+            begin_window_drag,
             check_for_updates,
             get_ducking_settings,
+            ducking_supported,
             set_ducking_enabled,
             set_duck_trigger_priority
         ])

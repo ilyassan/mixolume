@@ -8,6 +8,8 @@ import { SettingsView } from "@/components/SettingsView";
 import { PermissionNeededView } from "@/components/PermissionNeededView";
 import { Wordmark } from "@/components/Wordmark";
 import { Button } from "@/components/ui/button";
+import { isMac } from "@/lib/platform";
+import { beginWindowDrag } from "@/lib/tauri";
 import icon from "@/assets/icon.svg";
 
 const FADE_HOLD_MS = 1500;
@@ -59,7 +61,22 @@ function App() {
           transition={{ duration: 0.18, ease: "easeOut" }}
           className="bg-background text-foreground flex h-full min-h-[120px] flex-col overflow-y-auto p-2"
         >
-          <div className="mb-1 flex items-center justify-between px-1">
+          <div
+            className={`mb-1 flex items-center justify-between px-1 ${
+              isMac ? "" : "cursor-grab active:cursor-grabbing"
+            }`}
+            // Windows/Linux have no native title bar to drag from (decorations: false) and no
+            // tray-anchored menu-bar convention users already know, unlike macOS -- letting the
+            // header itself start a native window drag is how ytaudiobar (a sibling project)
+            // solved the same "window feels stuck" complaint there. Left out on macOS, where the
+            // window deliberately re-anchors under the menu-bar icon every time it opens instead
+            // of being manually positioned, matching Control Center/menu-bar-extra behavior.
+            onMouseDown={(event) => {
+              if (!isMac && event.button === 0) {
+                void beginWindowDrag();
+              }
+            }}
+          >
             <div className="flex items-center gap-1.5">
               <img src={icon} alt="" className="size-4 rounded-[4px]" />
               <Wordmark className="text-muted-foreground text-xs" />
@@ -69,6 +86,7 @@ function App() {
               size="icon"
               className="size-6"
               onClick={() => setShowSettings(true)}
+              onMouseDown={(event) => event.stopPropagation()}
               aria-label="Settings"
             >
               <Settings className="size-3.5" />
