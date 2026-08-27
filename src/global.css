@@ -27,7 +27,37 @@
 :root {
   --radius: 0.625rem;
 
-  /* Light theme (default) */
+  /* Dark theme, unconditional default -- previously this lived behind
+     `@media (prefers-color-scheme: dark)` with a light `:root` as the fallback, which assumed
+     every platform's webview reliably resolves `prefers-color-scheme` to the OS's real
+     light/dark setting. Confirmed live that WebView2 on Windows doesn't: the app rendered its
+     light palette on a Windows machine set to dark, while WKWebView on macOS resolved dark
+     correctly on the same setting. Rather than depend on that per-engine reliability, ship one
+     deliberate look everywhere -- the same call ytaudiobar (a sibling project) made for the
+     same reason. `.light` below keeps the old light palette available for a future manual
+     in-app theme toggle; it is not wired to OS/media-query detection.
+  */
+  --background: oklch(0.16 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.21 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.21 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.7 0.17 260);
+  --primary-foreground: oklch(0.145 0 0);
+  --secondary: oklch(0.27 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.27 0 0);
+  --muted-foreground: oklch(0.65 0 0);
+  --accent: oklch(0.3 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 12%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.7 0.17 260 / 50%);
+}
+
+.light {
   --background: oklch(1 0 0);
   --foreground: oklch(0.145 0 0);
   --card: oklch(0.985 0 0);
@@ -46,29 +76,6 @@
   --border: oklch(0.9 0 0);
   --input: oklch(0.9 0 0);
   --ring: oklch(0.55 0.2 260 / 50%);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: oklch(0.16 0 0);
-    --foreground: oklch(0.985 0 0);
-    --card: oklch(0.21 0 0);
-    --card-foreground: oklch(0.985 0 0);
-    --popover: oklch(0.21 0 0);
-    --popover-foreground: oklch(0.985 0 0);
-    --primary: oklch(0.7 0.17 260);
-    --primary-foreground: oklch(0.145 0 0);
-    --secondary: oklch(0.27 0 0);
-    --secondary-foreground: oklch(0.985 0 0);
-    --muted: oklch(0.27 0 0);
-    --muted-foreground: oklch(0.65 0 0);
-    --accent: oklch(0.3 0 0);
-    --accent-foreground: oklch(0.985 0 0);
-    --destructive: oklch(0.704 0.191 22.216);
-    --border: oklch(1 0 0 / 12%);
-    --input: oklch(1 0 0 / 15%);
-    --ring: oklch(0.7 0.17 260 / 50%);
-  }
 }
 
 @layer base {
