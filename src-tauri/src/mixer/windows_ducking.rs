@@ -88,7 +88,9 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationHandler_Impl {
 /// (0xC0000374). `PropVariantClear` tries to free `blob.pBlobData` for `VT_BLOB`, but that pointer
 /// here is a stack address (`activation_params`), not something `CoTaskMemAlloc`'d -- there is
 /// nothing real to free, and trying to corrupts the heap.
-fn blob_propvariant(activation_params: &AUDIOCLIENT_ACTIVATION_PARAMS) -> windows::core::PROPVARIANT {
+fn blob_propvariant(
+    activation_params: &AUDIOCLIENT_ACTIVATION_PARAMS,
+) -> windows::core::PROPVARIANT {
     use windows::core::imp;
     unsafe {
         windows::core::PROPVARIANT::from_raw(imp::PROPVARIANT {
@@ -425,8 +427,8 @@ fn run_capture(
     }
     .map_err(|e| super::MixerError::Platform(e.to_string()))?;
 
-    let capture_client: IAudioCaptureClient =
-        unsafe { audio_client.GetService() }.map_err(|e| super::MixerError::Platform(e.to_string()))?;
+    let capture_client: IAudioCaptureClient = unsafe { audio_client.GetService() }
+        .map_err(|e| super::MixerError::Platform(e.to_string()))?;
     unsafe { audio_client.Start() }.map_err(|e| super::MixerError::Platform(e.to_string()))?;
 
     log::info!(
@@ -469,7 +471,8 @@ fn run_capture(
             // stays consistent with an actual gap in audio, rather than silently compressing it.
             vec![0.0f32; num_frames as usize]
         } else {
-            let byte_len = num_frames as usize * format.channels.max(1) as usize
+            let byte_len = num_frames as usize
+                * format.channels.max(1) as usize
                 * format.bytes_per_sample as usize;
             let bytes = unsafe { std::slice::from_raw_parts(data_ptr, byte_len) };
             bytes_to_mono_f32(bytes, format)
@@ -486,7 +489,10 @@ fn run_capture(
         is_triggering.store(triggering, Ordering::Relaxed);
 
         if triggering != was_triggering {
-            log::info!("auto-duck: pid {pid} trigger {}", if triggering { "ON" } else { "OFF" });
+            log::info!(
+                "auto-duck: pid {pid} trigger {}",
+                if triggering { "ON" } else { "OFF" }
+            );
             was_triggering = triggering;
         }
     }
@@ -611,7 +617,11 @@ mod tests {
         let mut r = LinearResampler::new(48_000, 24_000);
         let input = vec![0.0; 1000];
         let out = r.process(&input);
-        assert!((out.len() as i64 - 500).abs() <= 2, "got {} samples", out.len());
+        assert!(
+            (out.len() as i64 - 500).abs() <= 2,
+            "got {} samples",
+            out.len()
+        );
     }
 
     #[test]
@@ -620,7 +630,11 @@ mod tests {
         let mut r = LinearResampler::new(24_000, 48_000);
         let input = vec![0.0; 500];
         let out = r.process(&input);
-        assert!((out.len() as i64 - 1000).abs() <= 2, "got {} samples", out.len());
+        assert!(
+            (out.len() as i64 - 1000).abs() <= 2,
+            "got {} samples",
+            out.len()
+        );
     }
 
     #[test]
@@ -644,7 +658,12 @@ mod tests {
             // Allow a small negative epsilon for floating-point interpolation noise, but no real
             // backward jump and no large discontinuity.
             assert!(pair[1] - pair[0] > -0.01, "{:?} -> {:?}", pair[0], pair[1]);
-            assert!((pair[1] - pair[0]).abs() < 0.1, "{:?} -> {:?}", pair[0], pair[1]);
+            assert!(
+                (pair[1] - pair[0]).abs() < 0.1,
+                "{:?} -> {:?}",
+                pair[0],
+                pair[1]
+            );
         }
     }
 

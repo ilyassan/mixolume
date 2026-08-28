@@ -21,7 +21,9 @@ use super::DuckingSettings;
 // Re-exported (not just `use`d) so every existing `macos_ducking::PersistedDuckState`/
 // `macos_ducking::DUCK_GAIN_MULTIPLIER`/etc. reference throughout `macos.rs` keeps working
 // unchanged after this module's split -- these are also what the rest of this file uses directly.
-pub use super::duck_detect::{HysteresisCounters, PersistedDuckState, SpeechDetector, DUCK_GAIN_MULTIPLIER};
+pub use super::duck_detect::{
+    HysteresisCounters, PersistedDuckState, SpeechDetector, DUCK_GAIN_MULTIPLIER,
+};
 
 /// How much a callback nudges a ducked/restoring app's *actual* applied gain multiplier toward
 /// its target (0.0 or [`DUCK_GAIN_MULTIPLIER`]) each callback, rather than snapping instantly --
