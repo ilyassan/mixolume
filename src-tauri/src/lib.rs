@@ -130,23 +130,44 @@ async fn check_for_updates(app: AppHandle) -> Result<UpdateCheckOutcome, String>
     run_update_check(app).await
 }
 
-/// How often we re-poll the platform backend for session changes. WASAPI/PulseAudio/Core Audio
-/// don't give us a cheap cross-platform push notification in v1, so we poll and only emit to the
-/// frontend when the list actually differs from what we last sent (see `mixer::AppSession`'s
-/// `PartialEq`). 150ms rather than something even tighter: each tick does real work (enumerating
-/// HAL/session objects and reading properties on each), and this is a background menu-bar
-/// utility that should stay cheap to leave running -- but 150ms is still functionally free on
-/// modern hardware (a handful of lightweight reads, ~7 times a second) while keeping UI-visible
-/// state (notably auto-duck's badges/`effectiveVolume`) close enough behind the real audio
-/// decision to not feel laggy. Do not drop this to "instant"/0 -- that trades an imperceptible
+/// How often we re-poll the platform backend for session changes when nothing time-sensitive is
+/// happening. WASAPI/PulseAudio/Core Audio don't give us a cheap cross-platform push notification
+/// in v1, so we poll and only emit to the frontend when the list actually differs from what we
+/// last sent (see `mixer::AppSession`'s `PartialEq`). 150ms rather than something even tighter:
+/// each tick does real work (enumerating HAL/session objects and reading properties on each), and
+/// this is a background menu-bar utility that should stay cheap to leave running -- but 150ms is
+/// still functionally free on modern hardware (a handful of lightweight reads, ~7 times a second)
+/// while keeping most UI-visible state close enough behind the real audio decision to not feel
+/// laggy. Do not drop this to "instant"/0 as the *baseline* rate -- that trades an imperceptible
 /// latency improvement for real, unnecessary CPU/battery cost on a process meant to run all day.
 const POLL_INTERVAL: Duration = Duration::from_millis(150);
+
+/// How often to poll while a duck is actively engaging or releasing -- see [`POLL_INTERVAL`]'s
+/// doc comment for why that's too coarse specifically for this case. The realtime audio thread
+/// smooths a duck's gain change continuously (`DuckingRuntime::SMOOTHING_PER_CALLBACK`), but at
+/// `POLL_INTERVAL`'s rate the frontend only ever sees a "before" and an "after" snapshot with
+/// most of the ramp already invisibly finished in between (confirmed live: at the default
+/// smoothing rate, ~91% of the transition is already done within a single 150ms window) -- no
+/// amount of client-side easing can make something look gradual if the actual change already
+/// happened between two polls. Sampling faster during exactly this window gives the frontend
+/// enough real intermediate data points to animate smoothly, without paying that cost while nothing
+/// is transitioning (the loop drops back to `POLL_INTERVAL` the moment no session is currently a
+/// duck trigger or being ducked).
+const DUCK_TRANSITION_POLL_INTERVAL: Duration = Duration::from_millis(30);
 
 fn spawn_session_poll_loop(app_handle: AppHandle, backend: Arc<dyn AudioMixerBackend>) {
     tauri::async_runtime::spawn(async move {
         let mut last: Option<Vec<AppSession>> = None;
         loop {
-            tokio::time::sleep(POLL_INTERVAL).await;
+            let duck_active = last
+                .as_ref()
+                .is_some_and(|sessions| sessions.iter().any(|s| s.is_ducked || s.is_duck_trigger));
+            let interval = if duck_active {
+                DUCK_TRANSITION_POLL_INTERVAL
+            } else {
+                POLL_INTERVAL
+            };
+            tokio::time::sleep(interval).await;
             match backend.list_sessions() {
                 Ok(sessions) => {
                     if last.as_ref() != Some(&sessions) {

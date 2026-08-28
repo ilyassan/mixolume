@@ -214,8 +214,15 @@ impl SpeechDetector {
 /// its target (0.0 or [`DUCK_GAIN_MULTIPLIER`]) each callback, rather than snapping instantly --
 /// an abrupt gain jump is exactly the kind of click this project already spent real effort
 /// eliminating elsewhere (see the macOS hiccup fixes). At a typical ~10ms callback this reaches
-/// roughly 90% of the way to the target within ~150ms: a natural-feeling dip, not a lag.
-const DUCK_SMOOTHING_PER_CALLBACK: f32 = 0.15;
+/// roughly 90% of the way to the target within ~350ms: still a natural, fast mixing-console-style
+/// dip, not a lag -- deliberately not faster than that. A higher coefficient (this used to be
+/// 0.15, ~90% within ~150ms) converged *faster than the UI's poll loop could observe*: confirmed
+/// live that almost the entire visual transition had already happened invisibly by the time the
+/// frontend got its very first snapshot of it, which no amount of client-side animation can
+/// retroactively make look gradual. `DUCK_TRANSITION_POLL_INTERVAL` in `lib.rs` polls faster
+/// specifically while a duck is active, but that only helps if there's still a real ramp in
+/// progress to sample.
+const DUCK_SMOOTHING_PER_CALLBACK: f32 = 0.065;
 
 /// Per-engine-instance realtime ducking state: one [`SpeechDetector`] and one smoothed gain
 /// multiplier per currently-tapped app, plus the master on/off switch. Owned exclusively by the
