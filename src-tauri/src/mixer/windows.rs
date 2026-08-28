@@ -417,10 +417,7 @@ impl AudioMixerBackend for WindowsMixerBackend {
 
         let mut sessions = Vec::with_capacity(raw.len());
         for r in raw {
-            let is_duck_trigger = inner
-                .captures
-                .get(&r.id)
-                .is_some_and(|c| c.is_triggering());
+            let is_duck_trigger = inner.captures.get(&r.id).is_some_and(|c| c.is_triggering());
             // Ducked by *someone else* -- an app currently triggering never ducks itself, same
             // condition macOS's mixing pass applies.
             let is_ducked = any_triggering && !is_duck_trigger;
@@ -602,15 +599,14 @@ impl AudioMixerBackend for WindowsMixerBackend {
         if should_seed {
             // Best-effort: if this fails, the user can still add apps manually from Settings.
             if let Ok(sessions) = self.list_sessions() {
+                let running_names: Vec<String> =
+                    sessions.iter().map(|s| s.display_name.clone()).collect();
                 let mut inner = self.inner.lock().unwrap();
-                for well_known in WELL_KNOWN_COMMUNICATION_APPS {
-                    if sessions.iter().any(|s| s.display_name == *well_known) {
-                        inner
-                            .ducking_settings
-                            .priority_triggers
-                            .push((*well_known).to_string());
-                    }
-                }
+                super::seed_priority_apps_from_well_known(
+                    &mut inner.ducking_settings.priority_triggers,
+                    WELL_KNOWN_COMMUNICATION_APPS,
+                    &running_names,
+                );
             }
         }
 

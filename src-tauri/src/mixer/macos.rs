@@ -2077,14 +2077,11 @@ impl AudioMixerBackend for MacosMixerBackend {
                 .into_iter()
                 .map(|app| app.name)
                 .collect();
-            for well_known in WELL_KNOWN_COMMUNICATION_APPS {
-                if running_names.iter().any(|n| n == well_known) {
-                    inner
-                        .ducking_settings
-                        .priority_triggers
-                        .push((*well_known).to_string());
-                }
-            }
+            super::seed_priority_apps_from_well_known(
+                &mut inner.ducking_settings.priority_triggers,
+                WELL_KNOWN_COMMUNICATION_APPS,
+                &running_names,
+            );
         }
 
         macos_ducking::save_settings(&inner.ducking_settings);

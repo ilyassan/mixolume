@@ -100,6 +100,28 @@ pub fn clamp_volume(volume: f32) -> f32 {
     volume.clamp(0.0, 1.0)
 }
 
+/// Appends every name in `well_known_apps` that's also present in `running_names` onto
+/// `priority_triggers` -- the actual matching logic behind auto-duck's first-enable default
+/// seeding (macOS's and Windows' `set_ducking_enabled` each call this once). Deliberately just
+/// this loop, not the whole seeding flow: each backend's own well-known-apps list and how it
+/// gathers `running_names` differ for real platform reasons (macOS can enumerate every running
+/// app via NSWorkspace; Windows only knows about sessions it's already seen making sound, fetched
+/// under a lock this needs to stay outside of) -- sharing just the pure comparison avoids
+/// duplicating it twice without forcing two genuinely different data-gathering strategies into a
+/// shape that fits both.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn seed_priority_apps_from_well_known(
+    priority_triggers: &mut Vec<String>,
+    well_known_apps: &[&str],
+    running_names: &[String],
+) {
+    for well_known in well_known_apps {
+        if running_names.iter().any(|name| name == well_known) {
+            priority_triggers.push((*well_known).to_string());
+        }
+    }
+}
+
 pub trait AudioMixerBackend: Send + Sync {
     /// Every app currently known to be producing (or recently produced) sound.
     fn list_sessions(&self) -> Result<Vec<AppSession>, MixerError>;
