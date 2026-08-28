@@ -18,7 +18,7 @@ export interface AppSession {
   /** -1.0 (full left) to 1.0 (full right), 0.0 centered. */
   balance: number;
   isActive: boolean;
-  /** Auto-duck currently has this app pegged as why everything else is quieter. macOS-only. */
+  /** Auto-duck currently has this app pegged as why everything else is quieter. macOS/Windows only. */
   isDuckTrigger: boolean;
   /** Auto-duck is currently lowering this app's volume because another app is triggering it. */
   isDucked: boolean;
@@ -44,9 +44,10 @@ export type UpdateCheckOutcome =
 
 // Mirrors the Rust `DuckingSettings` struct. Opt-in, not opt-out: `priorityTriggers` is the list
 // of apps explicitly allowed to trigger a duck -- an empty list means the feature does nothing
-// yet, not "everything triggers." Only meaningful on macOS -- every other backend's default
-// trait methods report `{ enabled: false, priorityTriggers: [] }` and ignore writes, so the
-// Settings UI can call these unconditionally without checking the platform itself.
+// yet, not "everything triggers." Implemented on macOS and Windows; Linux's backend doesn't
+// override the trait's default methods, which report `{ enabled: false, priorityTriggers: [] }`
+// and ignore writes, so the Settings UI can call these unconditionally without checking the
+// platform itself (it still checks `duckingSupported()` before showing the toggle at all).
 export interface DuckingSettings {
   enabled: boolean;
   priorityTriggers: string[];
@@ -65,11 +66,22 @@ export const setMuted = (sessionId: string, muted: boolean) =>
 export const setBalance = (sessionId: string, balance: number) =>
   invoke<void>("set_balance", { sessionId, balance });
 
+// Routed through a Rust command rather than calling `getCurrentWindow().startDragging()`
+// directly -- see `begin_window_drag`'s doc comment in lib.rs for why starting a drag needs the
+// same hide-on-blur guard as showing the window does.
+export const beginWindowDrag = () => invoke<void>("begin_window_drag");
+
 export const checkForUpdates = () =>
   invoke<UpdateCheckOutcome>("check_for_updates");
 
 export const getDuckingSettings = () =>
   invoke<DuckingSettings>("get_ducking_settings");
+
+// Auto-duck needs per-app raw audio content (to tell speech from music) -- macOS gets that via
+// Core Audio process taps, Windows via WASAPI process-loopback capture. Linux has no such backend
+// yet and reports `false` here so the Settings UI can hide the toggle instead of showing a
+// control that no-ops silently.
+export const duckingSupported = () => invoke<boolean>("ducking_supported");
 
 export const setDuckingEnabled = (enabled: boolean) =>
   invoke<void>("set_ducking_enabled", { enabled });

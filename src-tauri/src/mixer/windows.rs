@@ -5,6 +5,17 @@
 //! `IAudioSessionControl2` gives us the owning process id; `ISimpleAudioVolume` (obtained by
 //! casting the same session control) gives us get/set volume + mute. No elevated privileges,
 //! no driver — see PLAN.md section 2.
+//!
+//! Auto-duck (see `windows_ducking.rs`) adds one wrinkle unique to this backend: unlike macOS
+//! (which never touches a real OS volume control -- it builds its own gain pipeline from
+//! scratch), ducking here has to temporarily overwrite the *actual* `ISimpleAudioVolume` value to
+//! make a session quieter, then restore it. So `Inner::target_volume` tracks what the user
+//! actually set each session to, independent of whatever a duck has transiently written --
+//! `list_sessions`'s `volume` field always reports that tracked target (never a possibly-ducked
+//! live read), matching `AppSession::volume`'s "unaffected by auto-duck" contract.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE};
@@ -27,15 +38,78 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON};
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
 
-use super::{clamp_volume, AppSession, AudioMixerBackend, MixerError};
+use super::duck_detect::DUCK_GAIN_MULTIPLIER;
+use super::windows_ducking::{self, DuckCapture};
+use super::{clamp_volume, AppSession, AudioMixerBackend, DuckingSettings, MixerError};
 
-pub struct WindowsMixerBackend;
+struct Inner {
+    /// Cross-app auto-duck settings, loaded from disk once at startup (see
+    /// `windows_ducking::load_settings`) and updated in place as the user changes them from
+    /// Settings.
+    ducking_settings: DuckingSettings,
+    /// One live process-loopback capture per currently-active priority-trigger app, keyed by
+    /// session id. Reconciled against `ducking_settings.priority_triggers` and each session's
+    /// `is_active` on every `list_sessions` call -- dropping an entry here stops its capture
+    /// thread (see `DuckCapture`'s `Drop` impl).
+    captures: HashMap<String, DuckCapture>,
+    /// What the user actually set each session's volume to, independent of whatever a duck has
+    /// transiently written to the real WASAPI volume -- see this module's doc comment. Seeded
+    /// lazily from a live read the first time a session is ever seen, then only ever updated by
+    /// `set_volume`.
+    target_volume: HashMap<String, f32>,
+    /// Whether the *last* value this backend wrote for each session was the ducked (multiplied)
+    /// one -- compared against the freshly-computed value on every `list_sessions` tick so a
+    /// `SetMasterVolume` write only happens on an actual duck-state transition, not every single
+    /// ~150ms poll regardless of whether anything changed (which would mean constantly writing a
+    /// volume even for sessions nothing is currently ducking).
+    applied_ducked: HashMap<String, bool>,
+}
+
+/// Windows backend: per-app volume via WASAPI audio sessions, auto-duck via WASAPI process
+/// loopback capture. See this module's doc comment for the ducking-specific state-tracking
+/// rationale.
+pub struct WindowsMixerBackend {
+    inner: Mutex<Inner>,
+}
 
 impl WindowsMixerBackend {
     pub fn new() -> Self {
-        Self
+        let ducking_settings = windows_ducking::load_settings();
+        Self {
+            inner: Mutex::new(Inner {
+                ducking_settings,
+                captures: HashMap::new(),
+                target_volume: HashMap::new(),
+                applied_ducked: HashMap::new(),
+            }),
+        }
     }
 }
+
+impl Default for WindowsMixerBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Recognized by exact display-name match against apps MiXolume has already seen producing
+/// sound (see `set_ducking_enabled`'s use of `list_sessions` instead of a full running-process
+/// scan -- Windows has no cheap equivalent of macOS's `NSWorkspace` enumeration, and this crate's
+/// `AppSession`s already only ever surface apps that have actually made sound). Same list as
+/// macOS's `WELL_KNOWN_COMMUNICATION_APPS` -- entries that only exist as macOS app names
+/// (FaceTime, Messages) simply never match here, which is harmless.
+const WELL_KNOWN_COMMUNICATION_APPS: &[&str] = &[
+    "WhatsApp",
+    "Zoom",
+    "Discord",
+    "FaceTime",
+    "Microsoft Teams",
+    "Slack",
+    "Messages",
+    "Skype",
+    "Telegram",
+    "Signal",
+];
 
 /// Every non-expired, non-system audio session control currently registered with the default
 /// render endpoint's session manager.
@@ -215,12 +289,38 @@ fn hicon_to_png(hicon: HICON) -> Option<Vec<u8>> {
     }
 }
 
+/// One session's raw, freshly-enumerated WASAPI state -- gathered in `list_sessions`'s first
+/// pass (which needs COM interfaces live) before it takes `Inner`'s lock for the ducking
+/// reconciliation pass, keeping the two concerns (WASAPI enumeration vs. this backend's own
+/// tracked state) from being interleaved in one long `unsafe` block.
+struct RawSession {
+    id: String,
+    simple_volume: ISimpleAudioVolume,
+    live_volume: f32,
+    muted: bool,
+    balance: f32,
+    is_active: bool,
+    display_name: String,
+    icon_png: Option<Vec<u8>>,
+}
+
 impl AudioMixerBackend for WindowsMixerBackend {
     fn list_sessions(&self) -> Result<Vec<AppSession>, MixerError> {
         let controls =
             enumerate_session_controls().map_err(|e| MixerError::Platform(e.to_string()))?;
 
-        let mut sessions = Vec::new();
+        // Auto-duck's own capture threads (`windows_ducking.rs`) call
+        // `ActivateAudioInterfaceAsync`/`IAudioClient::Initialize` from *this* process to capture
+        // some other app's audio -- but Windows' audio session manager attributes the resulting
+        // session to the calling process (us), not the app actually being captured. Confirmed
+        // live: enabling auto-duck made "MiXolume" itself start appearing as a fake session in
+        // this exact enumeration, immediately eligible to be shown in the UI, picked as a
+        // priority-trigger app, or ducked -- any of which risks this app trying to capture/duck
+        // itself. Filtering our own pid out at the source, unconditionally, is simpler and more
+        // robust than trying to special-case it at every later use site.
+        let own_pid = std::process::id();
+
+        let mut raw = Vec::new();
         unsafe {
             for control in controls {
                 // `IsSystemSoundsSession` returns a raw HRESULT: S_OK (0) means "yes", S_FALSE
@@ -232,7 +332,7 @@ impl AudioMixerBackend for WindowsMixerBackend {
                 }
 
                 let pid = match control.GetProcessId() {
-                    Ok(pid) if pid != 0 => pid,
+                    Ok(pid) if pid != 0 && pid != own_pid => pid,
                     _ => continue,
                 };
 
@@ -245,7 +345,7 @@ impl AudioMixerBackend for WindowsMixerBackend {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let volume = simple_volume.GetMasterVolume().unwrap_or(0.0);
+                let live_volume = simple_volume.GetMasterVolume().unwrap_or(0.0);
                 let muted = simple_volume
                     .GetMute()
                     .map(|b| b.as_bool())
@@ -254,31 +354,154 @@ impl AudioMixerBackend for WindowsMixerBackend {
 
                 let (display_name, icon_png) = resolve_process_info(pid);
 
-                sessions.push(AppSession {
+                raw.push(RawSession {
                     id: session_id_for(pid),
-                    display_name,
-                    icon_png,
-                    volume,
-                    effective_volume: volume,
+                    simple_volume,
+                    live_volume,
                     muted,
                     balance,
                     is_active: state == AudioSessionStateActive,
-                    is_duck_trigger: false,
-                    is_ducked: false,
+                    display_name,
+                    icon_png,
                 });
             }
         }
+
+        let mut inner = self.inner.lock().unwrap();
+
+        // Seed each newly-seen session's tracked target volume from its current live value --
+        // only ever seeded once per session id (never overwritten here again), so a later
+        // duck-induced live value never gets mistaken for a fresh user-set target. Mirrors
+        // macOS's `gain_state.entry(id).or_default()` lazy-seeding for the same reason.
+        for r in &raw {
+            inner
+                .target_volume
+                .entry(r.id.clone())
+                .or_insert(r.live_volume);
+        }
+
+        // Reconcile capture threads against the current priority-trigger list. Gated on ducking
+        // actually being configured at all, so the (overwhelmingly common) ducking-off case stays
+        // exactly as cheap as it was before this feature existed -- no capture activation
+        // attempts, no extra threads, every poll tick.
+        if inner.ducking_settings.enabled && !inner.ducking_settings.priority_triggers.is_empty() {
+            let wanted: std::collections::HashSet<&str> = raw
+                .iter()
+                .filter(|r| {
+                    r.is_active
+                        && inner
+                            .ducking_settings
+                            .priority_triggers
+                            .iter()
+                            .any(|n| n == &r.display_name)
+                })
+                .map(|r| r.id.as_str())
+                .collect();
+            for r in &raw {
+                if wanted.contains(r.id.as_str()) && !inner.captures.contains_key(&r.id) {
+                    if let Some(pid) = pid_from_session_id(&r.id) {
+                        log::info!(
+                            "auto-duck: starting capture for priority app \"{}\" (pid {pid})",
+                            r.display_name
+                        );
+                        inner.captures.insert(r.id.clone(), DuckCapture::new(pid));
+                    }
+                }
+            }
+            inner.captures.retain(|id, _| wanted.contains(id.as_str()));
+        } else if !inner.captures.is_empty() {
+            inner.captures.clear();
+        }
+
+        let any_triggering = inner.captures.values().any(|c| c.is_triggering());
+
+        let mut sessions = Vec::with_capacity(raw.len());
+        for r in raw {
+            let is_duck_trigger = inner
+                .captures
+                .get(&r.id)
+                .is_some_and(|c| c.is_triggering());
+            // Ducked by *someone else* -- an app currently triggering never ducks itself, same
+            // condition macOS's mixing pass applies.
+            let is_ducked = any_triggering && !is_duck_trigger;
+            let target = *inner.target_volume.get(&r.id).unwrap_or(&r.live_volume);
+            let effective = if is_ducked {
+                target * DUCK_GAIN_MULTIPLIER
+            } else {
+                target
+            };
+
+            // Only actually write through to WASAPI on a real transition -- comparing against
+            // the last-applied state, not writing unconditionally every tick, so this doesn't
+            // fight a live slider drag (which calls `set_volume` directly) or spam
+            // `SetMasterVolume` for sessions nothing is currently ducking.
+            let was_ducked = inner.applied_ducked.get(&r.id).copied().unwrap_or(false);
+            if was_ducked != is_ducked {
+                unsafe {
+                    let _ = r.simple_volume.SetMasterVolume(effective, std::ptr::null());
+                }
+                inner.applied_ducked.insert(r.id.clone(), is_ducked);
+            }
+
+            sessions.push(AppSession {
+                id: r.id,
+                display_name: r.display_name,
+                icon_png: r.icon_png,
+                volume: target,
+                effective_volume: effective,
+                muted: r.muted,
+                balance: r.balance,
+                is_active: r.is_active,
+                is_duck_trigger,
+                is_ducked,
+            });
+        }
+
+        // Drop tracked state for sessions that no longer exist at all -- keeps these maps
+        // bounded over a long Mixolume session that sees many different apps come and go,
+        // matching macOS's `app_info_cache.retain` for the same reason. Owned strings (not
+        // borrows of `sessions`) specifically so this can run before `sessions` is moved out by
+        // the `Ok(...)` below.
+        let live_ids: std::collections::HashSet<String> =
+            sessions.iter().map(|s| s.id.clone()).collect();
+        inner.target_volume.retain(|id, _| live_ids.contains(id));
+        inner.applied_ducked.retain(|id, _| live_ids.contains(id));
+
         Ok(sessions)
     }
 
     fn set_volume(&self, session_id: &str, volume: f32) -> Result<(), MixerError> {
+        let volume = clamp_volume(volume);
+        // Held for this whole call, including the WASAPI write below -- not just the
+        // target-volume bookkeeping. Releasing it early (an earlier version of this did) leaves
+        // a real race against `list_sessions`'s own per-session duck-transition write: a slider
+        // drag landing in the gap between "read `applied_ducked`" and "actually write the
+        // volume" could have its un-ducked write land *after* `list_sessions` had already
+        // (correctly) applied the ducked value for a trigger that started in between -- since
+        // `list_sessions` only writes on a state *change*, that wrong value would then persist
+        // until the duck state changed again, not just for one glitchy tick. Matches how
+        // `macos.rs`'s `Inner`-guarded setters already hold their lock across their own
+        // engine-mutating calls for the same reason.
+        let mut inner = self.inner.lock().unwrap();
+        inner.target_volume.insert(session_id.to_string(), volume);
+        let is_ducked = inner
+            .applied_ducked
+            .get(session_id)
+            .copied()
+            .unwrap_or(false);
+        let to_apply = if is_ducked {
+            volume * DUCK_GAIN_MULTIPLIER
+        } else {
+            volume
+        };
+
         let control = find_session_control(session_id)?;
         unsafe {
             let simple_volume: ISimpleAudioVolume = control
                 .cast()
                 .map_err(|e| MixerError::Platform(e.to_string()))?;
             simple_volume
-                .SetMasterVolume(clamp_volume(volume), std::ptr::null())
+                .SetMasterVolume(to_apply, std::ptr::null())
                 .map_err(|e| MixerError::Platform(e.to_string()))
         }
     }
@@ -326,6 +549,91 @@ impl AudioMixerBackend for WindowsMixerBackend {
                 .SetChannelVolume(1, right, std::ptr::null())
                 .map_err(|e| MixerError::Platform(e.to_string()))
         }
+    }
+
+    /// `app.exit()` calls `std::process::exit()` directly and does not run `Drop` for arbitrary
+    /// managed state (same fact macOS's `shutdown` doc comment cites), so any session left
+    /// mid-duck needs its real target volume restored here explicitly -- otherwise quitting while
+    /// someone's being ducked would leave their volume stuck low with no auto-duck engine left
+    /// running to ever bring it back up. Dropping every `DuckCapture` first (each one's `Drop`
+    /// stops its thread) is what `captures` going out of scope would do anyway on a normal
+    /// program exit, just synchronous and guaranteed here instead of racing process teardown.
+    fn shutdown(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.captures.clear();
+
+        let restores: Vec<(String, f32)> = inner
+            .applied_ducked
+            .iter()
+            .filter(|(_, &was_ducked)| was_ducked)
+            .filter_map(|(id, _)| inner.target_volume.get(id).map(|&v| (id.clone(), v)))
+            .collect();
+        for (id, target) in restores {
+            if let Ok(control) = find_session_control(&id) {
+                unsafe {
+                    if let Ok(simple_volume) = control.cast::<ISimpleAudioVolume>() {
+                        let _ = simple_volume.SetMasterVolume(target, std::ptr::null());
+                    }
+                }
+            }
+        }
+    }
+
+    fn get_ducking_settings(&self) -> DuckingSettings {
+        self.inner.lock().unwrap().ducking_settings.clone()
+    }
+
+    fn set_ducking_enabled(&self, enabled: bool) -> Result<(), MixerError> {
+        // Scoped so this guard drops before the possible `self.list_sessions()` call below --
+        // that takes the same lock itself, and `std::sync::Mutex` isn't reentrant.
+        let should_seed = {
+            let mut inner = self.inner.lock().unwrap();
+            let was_enabled = inner.ducking_settings.enabled;
+            inner.ducking_settings.enabled = enabled;
+            // First-ever enable (an empty list, not just "currently off"): pre-fill with
+            // whichever well-known communication apps MiXolume has already seen making sound, so
+            // the feature does something useful immediately instead of silently doing nothing
+            // until the user manually finds and adds e.g. Discord themselves. Same
+            // empty-list-as-signal simplification macOS's `set_ducking_enabled` uses -- see its
+            // comment for why that's an acceptable tradeoff, not a real gap.
+            enabled && !was_enabled && inner.ducking_settings.priority_triggers.is_empty()
+        };
+
+        if should_seed {
+            // Best-effort: if this fails, the user can still add apps manually from Settings.
+            if let Ok(sessions) = self.list_sessions() {
+                let mut inner = self.inner.lock().unwrap();
+                for well_known in WELL_KNOWN_COMMUNICATION_APPS {
+                    if sessions.iter().any(|s| s.display_name == *well_known) {
+                        inner
+                            .ducking_settings
+                            .priority_triggers
+                            .push((*well_known).to_string());
+                    }
+                }
+            }
+        }
+
+        let inner = self.inner.lock().unwrap();
+        windows_ducking::save_settings(&inner.ducking_settings);
+        Ok(())
+    }
+
+    fn set_duck_trigger_priority(
+        &self,
+        display_name: &str,
+        is_priority: bool,
+    ) -> Result<(), MixerError> {
+        let mut inner = self.inner.lock().unwrap();
+        let list = &mut inner.ducking_settings.priority_triggers;
+        let already_present = list.iter().any(|n| n == display_name);
+        if is_priority && !already_present {
+            list.push(display_name.to_string());
+        } else if !is_priority {
+            list.retain(|n| n != display_name);
+        }
+        windows_ducking::save_settings(&inner.ducking_settings);
+        Ok(())
     }
 }
 

@@ -11,6 +11,7 @@ import { Wordmark } from "@/components/Wordmark";
 import { SessionIcon } from "@/components/SessionIcon";
 import {
   checkForUpdates,
+  duckingSupported,
   getDuckingSettings,
   setDuckingEnabled,
   setDuckTriggerPriority,
@@ -39,6 +40,7 @@ export function SettingsView({ onBack }: SettingsViewProps) {
   const [duckingEnabled, setDuckingEnabledState] = useState(false);
   const [priorityApps, setPriorityApps] = useState<string[]>([]);
   const [duckingLoaded, setDuckingLoaded] = useState(false);
+  const [duckingIsSupported, setDuckingIsSupported] = useState(false);
   const [showAddPicker, setShowAddPicker] = useState(false);
   const [pickerSearch, setPickerSearch] = useState("");
   const sessions = useMixerStore((state) => state.sessions);
@@ -50,12 +52,19 @@ export function SettingsView({ onBack }: SettingsViewProps) {
   }, []);
 
   useEffect(() => {
-    getDuckingSettings()
-      .then((settings) => {
-        setDuckingEnabledState(settings.enabled);
-        setPriorityApps(settings.priorityTriggers);
-      })
-      .finally(() => setDuckingLoaded(true));
+    duckingSupported().then((supported) => {
+      setDuckingIsSupported(supported);
+      if (!supported) {
+        setDuckingLoaded(true);
+        return;
+      }
+      getDuckingSettings()
+        .then((settings) => {
+          setDuckingEnabledState(settings.enabled);
+          setPriorityApps(settings.priorityTriggers);
+        })
+        .finally(() => setDuckingLoaded(true));
+    });
   }, []);
 
   // A currently-known session's icon for a priority app, by name -- the same identity the
@@ -181,6 +190,7 @@ export function SettingsView({ onBack }: SettingsViewProps) {
           </button>
         </label>
 
+        {duckingIsSupported && (
         <div className="flex flex-col gap-2">
           <label className="flex items-center justify-between gap-3">
             <span className="flex flex-col">
@@ -370,6 +380,7 @@ export function SettingsView({ onBack }: SettingsViewProps) {
             )}
           </AnimatePresence>
         </div>
+        )}
 
         <div className="flex items-center justify-between gap-3">
           <span className="text-sm">Updates</span>
