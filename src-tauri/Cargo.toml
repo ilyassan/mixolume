@@ -133,6 +133,12 @@ objc2-app-kit = { version = "0.3", features = [
     # this project doesn't otherwise touch, for a case (add an app before it's ever been opened)
     # that's a much rarer real need than "it's open right now but hasn't made sound yet".
     "NSWorkspace",
+    # NSApplication.activateIgnoringOtherApps -- see `lib.rs`'s `restore_window` doc comment for
+    # why an accessory-policy app (no Dock icon, never "activates" just by showing a window) needs
+    # this explicit call: without it, WKWebView can treat the shown window as still backgrounded
+    # and throttle its own rendering (including requestAnimationFrame-driven UI animations), even
+    # though the window is visibly on screen and Tauri's own `set_focus()` already ran.
+    "NSApplication",
 ] }
 libc = "0.2"
 # For walking up a process's parent chain when resolving app names -- some audio-producing

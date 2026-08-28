@@ -228,7 +228,11 @@ const TRAY_ICON_ID: &str = "mixolume-tray";
 /// The monitor (if any) whose bounds contain the given physical point -- used to find which
 /// screen the tray icon is actually on, since a multi-monitor setup means `primary_monitor()`
 /// or the window's own (not-yet-positioned) `current_monitor()` can easily be the wrong one.
-fn monitor_containing(window: &tauri::WebviewWindow, x: f64, y: f64) -> Option<tauri::window::Monitor> {
+fn monitor_containing(
+    window: &tauri::WebviewWindow,
+    x: f64,
+    y: f64,
+) -> Option<tauri::window::Monitor> {
     let monitors = window.available_monitors().ok()?;
     monitors.into_iter().find(|monitor| {
         let pos = monitor.position();
@@ -355,6 +359,38 @@ fn restore_window(window: &tauri::WebviewWindow) {
     }
     let _ = window.show();
     let _ = window.set_focus();
+    activate_app_macos();
+}
+
+/// Explicitly makes the whole *application* (not just this window) the active/foreground app --
+/// macOS only, a no-op everywhere else. Needed specifically because MiXolume runs with
+/// `NSApplicationActivationPolicy::Accessory` (no Dock icon, matching Control Center/menu-bar-
+/// extra convention -- see `setup_tray`'s doc comment) -- an accessory app doesn't automatically
+/// become the active app just because one of its windows is shown, unlike a normal Dock app.
+/// Confirmed live: without this, `window.show()` + `window.set_focus()` alone leaves the *window*
+/// key but the *app* still backgrounded from WebKit's perspective, and WKWebView throttles a
+/// backgrounded webview's rendering (including `requestAnimationFrame`-driven UI animations) even
+/// while it's visibly on screen -- exactly the "duck/volume transitions look instant instead of
+/// smooth, only on macOS" symptom this was added to rule out.
+///
+/// Deliberately the older, deprecated `activateIgnoringOtherApps(true)` over the newer
+/// `activate()`: Apple's own docs for `activate()` say explicitly "the framework does not
+/// guarantee the app will be activated at all" (it supports cooperative yielding another app can
+/// decline), which isn't acceptable for a menu-bar utility that must reliably come to the
+/// foreground the instant its tray icon is clicked. `activateIgnoringOtherApps(true)` has no such
+/// escape hatch.
+fn activate_app_macos() {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::NSApplication;
+
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        #[allow(deprecated)]
+        NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+    }
 }
 
 fn show_main_window_near_tray(
@@ -368,8 +404,7 @@ fn show_main_window_near_tray(
     // A minimized window still reports `is_visible() == true` in Win32 terms (visibility and
     // iconic/minimized state are independent) -- `!is_minimized()` is what actually means "on
     // screen right now" there. Harmless on macOS, which never minimizes this window at all.
-    let is_open =
-        window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(false);
+    let is_open = window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(false);
     if is_open {
         dismiss_window(&window);
         return;
