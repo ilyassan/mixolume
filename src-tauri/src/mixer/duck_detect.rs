@@ -47,7 +47,12 @@ pub const VAD_FRAME_SAMPLES: usize = 480;
 pub const VAD_SAMPLE_RATE: SampleRate = SampleRate::Rate48kHz;
 /// Same rate as [`VAD_SAMPLE_RATE`], as a plain number -- `webrtc_vad::SampleRate` is an enum
 /// `Vad::new_with_rate_and_mode` wants, not something arithmetic (like resampling math) can use
-/// directly.
+/// directly. Only Windows' capture path (`windows_ducking.rs`) actually reads this -- it captures
+/// at whatever rate WASAPI hands it and has to resample to this before the VAD will accept it,
+/// where macOS's Core Audio taps are already configured to deliver 48kHz directly. `#[allow]`
+/// rather than `#[cfg(target_os = "windows")]`: this is a real, intentional part of the shared
+/// module's public surface, just not every platform's ducking backend needs it.
+#[allow(dead_code)]
 pub const VAD_SAMPLE_RATE_HZ: u32 = 48_000;
 
 /// How much a ducked app's gain is multiplied by while something else is triggering. Not zero --
