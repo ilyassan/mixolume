@@ -621,13 +621,11 @@ impl AudioMixerBackend for WindowsMixerBackend {
         is_priority: bool,
     ) -> Result<(), MixerError> {
         let mut inner = self.inner.lock().unwrap();
-        let list = &mut inner.ducking_settings.priority_triggers;
-        let already_present = list.iter().any(|n| n == display_name);
-        if is_priority && !already_present {
-            list.push(display_name.to_string());
-        } else if !is_priority {
-            list.retain(|n| n != display_name);
-        }
+        super::toggle_priority_trigger(
+            &mut inner.ducking_settings.priority_triggers,
+            display_name,
+            is_priority,
+        );
         windows_ducking::save_settings(&inner.ducking_settings);
         Ok(())
     }

@@ -122,6 +122,24 @@ pub fn seed_priority_apps_from_well_known(
     }
 }
 
+/// Adds (`is_priority: true`) or removes (`false`) `display_name` from `priority_triggers` --
+/// the actual list-mutation logic behind every backend's `set_duck_trigger_priority`, which was
+/// otherwise identical across macOS and Windows (only the settings-persistence call after it
+/// differs, since that's backend-specific).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn toggle_priority_trigger(
+    priority_triggers: &mut Vec<String>,
+    display_name: &str,
+    is_priority: bool,
+) {
+    let already_present = priority_triggers.iter().any(|n| n == display_name);
+    if is_priority && !already_present {
+        priority_triggers.push(display_name.to_string());
+    } else if !is_priority {
+        priority_triggers.retain(|n| n != display_name);
+    }
+}
+
 pub trait AudioMixerBackend: Send + Sync {
     /// Every app currently known to be producing (or recently produced) sound.
     fn list_sessions(&self) -> Result<Vec<AppSession>, MixerError>;
