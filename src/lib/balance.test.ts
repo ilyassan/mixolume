@@ -1,62 +1,78 @@
 import { describe, it, expect } from "vitest";
-import { toLeftRight, fromLeftRight } from "./balance";
+import { balanceToChannels, balanceFromLeftFraction, balanceFromRightFraction } from "./balance";
 
-describe("toLeftRight", () => {
-  it("centered balance gives both channels the full volume", () => {
-    expect(toLeftRight(0.8, 0)).toEqual([0.8, 0.8]);
+describe("balanceToChannels", () => {
+  it("centered balance gives both channels full", () => {
+    expect(balanceToChannels(0)).toEqual([1, 1]);
   });
 
-  it("full right balance silences the left channel only", () => {
-    const [left, right] = toLeftRight(0.8, 1);
+  it("full right balance zeroes only the left channel", () => {
+    const [left, right] = balanceToChannels(1);
     expect(left).toBeCloseTo(0);
-    expect(right).toBeCloseTo(0.8);
+    expect(right).toBeCloseTo(1);
   });
 
-  it("full left balance silences the right channel only", () => {
-    const [left, right] = toLeftRight(0.8, -1);
-    expect(left).toBeCloseTo(0.8);
+  it("full left balance zeroes only the right channel", () => {
+    const [left, right] = balanceToChannels(-1);
+    expect(left).toBeCloseTo(1);
     expect(right).toBeCloseTo(0);
+  });
+
+  it("is independent of volume entirely -- volume isn't even a parameter", () => {
+    // Same balance always gives the same channel fractions, regardless of whatever volume the
+    // caller happens to be at -- that's the whole point of the split.
+    expect(balanceToChannels(0.5)).toEqual(balanceToChannels(0.5));
   });
 });
 
-describe("fromLeftRight", () => {
-  it("equal channels give centered balance at that volume", () => {
-    const [volume, balance] = fromLeftRight(0.6, 0.6);
-    expect(volume).toBeCloseTo(0.6);
-    expect(balance).toBeCloseTo(0);
+describe("balanceFromLeftFraction", () => {
+  it("left at full gives centered balance (right becomes/stays full)", () => {
+    expect(balanceFromLeftFraction(1)).toBeCloseTo(0);
   });
 
-  it("louder right channel becomes the volume, with positive balance", () => {
-    const [volume, balance] = fromLeftRight(0.3, 0.8);
-    expect(volume).toBeCloseTo(0.8);
-    expect(balance).toBeCloseTo(0.625);
+  it("left reduced gives positive balance", () => {
+    expect(balanceFromLeftFraction(0.4)).toBeCloseTo(0.6);
   });
 
-  it("louder left channel becomes the volume, with negative balance", () => {
-    const [volume, balance] = fromLeftRight(0.9, 0.4);
-    expect(volume).toBeCloseTo(0.9);
-    expect(balance).toBeCloseTo(-0.5556, 3);
+  it("left silenced gives full positive balance", () => {
+    expect(balanceFromLeftFraction(0)).toBeCloseTo(1);
   });
 
-  it("both channels silent gives zero volume and centered balance", () => {
-    expect(fromLeftRight(0, 0)).toEqual([0, 0]);
+  it("clamps out-of-range input", () => {
+    expect(balanceFromLeftFraction(1.5)).toBeCloseTo(0);
+    expect(balanceFromLeftFraction(-0.5)).toBeCloseTo(1);
   });
 
-  it("round-trips through toLeftRight for a range of independent left/right pairs", () => {
-    const cases: [number, number][] = [
-      [0.5, 0.5],
-      [0.3, 0.8],
-      [0.9, 0.4],
-      [1, 0],
-      [0, 1],
-      [0.75, 0.25],
-      [0.1, 0.9],
-    ];
-    for (const [left, right] of cases) {
-      const [volume, balance] = fromLeftRight(left, right);
-      const [roundTrippedLeft, roundTrippedRight] = toLeftRight(volume, balance);
-      expect(roundTrippedLeft).toBeCloseTo(left, 5);
-      expect(roundTrippedRight).toBeCloseTo(right, 5);
+  it("round-trips through balanceToChannels for the left channel", () => {
+    for (const leftFraction of [0, 0.25, 0.5, 0.75, 1]) {
+      const [roundTrippedLeft] = balanceToChannels(balanceFromLeftFraction(leftFraction));
+      expect(roundTrippedLeft).toBeCloseTo(leftFraction);
+    }
+  });
+});
+
+describe("balanceFromRightFraction", () => {
+  it("right at full gives centered balance (left becomes/stays full)", () => {
+    expect(balanceFromRightFraction(1)).toBeCloseTo(0);
+  });
+
+  it("right reduced gives negative balance", () => {
+    expect(balanceFromRightFraction(0.4)).toBeCloseTo(-0.6);
+  });
+
+  it("right silenced gives full negative balance", () => {
+    expect(balanceFromRightFraction(0)).toBeCloseTo(-1);
+  });
+
+  it("clamps out-of-range input", () => {
+    expect(balanceFromRightFraction(1.5)).toBeCloseTo(0);
+    expect(balanceFromRightFraction(-0.5)).toBeCloseTo(-1);
+  });
+
+  it("round-trips through balanceToChannels for the right channel", () => {
+    for (const rightFraction of [0, 0.25, 0.5, 0.75, 1]) {
+      const [, roundTrippedRight] = balanceToChannels(balanceFromRightFraction(rightFraction));
+      expect(roundTrippedRight).toBeCloseTo(rightFraction);
     }
   });
 });

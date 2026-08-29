@@ -189,10 +189,12 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use super::macos_ducking::{self, DuckingRuntime};
 use super::{
-    clamp_volume, AppSession, AudioMixerBackend, DuckingSettings, MixerError, RunningAppInfo,
+    clamp_boosted_volume, AppSession, AudioMixerBackend, DuckingSettings, MixerError,
+    RunningAppInfo,
 };
 
 // =================================================================================================
@@ -241,7 +243,12 @@ impl AppGainState {
     }
 
     fn set_volume(&mut self, volume: f32) {
-        self.volume = clamp_volume(volume);
+        // Boosted, not `clamp_volume` -- macOS has no native "per-app volume" API to begin with
+        // (every app's volume here is already just a software gain multiply on captured samples,
+        // see `mix_capture_callback`'s doc comment), and that mix's final output is already
+        // hard-clamped to `[-1.0, 1.0]` before being written out, so allowing gain above 1.0 here
+        // needs no new clipping protection -- it reuses what's already there.
+        self.volume = clamp_boosted_volume(volume);
     }
 
     fn set_muted(&mut self, muted: bool) {
@@ -448,8 +455,12 @@ unsafe impl Send for Scratch {}
 
 /// Bundle-ID prefixes of system processes that show up in the HAL process list but that the user
 /// can't meaningfully volume-control (Core Audio's own daemons, accessibility services, etc.).
-/// Non-exhaustive -- copied from sonicflow's `AudioProcessDetector.systemBundlesToHide` as a
-/// starting point, not independently re-derived; extend as real-world testing turns up more.
+/// Checked first, before [`is_system_internal_path`] below, because it's free -- `bundle_id` is
+/// already in hand from the same HAL enumeration pass that found this process at all, no syscall
+/// needed. Originally copied from sonicflow's `AudioProcessDetector.systemBundlesToHide`; kept
+/// around as a fast-path alongside the path check below rather than replaced by it, since a
+/// syscall failure on the path lookup (rare, but see `is_hidden_system_process_cached`'s doc
+/// comment) still leaves this available as a free, always-reliable fallback signal.
 const SYSTEM_BUNDLE_PREFIXES_TO_HIDE: &[&str] = &[
     "com.apple.audiomxd",
     "com.apple.coreaudiod",
@@ -465,35 +476,76 @@ fn is_hidden_system_bundle(bundle_id: &str) -> bool {
         .any(|prefix| bundle_id.starts_with(prefix))
 }
 
-/// Bare `/usr/sbin`-style daemons hidden by process name rather than bundle id, since they have
-/// no `.app` bundle (and therefore no `CFBundleIdentifier` for [`is_hidden_system_bundle`] to
-/// even see) -- confirmed live: `systemsoundserverd` (the login-chime/volume-beep player) showed
-/// up in the session list because `p.bundle_id` was `None` for it, so the bundle-prefix check
-/// never ran at all. Matched against [`process_short_name`]'s `pbi_name`, not `pbi_comm` --
-/// `pbi_comm` truncates to 15 characters, which would cut "systemsoundserverd" short.
-const SYSTEM_PROCESS_NAMES_TO_HIDE: &[&str] = &["systemsoundserverd"];
+/// Directories no real, user-facing app's executable lives under -- every app a user would
+/// actually recognize (Apple's own included: Music, Safari, Calculator, FaceTime, Preview, ...)
+/// is bundled under `/Applications` or `/System/Applications`. Daemons, XPC services, and
+/// system-internal utilities live somewhere else entirely -- confirmed on real hardware:
+/// `systemsoundserverd`/`coreaudiod` are `/usr/sbin/...`, `PowerChime.app` is
+/// `/System/Library/CoreServices/PowerChime.app/...`, and `com.apple.WebKit.GPU`'s actual
+/// executable (despite the bundle id suggesting otherwise) is a WebKit-framework-internal XPC
+/// service under `/System/Library/Frameworks/WebKit.framework/.../XPCServices/...`.
+///
+/// This is deliberately a *structural* check (where does this thing live) instead of an
+/// ever-growing list of specific names/bundle-ids added by hand every time a user reports the
+/// next one -- `PowerChime` showing up was exactly that pattern (`systemsoundserverd` got fixed
+/// by name last time, the next bundle-less/differently-bundled system thing just needed its own
+/// entry) rather than a fix that generalizes to whatever Apple ships next.
+const SYSTEM_INTERNAL_PATH_PREFIXES: &[&str] = &["/System/Library/", "/usr/sbin/", "/usr/libexec/"];
 
-/// `proc_bsdinfo.pbi_name` for `pid` -- a C string up to 31 bytes, read via the same
-/// `libproc::pidinfo::<BSDInfo>` call [`resolve_named_running_app`] already uses for parent-pid
-/// walking. `None` if the process has already exited or the syscall otherwise fails.
-fn process_short_name(pid: i32) -> Option<String> {
-    let info = libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(pid, 0).ok()?;
-    let bytes: Vec<u8> = info
-        .pbi_name
+fn is_system_internal_path(path: &str) -> bool {
+    SYSTEM_INTERNAL_PATH_PREFIXES
         .iter()
-        .take_while(|&&c| c != 0)
-        .map(|&c| c as u8)
-        .collect();
-    let name = String::from_utf8(bytes).ok()?;
-    (!name.is_empty()).then_some(name)
+        .any(|prefix| path.starts_with(prefix))
 }
 
-fn is_hidden_system_process(bundle_id: Option<&str>, pid: i32) -> bool {
+/// Cached: `libproc::proc_pid::pidpath` makes a fresh syscall on every single call, and that
+/// syscall can transiently fail (process already gone, momentary `ESRCH`/`EPERM`, etc.) for
+/// reasons unrelated to whether the process should actually be hidden. An earlier, uncached
+/// version of an equivalent name-based check re-derived its answer fresh on every poll tick --
+/// confirmed live as the cause of `systemsoundserverd` intermittently showing up in the session
+/// list, sometimes in "active", sometimes in "inactive": when the syscall failed, the process fell
+/// through unfiltered for that one tick, landing in whichever section its `is_running_output`
+/// happened to be that moment.
+///
+/// A pid's hidden-or-not status can't actually change during its lifetime, so once resolved it's
+/// cached permanently for that pid -- but only a *decisive* answer gets cached: a bundle-id match
+/// (instant, no syscall, always reliable) or a path lookup that actually succeeded. A syscall
+/// failure resolves to `false` for just this one call without being cached, so the next poll
+/// tries again from scratch instead of permanently locking in a wrong guess.
+fn is_hidden_system_process_cached(
+    cache: &mut HashMap<i32, bool>,
+    bundle_id: Option<&str>,
+    pid: i32,
+) -> bool {
+    if let Some(&hidden) = cache.get(&pid) {
+        return hidden;
+    }
     if bundle_id.is_some_and(is_hidden_system_bundle) {
+        cache.insert(pid, true);
         return true;
     }
-    process_short_name(pid)
-        .is_some_and(|name| SYSTEM_PROCESS_NAMES_TO_HIDE.contains(&name.as_str()))
+    match libproc::proc_pid::pidpath(pid) {
+        Ok(path) => {
+            let hidden = is_system_internal_path(&path);
+            cache.insert(pid, hidden);
+            hidden
+        }
+        Err(_) => false,
+    }
+}
+
+/// Whether a process counts as "wanted" for `MacosMixerBackend::reconcile_engine`'s tap-teardown
+/// decision -- either it's genuinely reporting active right now, or it was recently enough that
+/// it's still within its post-active hold window. Pulled out as its own pure function (rather
+/// than left inline in the filter closure) so the flicker-tolerance logic itself is
+/// unit-testable without needing a real Core Audio process/engine to exercise it. See
+/// `Inner::active_hold_until`'s doc comment for the full rationale.
+fn is_wanted_for_reconciliation(
+    is_running_output: bool,
+    hold_until: Option<Instant>,
+    now: Instant,
+) -> bool {
+    is_running_output || hold_until.is_some_and(|until| until > now)
 }
 
 // =================================================================================================
@@ -571,6 +623,13 @@ fn resolve_named_running_app(pid: i32) -> Option<Retained<NSRunningApplication>>
 /// don't). Name falls back to the bundle id, then to `pid <N>`, if neither the process nor any
 /// ancestor can be resolved (e.g. it already exited); icon falls back to `None` (the frontend
 /// already renders a placeholder for that -- see `SessionIcon.tsx`).
+/// One [`Inner::app_info_cache`] entry: either a resolve is still in flight on a background
+/// thread, or it's finished and this is the result.
+enum AppInfoCacheEntry {
+    Pending,
+    Resolved(String, Option<Vec<u8>>),
+}
+
 fn resolve_app_info(pid: i32, bundle_id: Option<&str>) -> (String, Option<Vec<u8>>) {
     // Belt-and-suspenders alongside `app_info_cache`'s once-per-pid caching (which is what
     // actually keeps this leak-free in practice -- see that field's doc comment): draining the
@@ -1716,6 +1775,15 @@ fn read_device_uid(device_id: AudioObjectID) -> Result<String, MixerError> {
 // The public backend.
 // =================================================================================================
 
+/// How long a process that was recently seen actively producing output continues to count as
+/// "wanted" by `MacosMixerBackend::reconcile_engine`'s tap-teardown decision, even if the
+/// current poll's `is_running_output` reading is momentarily `false` -- see
+/// `Inner::active_hold_until`'s doc comment for the full rationale. Matches the frontend's own
+/// `FADE_HOLD_MS` (`App.tsx`): same underlying flaky signal, same reasoning for how long to
+/// tolerate it, even though the two hold windows serve different purposes (this one guards an
+/// expensive engine rebuild; that one guards a UI transition) and are otherwise independent.
+const ACTIVE_HOLD_DURATION: Duration = Duration::from_millis(1500);
+
 struct Inner {
     /// Persistent per-app gain/mute state, keyed by [`AppSession::id`]. Survives tap
     /// teardown/rebuild (see [`TapEngine`]'s doc comment).
@@ -1735,7 +1803,34 @@ struct Inner {
     /// ~700ms per active app" down to "once per app, ever" (until the app exits and its pid gets
     /// reused, at which point removing the stale entry -- see `list_sessions` -- fixes it),
     /// which makes the leak negligible even without solving the underlying autorelease-pool gap.
-    app_info_cache: HashMap<i32, (String, Option<Vec<u8>>)>,
+    ///
+    /// [`AppInfoCacheEntry::Pending`] until a spawned background thread (see `list_sessions`)
+    /// finishes the resolve and writes [`AppInfoCacheEntry::Resolved`] back in -- confirmed live
+    /// (macOS `sample` profiling during an active drag) that `resolve_app_info` is genuinely slow
+    /// on a process's *first* poll tick (~100ms+), and running it synchronously here, inside the
+    /// same lock `set_volume` et al. need on every drag update, was the actual cause of periodic
+    /// UI freezes that got worse the more apps were tapped (more distinct pids, more of them
+    /// eventually hitting this cold-start cost). A pid stays `Pending` for however many ticks the
+    /// background resolve takes; `list_sessions` shows a `pid <N>` placeholder with no icon in the
+    /// meantime rather than blocking on it.
+    app_info_cache: HashMap<i32, AppInfoCacheEntry>,
+    /// [`is_hidden_system_process_cached`] results, cached by pid -- see that function's doc
+    /// comment for why re-deriving this via a live syscall on every poll tick is a real
+    /// correctness bug (a transient syscall failure lets a process that should be hidden through
+    /// for that one poll), not just wasted work like `app_info_cache`'s case.
+    hidden_process_cache: HashMap<i32, bool>,
+    /// Per-session id, the instant until which [`Self::reconcile_engine`] should still treat that
+    /// session as "wanted" even if the current poll's `is_running_output` reading says otherwise
+    /// -- `kAudioProcessPropertyIsRunningOutput` is documented (and confirmed live) to report
+    /// brief false readings for a genuinely still-playing app, exactly the reason
+    /// `useSessionListWithFadeOut` holds `isActive` on the frontend for the same duration. There
+    /// was no equivalent hold on this side: reacting to that flicker here means tearing down and
+    /// rebuilding the *entire* tap engine -- real Core Audio HAL calls, done while holding the
+    /// same lock the poll loop needs -- for a signal glitch, not a real state change. Confirmed
+    /// live as the cause of the whole app visibly slowing down specifically once a second app
+    /// was tapped: more apps tapped means more for any single flaky reading to force a full
+    /// rebuild of, not just the one that flickered.
+    active_hold_until: HashMap<String, Instant>,
     /// Cross-app auto-duck settings, loaded from disk once at startup (see
     /// [`macos_ducking::load_settings`]) and updated in place as the user changes them from
     /// Settings. `enabled` is also mirrored into `ducking_enabled_live` for instant effect --
@@ -1754,13 +1849,34 @@ struct Inner {
     /// been speech" counter to zero, which is exactly the real bug `HysteresisCounters`'s doc
     /// comment describes -- confirmed live, not hypothetical.
     ducking_state: HashMap<String, macos_ducking::PersistedDuckState>,
+    /// Bumped every time [`MacosMixerBackend::reconcile_engine`] starts a rebuild -- a
+    /// belt-and-suspenders guard so a build that somehow outlives the one-at-a-time discipline
+    /// `pending_rebuild_target` enforces discards itself instead of clobbering `engine` with an
+    /// outdated result. See that function's own comment for why the actual build happens on a
+    /// background thread in the first place.
+    rebuild_generation: u64,
+    /// The session-id set the single in-flight rebuild is building toward, or `None` when no
+    /// rebuild is running. Doubles as the "a rebuild is already running" flag: while it's `Some`,
+    /// [`MacosMixerBackend::reconcile_engine`] starts no further rebuilds at all.
+    ///
+    /// Without it, the "is a rebuild even needed" check only had `engine`'s *already-installed*
+    /// tapped set to compare against, which stays empty for as long as a build is in flight
+    /// (`engine` is cleared before the background thread starts, and only set once it finishes)
+    /// -- so every poll tick that landed during that window (every ~150ms, for however long a
+    /// real Core Audio aggregate-device build takes) saw "0 tapped, but N wanted" and kicked off
+    /// *another* concurrent rebuild, compounding into exactly a full freeze. Confirmed live: the
+    /// very regression this field fixes.
+    pending_rebuild_target: Option<std::collections::HashSet<String>>,
 }
 
 /// macOS backend: per-app volume via Core Audio process taps + a private aggregate device +
 /// a lock-free ring buffer bridging to a playback IOProc on the real output device. See the
 /// module doc comment for the full architecture, citations, and flagged risk areas.
 pub struct MacosMixerBackend {
-    inner: Mutex<Inner>,
+    /// `Arc`-wrapped so the background threads `list_sessions` spawns to resolve
+    /// [`Inner::app_info_cache`] entries (see that field's doc comment) can hold their own handle
+    /// and write their result back in without needing `&MacosMixerBackend` to outlive them.
+    inner: Arc<Mutex<Inner>>,
 }
 
 impl MacosMixerBackend {
@@ -1768,14 +1884,18 @@ impl MacosMixerBackend {
         let ducking_settings = macos_ducking::load_settings();
         let ducking_enabled_live = Arc::new(AtomicBool::new(ducking_settings.enabled));
         Self {
-            inner: Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 gain_state: HashMap::new(),
                 engine: None,
                 app_info_cache: HashMap::new(),
+                hidden_process_cache: HashMap::new(),
+                active_hold_until: HashMap::new(),
                 ducking_settings,
                 ducking_enabled_live,
                 ducking_state: HashMap::new(),
-            }),
+                rebuild_generation: 0,
+                pending_rebuild_target: None,
+            })),
         }
     }
 
@@ -1784,10 +1904,26 @@ impl MacosMixerBackend {
     /// unnecessary rebuild).
     fn reconcile_engine(
         inner: &mut Inner,
+        inner_arc: &Arc<Mutex<Inner>>,
         processes: &[AudioProcessInfo],
     ) -> Result<(), MixerError> {
-        let active: Vec<&AudioProcessInfo> =
-            processes.iter().filter(|p| p.is_running_output).collect();
+        let now = Instant::now();
+        // "Active" for tap purposes means reporting so right now, *or* within its hold window --
+        // see `Inner::active_hold_until`'s doc comment for why reacting to the raw signal alone
+        // would tear down and rebuild the whole engine over transient flicker, not a real change.
+        let active: Vec<&AudioProcessInfo> = processes
+            .iter()
+            .filter(|p| {
+                is_wanted_for_reconciliation(
+                    p.is_running_output,
+                    inner
+                        .active_hold_until
+                        .get(&session_id_for_pid(p.pid))
+                        .copied(),
+                    now,
+                )
+            })
+            .collect();
 
         let currently_tapped: std::collections::HashSet<&str> = inner
             .engine
@@ -1801,7 +1937,17 @@ impl MacosMixerBackend {
             && wanted
                 .iter()
                 .all(|id| currently_tapped.contains(id.as_str()));
-        if unchanged {
+        // At most one rebuild runs at a time, whatever set it's targeting -- see
+        // `Inner::pending_rebuild_target`'s doc comment for why the in-flight window otherwise
+        // reads as "0 tapped" to every poll tick that lands in it, and re-triggers yet another
+        // concurrent rebuild. Deliberately not "already heading toward exactly this set": letting
+        // a *differently*-targeted rebuild start alongside one already running means two engines
+        // can briefly exist at once, each with its own aggregate device, its own taps on the same
+        // processes, and its own playback IOProc adding into the same real output device.
+        // Whatever the current build converges on is one poll tick (~150ms) away from being
+        // reconciled again anyway, which is cheaper than that overlap.
+        let already_in_flight = inner.pending_rebuild_target.is_some();
+        if unchanged || already_in_flight {
             return Ok(());
         }
 
@@ -1815,16 +1961,20 @@ impl MacosMixerBackend {
                 .extend(old_engine.snapshot_ducking_state());
         }
 
-        // Drop the old engine (if any) before building the new one -- Core Audio aggregate/tap
-        // ids aren't reusable, and we don't want two aggregates fighting over the same real
-        // output device even briefly.
-        inner.engine = None;
+        // Detached from `inner` here, torn down further below -- Core Audio aggregate/tap ids
+        // aren't reusable, so the old engine has to be gone before the new one is built, and we
+        // don't want two aggregates fighting over the same real output device even briefly.
+        let old_engine = inner.engine.take();
 
         if active.is_empty() {
+            drop(old_engine);
             return Ok(());
         }
 
-        let active_with_state: Vec<(&AudioProcessInfo, String, (f32, f32))> = active
+        // Owned (not borrowed) so this can be handed to the background thread below -- see that
+        // thread's own comment for why the actual `TapEngine::new` call must not happen here,
+        // still holding this lock.
+        let active_with_state: Vec<(AudioProcessInfo, String, (f32, f32))> = active
             .iter()
             .map(|p| {
                 let id = session_id_for_pid(p.pid);
@@ -1833,7 +1983,7 @@ impl MacosMixerBackend {
                     .entry(id.clone())
                     .or_default()
                     .effective_gains();
-                (*p, id, gains)
+                ((*p).clone(), id, gains)
             })
             .collect();
 
@@ -1847,13 +1997,11 @@ impl MacosMixerBackend {
         let excluded_flags: Vec<bool> = active
             .iter()
             .map(|p| {
-                let is_priority = inner.app_info_cache.get(&p.pid).is_some_and(|(name, _)| {
-                    inner
-                        .ducking_settings
-                        .priority_triggers
-                        .iter()
-                        .any(|e| e == name)
-                });
+                let is_priority = matches!(
+                    inner.app_info_cache.get(&p.pid),
+                    Some(AppInfoCacheEntry::Resolved(name, _))
+                        if inner.ducking_settings.priority_triggers.iter().any(|e| e == name)
+                );
                 !is_priority
             })
             .collect();
@@ -1868,12 +2016,77 @@ impl MacosMixerBackend {
             })
             .collect();
 
-        inner.engine = Some(TapEngine::new(
-            &active_with_state,
-            Arc::clone(&inner.ducking_enabled_live),
-            excluded_flags,
-            persisted_ducking_states,
-        )?);
+        // `TapEngine::new` below does real Core Audio HAL work (creating an aggregate device,
+        // one process tap per app) -- genuinely slow enough (confirmed live via `sample`
+        // profiling during an active drag: real, measured multi-hundred-millisecond spikes with
+        // new `com.apple.audio.IOThread.client` threads appearing) that running it while still
+        // holding this same lock blocks every `set_volume`/`set_balance` call for as long as it
+        // takes, for the entire time a session set is genuinely changing -- not just the
+        // already-fixed flicker case. Mirrors how a native (non-webview) app in the same problem
+        // space handles its own equivalent rebuild: build off the critical path, then just swap
+        // the finished result in.
+        //
+        // `rebuild_generation` guards against installing a stale result: if the active set
+        // changes *again* before this build finishes (another rebuild started, bumping the
+        // generation), the now-superseded build is dropped instead of clobbering whatever the
+        // newer one installs.
+        inner.rebuild_generation = inner.rebuild_generation.wrapping_add(1);
+        let generation = inner.rebuild_generation;
+        inner.pending_rebuild_target = Some(wanted);
+        let ducking_enabled_live = Arc::clone(&inner.ducking_enabled_live);
+        let inner_arc = Arc::clone(inner_arc);
+        std::thread::spawn(move || {
+            // Tearing the outgoing engine down is itself real HAL work -- `AudioDeviceStop`
+            // blocks until the in-flight IOProc callback returns, and destroying the aggregate
+            // device is a round-trip to `coreaudiod` -- so it belongs on this side of the lock
+            // for exactly the same reason the build below does. Still strictly before the build,
+            // which is the ordering the "no two aggregates at once" invariant needs.
+            drop(old_engine);
+            let active_refs: Vec<(&AudioProcessInfo, String, (f32, f32))> = active_with_state
+                .iter()
+                .map(|(process, id, gains)| (process, id.clone(), *gains))
+                .collect();
+            // A freshly-spawned thread has no autorelease pool of its own, and this path creates
+            // real Objective-C temporaries (`CATapDescription`, the `NSString`/`NSArray` it's
+            // built from). Same reasoning as `resolve_app_info`/`list_running_applications` --
+            // see `Inner::app_info_cache`'s doc comment for the confirmed-on-real-hardware leak
+            // an unpooled AppKit/Core Audio call path produced.
+            let result = objc2::rc::autoreleasepool(|_pool| {
+                TapEngine::new(
+                    &active_refs,
+                    ducking_enabled_live,
+                    excluded_flags,
+                    persisted_ducking_states,
+                )
+            });
+            let mut inner = inner_arc.lock().unwrap();
+            if inner.rebuild_generation != generation {
+                // Superseded while this build was in flight -- whatever's already installed (or
+                // about to be, from the newer build) is the correct one, not this. Deliberately
+                // does *not* touch `pending_rebuild_target` here: the newer rebuild that
+                // superseded this one already owns it.
+                return;
+            }
+            inner.pending_rebuild_target = None;
+            match result {
+                Ok(engine) => {
+                    // `active_with_state`'s gains were read before this build started. Anything
+                    // the user changed since (a slider drag lands on `gain_state` regardless of
+                    // whether an engine currently exists to push it to) would otherwise be
+                    // silently discarded here -- the new engine would come up at the pre-rebuild
+                    // volume and stay there until the next `set_volume` call happened to arrive.
+                    for session_id in engine.slot_of.keys() {
+                        if let Some(state) = inner.gain_state.get(session_id) {
+                            engine.set_gain(session_id, state.effective_gains());
+                        }
+                    }
+                    inner.engine = Some(engine);
+                }
+                Err(err) => {
+                    log::warn!("failed to rebuild tap engine: {err}");
+                }
+            }
+        });
         Ok(())
     }
 }
@@ -1905,17 +2118,20 @@ impl AudioMixerBackend for MacosMixerBackend {
 
         // Ensure every currently-audible process has a persistent gain_state entry (freshly-seen
         // -> full volume, unmuted), *before* reconciling the engine so the engine can read the
-        // right initial gain.
+        // right initial gain. Also refreshes `active_hold_until` for `reconcile_engine`'s
+        // flicker-tolerant "is this still wanted" check -- see that field's doc comment.
+        let now = Instant::now();
         for p in &processes {
             if p.is_running_output {
+                let id = session_id_for_pid(p.pid);
+                inner.gain_state.entry(id.clone()).or_default();
                 inner
-                    .gain_state
-                    .entry(session_id_for_pid(p.pid))
-                    .or_default();
+                    .active_hold_until
+                    .insert(id, now + ACTIVE_HOLD_DURATION);
             }
         }
 
-        Self::reconcile_engine(&mut inner, &processes)?;
+        Self::reconcile_engine(&mut inner, &self.inner, &processes)?;
 
         // Read back current ducking state for the UI -- safe to call any time (see
         // `TapEngine::snapshot_ducking_state`'s doc comment), and cheap (atomic loads only, no
@@ -1938,7 +2154,11 @@ impl AudioMixerBackend for MacosMixerBackend {
 
         let mut sessions = Vec::with_capacity(processes.len());
         for p in &processes {
-            if is_hidden_system_process(p.bundle_id.as_deref(), p.pid) {
+            if is_hidden_system_process_cached(
+                &mut inner.hidden_process_cache,
+                p.bundle_id.as_deref(),
+                p.pid,
+            ) {
                 continue;
             }
             let id = session_id_for_pid(p.pid);
@@ -1956,12 +2176,37 @@ impl AudioMixerBackend for MacosMixerBackend {
                 continue;
             };
             // Cached by pid -- see `Inner::app_info_cache`'s doc comment for why re-resolving
-            // this every poll tick is a real memory-safety bug, not just wasted work.
-            let (display_name, icon_png) = inner
-                .app_info_cache
-                .entry(p.pid)
-                .or_insert_with(|| resolve_app_info(p.pid, p.bundle_id.as_deref()))
-                .clone();
+            // this every poll tick is a real memory-safety bug, not just wasted work, and why a
+            // still-`Pending` entry is resolved on a background thread rather than blocking here.
+            let (display_name, icon_png) = match inner.app_info_cache.get(&p.pid) {
+                Some(AppInfoCacheEntry::Resolved(name, icon)) => (name.clone(), icon.clone()),
+                Some(AppInfoCacheEntry::Pending) => (format!("pid {}", p.pid), None),
+                None => {
+                    inner
+                        .app_info_cache
+                        .insert(p.pid, AppInfoCacheEntry::Pending);
+                    let pid = p.pid;
+                    let bundle_id = p.bundle_id.clone();
+                    let inner_arc = Arc::clone(&self.inner);
+                    std::thread::spawn(move || {
+                        let resolved = resolve_app_info(pid, bundle_id.as_deref());
+                        let mut inner = inner_arc.lock().unwrap();
+                        // Only overwrite if still `Pending` -- if the pid was pruned and reused
+                        // by an unrelated process in the meantime, `list_sessions` will have
+                        // already re-inserted a fresh `Pending` (or `Resolved`) entry for it that
+                        // this stale resolve must not clobber.
+                        if matches!(
+                            inner.app_info_cache.get(&pid),
+                            Some(AppInfoCacheEntry::Pending)
+                        ) {
+                            inner
+                                .app_info_cache
+                                .insert(pid, AppInfoCacheEntry::Resolved(resolved.0, resolved.1));
+                        }
+                    });
+                    (format!("pid {pid}"), None)
+                }
+            };
             let is_duck_trigger = duck_states.get(&id).is_some_and(|s| s.is_triggering);
             // Ducked by *someone else* -- an app currently triggering never ducks itself,
             // matching the exact same condition `mix_capture_callback`'s mixing pass applies to
@@ -1993,19 +2238,74 @@ impl AudioMixerBackend for MacosMixerBackend {
         inner
             .app_info_cache
             .retain(|pid, _| live_pids.contains(pid));
+        inner
+            .hidden_process_cache
+            .retain(|pid, _| live_pids.contains(pid));
+        // `gain_state`/`ducking_state` are keyed by session id (`"macos-{pid}"`), not raw pid, but
+        // need the same pruning for the same reason -- and it's not just a slow leak here: pids
+        // get reused by the OS, so a stale entry could hand a completely unrelated future process
+        // a stranger's leftover volume/mute/balance/ducking state instead of fresh defaults the
+        // next time that pid number comes back around.
+        let live_session_ids: std::collections::HashSet<String> = processes
+            .iter()
+            .map(|p| session_id_for_pid(p.pid))
+            .collect();
+        inner
+            .gain_state
+            .retain(|id, _| live_session_ids.contains(id));
+        inner
+            .ducking_state
+            .retain(|id, _| live_session_ids.contains(id));
+        inner
+            .active_hold_until
+            .retain(|id, _| live_session_ids.contains(id));
+        // `kAudioHardwarePropertyProcessObjectList` (the source of `processes`, and therefore of
+        // this order) has no documented ordering guarantee, and nothing upstream imposes one --
+        // confirmed live as a real, serious bug, not just a cosmetic one: with two or more
+        // sessions, an unstable order reshuffles the frontend's rendered list on poll ticks where
+        // nothing user-visible actually changed, which the row list's Framer Motion
+        // `layout="position"` tracking (correctly) interprets as things needing to animate into
+        // new positions -- repeatedly, every time the order happens to shuffle again, which
+        // showed up as sustained near-100% frontend CPU once a second app was added (nothing to
+        // reorder against with only one session, so invisible until then). Sorting here, once,
+        // gives every consumer a stable, deterministic order for free. `display_name` first
+        // (what a user would expect a stable ordering to follow), `id` as a tie-break for
+        // sessions that share a name (e.g. two windows of the same app), so the order is fully
+        // deterministic even then.
+        sessions.sort_by(|a, b| {
+            a.display_name
+                .cmp(&b.display_name)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         Ok(sessions)
     }
 
+    fn max_volume_percent(&self) -> u32 {
+        150
+    }
+
     fn set_volume(&self, session_id: &str, volume: f32) -> Result<(), MixerError> {
+        // TEMPORARY DIAGNOSTIC -- remove after the mid-drag glitch investigation.
+        let t0 = std::time::Instant::now();
         let mut inner = self.inner.lock().unwrap();
+        let lock_wait = t0.elapsed();
         let state = inner
             .gain_state
             .get_mut(session_id)
             .ok_or_else(|| MixerError::SessionNotFound(session_id.to_string()))?;
         state.set_volume(volume);
         let effective = state.effective_gains();
+        let t1 = std::time::Instant::now();
         if let Some(engine) = &inner.engine {
             engine.set_gain(session_id, effective);
+        }
+        let set_gain_elapsed = t1.elapsed();
+        if lock_wait > std::time::Duration::from_millis(3)
+            || set_gain_elapsed > std::time::Duration::from_millis(3)
+        {
+            eprintln!(
+                "[macos-set_volume-diag] lock_wait={lock_wait:?} set_gain={set_gain_elapsed:?}"
+            );
         }
         Ok(())
     }
@@ -2025,15 +2325,27 @@ impl AudioMixerBackend for MacosMixerBackend {
     }
 
     fn set_balance(&self, session_id: &str, balance: f32) -> Result<(), MixerError> {
+        // TEMPORARY DIAGNOSTIC -- remove after the mid-drag glitch investigation.
+        let t0 = std::time::Instant::now();
         let mut inner = self.inner.lock().unwrap();
+        let lock_wait = t0.elapsed();
         let state = inner
             .gain_state
             .get_mut(session_id)
             .ok_or_else(|| MixerError::SessionNotFound(session_id.to_string()))?;
         state.set_balance(balance);
         let effective = state.effective_gains();
+        let t1 = std::time::Instant::now();
         if let Some(engine) = &inner.engine {
             engine.set_gain(session_id, effective);
+        }
+        let set_gain_elapsed = t1.elapsed();
+        if lock_wait > std::time::Duration::from_millis(3)
+            || set_gain_elapsed > std::time::Duration::from_millis(3)
+        {
+            eprintln!(
+                "[macos-set_balance-diag] lock_wait={lock_wait:?} set_gain={set_gain_elapsed:?}"
+            );
         }
         Ok(())
     }
@@ -2148,10 +2460,17 @@ mod tests {
     }
 
     #[test]
-    fn set_volume_clamps_into_zero_one_range() {
+    fn set_volume_clamps_into_boosted_range() {
         let mut s = AppGainState::default();
+        // Below the old 1.0 unity cap: passes through untouched, boost or not.
+        s.set_volume(0.7);
+        assert_eq!(s.volume, 0.7);
+        // Above unity, at the boosted ceiling: allowed, not clamped back to 1.0.
         s.set_volume(1.5);
-        assert_eq!(s.volume, 1.0);
+        assert_eq!(s.volume, 1.5);
+        // Above the boosted ceiling: clamped to it.
+        s.set_volume(3.0);
+        assert_eq!(s.volume, super::super::MAX_BOOSTED_VOLUME);
         s.set_volume(-0.3);
         assert_eq!(s.volume, 0.0);
     }
@@ -2346,24 +2665,133 @@ mod tests {
     }
 
     #[test]
-    fn process_name_lookup_resolves_this_process_own_pid() {
-        // `process_short_name`/`is_hidden_system_process`'s no-bundle-id path needs a real live
-        // pid (no way to fake `pbi_name` without a real syscall) -- this test process's own pid
-        // is the only "real" one a unit test has on hand.
-        let own_pid = std::process::id() as i32;
-        assert!(process_short_name(own_pid).is_some());
-        // The cargo test binary is obviously not named "systemsoundserverd" -- proves the
-        // no-bundle-id path doesn't spuriously hide arbitrary processes it doesn't recognize.
-        assert!(!is_hidden_system_process(None, own_pid));
+    fn does_not_hide_ordinary_paths() {
+        assert!(!is_system_internal_path(
+            "/Applications/Spotify.app/Contents/MacOS/Spotify"
+        ));
+        assert!(!is_system_internal_path(
+            "/System/Applications/Music.app/Contents/MacOS/Music"
+        ));
     }
 
     #[test]
-    fn bundle_id_hide_list_short_circuits_before_any_process_name_lookup() {
+    fn hides_known_system_internal_paths() {
+        // Confirmed on real hardware -- see `SYSTEM_INTERNAL_PATH_PREFIXES`'s doc comment.
+        assert!(is_system_internal_path("/usr/sbin/systemsoundserverd"));
+        assert!(is_system_internal_path(
+            "/System/Library/CoreServices/PowerChime.app/Contents/MacOS/PowerChime"
+        ));
+        assert!(is_system_internal_path(
+            "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU"
+        ));
+    }
+
+    #[test]
+    fn wanted_when_reporting_active_regardless_of_hold_state() {
+        let now = Instant::now();
+        assert!(is_wanted_for_reconciliation(true, None, now));
+        assert!(is_wanted_for_reconciliation(
+            true,
+            Some(now - Duration::from_secs(10)),
+            now
+        ));
+    }
+
+    #[test]
+    fn not_wanted_when_inactive_with_no_hold_at_all() {
+        assert!(!is_wanted_for_reconciliation(false, None, Instant::now()));
+    }
+
+    #[test]
+    fn still_wanted_when_inactive_but_within_the_hold_window() {
+        let now = Instant::now();
+        let hold_until = now + Duration::from_millis(500);
+        assert!(is_wanted_for_reconciliation(false, Some(hold_until), now));
+    }
+
+    #[test]
+    fn not_wanted_once_the_hold_window_has_expired() {
+        let now = Instant::now();
+        let hold_until = now - Duration::from_millis(1);
+        assert!(!is_wanted_for_reconciliation(false, Some(hold_until), now));
+    }
+
+    #[test]
+    fn pid_path_lookup_resolves_this_process_own_pid() {
+        // `is_hidden_system_process_cached`'s no-bundle-id path needs a real live pid (no way to
+        // fake `pidpath`'s result without a real syscall) -- this test process's own pid is the
+        // only "real" one a unit test has on hand.
+        let own_pid = std::process::id() as i32;
+        assert!(libproc::proc_pid::pidpath(own_pid).is_ok());
+        // The cargo test binary obviously isn't under `/System/Library`, `/usr/sbin`, or
+        // `/usr/libexec` -- proves the no-bundle-id path doesn't spuriously hide arbitrary
+        // processes it doesn't recognize.
+        assert!(!is_hidden_system_process_cached(
+            &mut HashMap::new(),
+            None,
+            own_pid
+        ));
+    }
+
+    #[test]
+    fn bundle_id_hide_list_short_circuits_before_any_path_lookup() {
         // A hidden bundle id should be caught without needing a valid pid at all -- pid 0 would
-        // make `process_short_name` fail/return `None`, so this only passes if the bundle check
-        // runs (and short-circuits) first.
-        assert!(is_hidden_system_process(Some("com.apple.coreaudiod"), 0));
-        assert!(!is_hidden_system_process(Some("com.spotify.client"), 0));
+        // make `pidpath` fail, so this only passes if the bundle check runs (and short-circuits)
+        // first.
+        assert!(is_hidden_system_process_cached(
+            &mut HashMap::new(),
+            Some("com.apple.coreaudiod"),
+            0
+        ));
+        assert!(!is_hidden_system_process_cached(
+            &mut HashMap::new(),
+            Some("com.spotify.client"),
+            0
+        ));
+    }
+
+    #[test]
+    fn cached_variant_caches_a_bundle_id_match_without_any_syscall() {
+        let mut cache = HashMap::new();
+        // pid 0 would make `pidpath` fail -- proves this resolves purely from the bundle-id
+        // match, and that the resulting `true` actually gets cached.
+        assert!(is_hidden_system_process_cached(
+            &mut cache,
+            Some("com.apple.coreaudiod"),
+            0
+        ));
+        assert_eq!(cache.get(&0), Some(&true));
+    }
+
+    #[test]
+    fn cached_variant_caches_a_resolved_non_hidden_process() {
+        let mut cache = HashMap::new();
+        let own_pid = std::process::id() as i32;
+        assert!(!is_hidden_system_process_cached(&mut cache, None, own_pid));
+        // A decisive `false` (the path lookup succeeded and wasn't under a hidden prefix) is
+        // cached too, not just `true` -- otherwise every ordinary app would re-run the syscall
+        // every poll.
+        assert_eq!(cache.get(&own_pid), Some(&false));
+    }
+
+    #[test]
+    fn cached_variant_does_not_cache_a_failed_syscall() {
+        let mut cache = HashMap::new();
+        // pid 0 with no bundle id: the bundle check doesn't match, and `pidpath(0)` fails -- this
+        // must resolve to `false` for this call without inserting anything, so a later call (once
+        // the real process is resolvable) can still get the right answer instead of being
+        // permanently stuck on a guess made during a transient failure.
+        assert!(!is_hidden_system_process_cached(&mut cache, None, 0));
+        assert_eq!(cache.get(&0), None);
+    }
+
+    #[test]
+    fn cached_variant_reuses_a_cached_answer_without_needing_bundle_id_again() {
+        let mut cache = HashMap::new();
+        cache.insert(999_999, true);
+        // No bundle id and an unresolvable pid -- would resolve to `false` if the cache weren't
+        // consulted first, so this only passes if the cached answer is actually used.
+        assert!(is_hidden_system_process_cached(&mut cache, None, 999_999));
     }
 
     // ---------------------------------------------------------------------------------------

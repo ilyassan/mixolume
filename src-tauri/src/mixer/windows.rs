@@ -464,6 +464,19 @@ impl AudioMixerBackend for WindowsMixerBackend {
         inner.target_volume.retain(|id, _| live_ids.contains(id));
         inner.applied_ducked.retain(|id, _| live_ids.contains(id));
 
+        // `IAudioSessionEnumerator` (behind `enumerate_session_controls`) has no documented
+        // ordering guarantee either, matching macOS's `kAudioHardwarePropertyProcessObjectList`
+        // -- see the identical sort in `macos.rs`'s `list_sessions` for the full rationale (an
+        // unstable order reshuffles the frontend's rendered list on poll ticks where nothing
+        // user-visible changed, which its Framer Motion layout tracking reacts to as real
+        // movement, confirmed live as the cause of sustained high frontend CPU once a second
+        // session existed to reorder against).
+        sessions.sort_by(|a, b| {
+            a.display_name
+                .cmp(&b.display_name)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
         Ok(sessions)
     }
 

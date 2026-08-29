@@ -1,5 +1,5 @@
 import { AppWindow } from "lucide-react";
-import { iconPngToDataUrl } from "@/lib/iconUrl";
+import { useIconObjectUrl } from "@/hooks/useIconObjectUrl";
 
 interface SessionIconProps {
   iconPng: number[] | null;
@@ -7,9 +7,9 @@ interface SessionIconProps {
 }
 
 export function SessionIcon({ iconPng, displayName }: SessionIconProps) {
-  const dataUrl = iconPngToDataUrl(iconPng);
+  const objectUrl = useIconObjectUrl(iconPng);
 
-  if (!dataUrl) {
+  if (!objectUrl) {
     return (
       <div className="bg-secondary text-muted-foreground flex size-8 shrink-0 items-center justify-center rounded-md">
         <AppWindow className="size-4" />
@@ -19,7 +19,7 @@ export function SessionIcon({ iconPng, displayName }: SessionIconProps) {
 
   return (
     <img
-      src={dataUrl}
+      src={objectUrl}
       alt=""
       className="size-8 shrink-0 rounded-md object-contain"
       // Decorative - the app name is rendered as text right next to it.

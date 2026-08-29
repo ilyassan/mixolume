@@ -1,11 +1,11 @@
-import { memo, useEffect, useState } from "react";
+import { memo, useState } from "react";
 import { ChevronRight, Volume2, VolumeX } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
-import { Slider } from "@/components/ui/slider";
 import { Button } from "@/components/ui/button";
 import { SessionIcon } from "@/components/SessionIcon";
-import { toLeftRight, fromLeftRight } from "@/lib/balance";
-import { useSmoothedNumber } from "@/hooks/useSmoothedNumber";
+import { VolumeSlider } from "@/components/VolumeSlider";
+import { BalanceSliders } from "@/components/BalanceSliders";
+import { useMixerStore } from "@/stores/mixer-store";
 import type { FadingSession } from "@/hooks/useSessionListWithFadeOut";
 
 interface SessionRowProps {
@@ -13,6 +13,10 @@ interface SessionRowProps {
   onVolumeChange: (sessionId: string, volume: number) => void;
   onMuteToggle: (sessionId: string, muted: boolean) => void;
   onBalanceChange: (sessionId: string, balance: number) => void;
+  /** Highest volume percent the current backend allows -- 100 normally, 200 on macOS's boosted
+   * backend. Sizes the main volume slider's `max`; the L/R balance sliders stay 0-100 always,
+   * since balance is a pan ratio, not itself boostable. */
+  maxVolumePercent: number;
 }
 
 // Memoized: `useSessionListWithFadeOut` now reuses the same `session` object reference for a
@@ -28,12 +32,12 @@ export const SessionRow = memo(function SessionRow({
   onVolumeChange,
   onMuteToggle,
   onBalanceChange,
+  maxVolumePercent,
 }: SessionRowProps) {
   const {
     id,
     displayName,
     iconPng,
-    volume,
     effectiveVolume,
     muted,
     balance,
@@ -43,52 +47,20 @@ export const SessionRow = memo(function SessionRow({
     removing,
   } = session;
   // What's actually coming out right now, not the target -- a ducked app should visibly read
-  // quieter, not sit at its full set volume while audibly playing much lower than that.
-  const percent = Math.round(effectiveVolume * 100);
+  // quieter, not sit at its full set volume while audibly playing much lower than that. Kept
+  // unrounded here (rounded only where it's actually displayed, in the `%` label below) --
+  // rounding this to a whole number fed a quantized value straight into the slider's controlled
+  // `value`, which combined with the Slider's own step to make dragging visibly hop between
+  // whole percents instead of gliding with the pointer, confirmed live.
+  const percent = effectiveVolume * 100;
   // Advanced panel (balance, and room for whatever gets added later) stays collapsed by
   // default -- opened automatically only if a row already has a non-center balance (e.g. after
   // a relaunch), so returning users don't lose sight of a setting they already made.
   const [expanded, setExpanded] = useState(balance !== 0);
-
-  const [left, right] = toLeftRight(volume, balance);
-  const leftPercent = Math.round(left * 100);
-  const rightPercent = Math.round(right * 100);
-
-  // Distinguishes "the user is dragging this slider right now" (should track the cursor with no
-  // added lag) from "this changed for some other reason" (auto-duck lowering/restoring it, most
-  // notably -- should ease smoothly instead of jumping). Driven straight off the slider's own
-  // pointer interaction, not inferred from the value itself.
-  const [isDraggingVolume, setIsDraggingVolume] = useState(false);
-  // Belt-and-suspenders beyond the Slider's own onPointerUp/onPointerCancel: those are attached
-  // to the slider element itself, and if the browser ever fails to deliver one to it (pointer
-  // capture released oddly, focus lost mid-drag, etc.) this would otherwise get permanently
-  // stuck "dragging" -- which silently disables smoothing for that one row forever, exactly the
-  // "some apps never animate" symptom this was confirmed to cause live. A window-level listener
-  // can't miss the pointer going up anywhere on screen.
-  useEffect(() => {
-    if (!isDraggingVolume) {
-      return;
-    }
-    const stopDragging = () => setIsDraggingVolume(false);
-    window.addEventListener("pointerup", stopDragging);
-    window.addEventListener("pointercancel", stopDragging);
-    return () => {
-      window.removeEventListener("pointerup", stopDragging);
-      window.removeEventListener("pointercancel", stopDragging);
-    };
-  }, [isDraggingVolume]);
-  const displayPercent = useSmoothedNumber(percent, isDraggingVolume);
-
-  const handleLeftChange = (nextPercent: number) => {
-    const [newVolume, newBalance] = fromLeftRight(nextPercent / 100, right);
-    onVolumeChange(id, newVolume);
-    onBalanceChange(id, newBalance);
-  };
-  const handleRightChange = (nextPercent: number) => {
-    const [newVolume, newBalance] = fromLeftRight(left, nextPercent / 100);
-    onVolumeChange(id, newVolume);
-    onBalanceChange(id, newBalance);
-  };
+  // Whether *any* row (not necessarily this one) is currently being drag-adjusted -- see
+  // `layout` below for why this row needs to know about every other row's drag state, not just
+  // its own.
+  const isAnyRowDragging = useMixerStore((state) => state.draggingSessionId !== null);
 
   // Motion owns opacity entirely here (mount fade-in, the `removing` fade-out, and the
   // active/inactive dim) -- it used to be split between this and a CSS class, which meant two
@@ -101,11 +73,27 @@ export const SessionRow = memo(function SessionRow({
   // badges, triggers layout and enter/exit animation simultaneously). Position-only tracking
   // still animates reordering within a list smoothly without touching size at all, so there's
   // nothing left for a sibling's width change to disturb.
+  //
+  // Suspended entirely (`layout={false}`) while *any* row is being drag-adjusted, regardless of
+  // which one: Framer Motion's layout-projection system tracks every mounted `layout`-enabled
+  // node in one shared registry, not per-component -- when any one of them updates, it schedules
+  // a measurement pass across the *entire* registered set in that same animation frame (this is
+  // what makes relative-position FLIP math correct, not a bug). `React.memo` on this component
+  // (see its own doc comment) stops *React* from re-rendering unrelated rows, but does nothing
+  // about this -- Framer Motion's registry isn't keyed off React's render decisions. Confirmed
+  // live with a bare, zero-React-state `<input type="range">` that called the raw backend
+  // command directly (bypassing this entire component's own state/store/animation code): it
+  // glitched identically to the real slider purely from the resulting real volume-state pushes
+  // reflowing sibling rows, and stopped glitching the moment those pushes stopped arriving --
+  // narrowing the cause to exactly this, not the IPC round-trip or this app's drag architecture.
+  // Reordering (the thing `layout="position"` actually animates) only happens when a session
+  // appears/disappears/renames, never merely from a value changing, so losing it for the
+  // relatively brief span of an active drag has no real downside.
   const targetOpacity = removing ? 0 : isActive ? 1 : 0.5;
 
   return (
     <motion.div
-      layout="position"
+      layout={isAnyRowDragging ? false : "position"}
       initial={{ opacity: 0 }}
       animate={{ opacity: targetOpacity }}
       exit={{ opacity: 0 }}
@@ -221,24 +209,16 @@ export const SessionRow = memo(function SessionRow({
           </Button>
         </div>
 
-        <div className="mt-1.5 flex items-center gap-2">
-          <Slider
-            aria-label={`${displayName} volume`}
-            value={[displayPercent]}
-            min={0}
-            max={100}
-            step={1}
-            disabled={removing}
-            onValueChange={([next]) => onVolumeChange(id, next / 100)}
-            onPointerDown={() => setIsDraggingVolume(true)}
-            onPointerUp={() => setIsDraggingVolume(false)}
-            onPointerCancel={() => setIsDraggingVolume(false)}
-            className="flex-1"
-          />
-          <span className="text-muted-foreground w-9 shrink-0 text-right text-xs tabular-nums">
-            {Math.round(displayPercent)}%
-          </span>
-        </div>
+        <VolumeSlider
+          sessionId={id}
+          displayName={displayName}
+          percent={percent}
+          maxVolumePercent={maxVolumePercent}
+          disabled={removing}
+          muted={muted}
+          onVolumeChange={onVolumeChange}
+          onUnmute={() => onMuteToggle(id, false)}
+        />
       </div>
 
       <AnimatePresence initial={false}>
@@ -251,38 +231,15 @@ export const SessionRow = memo(function SessionRow({
             transition={{ duration: 0.18, ease: "easeOut" }}
             className="overflow-hidden"
           >
-            <div className="mt-1.5 flex items-center gap-4 px-2.5 pb-2.5">
-              <div className="flex flex-1 items-center gap-2">
-                <span className="text-muted-foreground w-3 text-[10px] font-medium">
-                  L
-                </span>
-                <Slider
-                  aria-label={`${displayName} left channel`}
-                  value={[leftPercent]}
-                  min={0}
-                  max={100}
-                  step={1}
-                  disabled={removing}
-                  onValueChange={([next]) => handleLeftChange(next)}
-                  className="flex-1"
-                />
-              </div>
-              <div className="flex flex-1 items-center gap-2">
-                <span className="text-muted-foreground w-3 text-[10px] font-medium">
-                  R
-                </span>
-                <Slider
-                  aria-label={`${displayName} right channel`}
-                  value={[rightPercent]}
-                  min={0}
-                  max={100}
-                  step={1}
-                  disabled={removing}
-                  onValueChange={([next]) => handleRightChange(next)}
-                  className="flex-1"
-                />
-              </div>
-            </div>
+            <BalanceSliders
+              sessionId={id}
+              displayName={displayName}
+              balance={balance}
+              muted={muted}
+              disabled={removing}
+              onBalanceChange={onBalanceChange}
+              onUnmute={() => onMuteToggle(id, false)}
+            />
           </motion.div>
         )}
       </AnimatePresence>

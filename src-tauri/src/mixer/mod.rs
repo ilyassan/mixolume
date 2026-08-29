@@ -95,9 +95,23 @@ pub enum MixerError {
 /// Clamp a requested volume into the 0.0..=1.0 range every backend agrees on for v1.
 ///
 /// Pulled out as a free function (rather than duplicated per backend) because it's pure logic
-/// worth unit-testing once instead of three times.
+/// worth unit-testing once instead of three times. `allow(dead_code)`: used by `windows.rs` and
+/// `linux.rs`, neither of which is compiled into a macOS build, so a local macOS-only `cargo
+/// check`/`clippy` sees no caller -- CI's Windows/Linux legs do.
+#[allow(dead_code)]
 pub fn clamp_volume(volume: f32) -> f32 {
     volume.clamp(0.0, 1.0)
+}
+
+/// Ceiling for backends that support boosting a session past its normal 100% volume (like VLC's
+/// own boosted-volume slider) -- currently macOS only, see [`AudioMixerBackend::max_volume_percent`].
+pub const MAX_BOOSTED_VOLUME: f32 = 1.5;
+
+/// Same as [`clamp_volume`] but allows up to [`MAX_BOOSTED_VOLUME`] -- used only by backends that
+/// actually support boosting (their `set_volume` calls this instead of `clamp_volume`), so
+/// backends that don't yet are entirely unaffected by this ceiling existing at all.
+pub fn clamp_boosted_volume(volume: f32) -> f32 {
+    volume.clamp(0.0, MAX_BOOSTED_VOLUME)
 }
 
 /// Appends every name in `well_known_apps` that's also present in `running_names` onto
@@ -157,6 +171,13 @@ pub trait AudioMixerBackend: Send + Sync {
     /// anything; they only poke a volume/mute value on the OS's own already-persistent audio
     /// session, so there's nothing to release and the default no-op is correct for them.
     fn shutdown(&self) {}
+
+    /// The highest volume percent this backend allows a session to be set to -- 100 for every
+    /// backend that doesn't override it. A backend that supports boosting past unity (see
+    /// [`MAX_BOOSTED_VOLUME`]) overrides this so the frontend knows to let its slider go further.
+    fn max_volume_percent(&self) -> u32 {
+        100
+    }
 
     /// Current auto-duck settings. Default: disabled, no priority apps -- correct as-is for
     /// every backend that doesn't override it.
@@ -222,5 +243,20 @@ mod tests {
     #[test]
     fn clamp_volume_passes_through_valid_range() {
         assert_eq!(clamp_volume(0.42), 0.42);
+    }
+
+    #[test]
+    fn clamp_boosted_volume_clamps_below_zero() {
+        assert_eq!(clamp_boosted_volume(-0.5), 0.0);
+    }
+
+    #[test]
+    fn clamp_boosted_volume_allows_past_unity() {
+        assert_eq!(clamp_boosted_volume(1.5), 1.5);
+    }
+
+    #[test]
+    fn clamp_boosted_volume_clamps_above_ceiling() {
+        assert_eq!(clamp_boosted_volume(5.0), MAX_BOOSTED_VOLUME);
     }
 }

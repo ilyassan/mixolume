@@ -69,7 +69,21 @@ impl AudioMixerBackend for LinuxMixerBackend {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        Ok(parse_sink_inputs(&stdout))
+        let mut sessions = parse_sink_inputs(&stdout);
+        // `pactl` empirically lists sink-inputs in ascending creation-index order, which is more
+        // stable in practice than the other two backends' enumeration APIs -- but it's not a
+        // documented guarantee either, so this sorts explicitly rather than relying on that
+        // holding forever. See the identical sort in `macos.rs`'s `list_sessions` for the full
+        // rationale (an unstable order reshuffles the frontend's rendered list on poll ticks
+        // where nothing user-visible changed, which its Framer Motion layout tracking reacts to
+        // as real movement -- confirmed live, on macOS, as the cause of sustained high frontend
+        // CPU once a second session existed to reorder against).
+        sessions.sort_by(|a, b| {
+            a.display_name
+                .cmp(&b.display_name)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(sessions)
     }
 
     fn set_volume(&self, session_id: &str, volume: f32) -> Result<(), MixerError> {

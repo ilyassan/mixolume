@@ -24,6 +24,17 @@ export interface AppSession {
   isDucked: boolean;
 }
 
+/**
+ * One session as it arrives over `sessions-changed` -- the same shape as `AppSession` except
+ * that `iconPng` is *absent* (not null) when the backend already sent that id's icon in an
+ * earlier push and it hasn't changed since. See `PushedSession` in `lib.rs` for why re-sending
+ * an unchanged icon is expensive enough to be worth avoiding, and `resolvePushedIcons` in
+ * `mixer-store.ts` for where the omitted value is filled back in.
+ */
+export type SessionPush = Omit<AppSession, "iconPng"> & {
+  iconPng?: number[] | null;
+};
+
 // Substring of the Rust error returned while Screen & System Audio Recording permission hasn't
 // been granted yet (see `screen_capture_permission::ensure_granted` in macos.rs). Screen Recording
 // is one of the few macOS permission categories that only takes effect after a full app relaunch
@@ -66,6 +77,10 @@ export const setMuted = (sessionId: string, muted: boolean) =>
 export const setBalance = (sessionId: string, balance: number) =>
   invoke<void>("set_balance", { sessionId, balance });
 
+// The highest volume percent the current backend allows a session to be set to -- 100 everywhere
+// except macOS (200, boosted like VLC's own past-100% slider). Drives the volume slider's `max`.
+export const maxVolumePercent = () => invoke<number>("max_volume_percent");
+
 // Routed through a Rust command rather than calling `getCurrentWindow().startDragging()`
 // directly -- see `begin_window_drag`'s doc comment in lib.rs for why starting a drag needs the
 // same hide-on-blur guard as showing the window does.
@@ -91,11 +106,12 @@ export const setDuckTriggerPriority = (displayName: string, isPriority: boolean)
 
 // ===== EVENTS =====
 
-// Rust pushes the full, updated session list whenever it changes (on its own
-// polling interval - not something the frontend controls).
+// Rust pushes the updated session list whenever it changes (on its own polling interval - not
+// something the frontend controls). Every session is present every time; only `iconPng` may be
+// omitted - see `SessionPush`.
 export const listenToSessionsChanged = (
-  callback: (sessions: AppSession[]) => void,
+  callback: (sessions: SessionPush[]) => void,
 ) =>
-  listen<AppSession[]>("sessions-changed", (event) => {
+  listen<SessionPush[]>("sessions-changed", (event) => {
     callback(event.payload);
   });

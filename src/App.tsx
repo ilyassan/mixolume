@@ -22,6 +22,7 @@ function App() {
   const setVolume = useMixerStore((state) => state.setVolume);
   const setMuted = useMixerStore((state) => state.setMuted);
   const setBalance = useMixerStore((state) => state.setBalance);
+  const maxVolumePercent = useMixerStore((state) => state.maxVolumePercent);
 
   const [inactiveExpanded, setInactiveExpanded] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -119,6 +120,7 @@ function App() {
                   onVolumeChange={setVolume}
                   onMuteToggle={setMuted}
                   onBalanceChange={setBalance}
+                  maxVolumePercent={maxVolumePercent}
                 />
               ))}
             </AnimatePresence>
@@ -160,6 +162,7 @@ function App() {
                             onVolumeChange={setVolume}
                             onMuteToggle={setMuted}
                             onBalanceChange={setBalance}
+                            maxVolumePercent={maxVolumePercent}
                           />
                         ))}
                       </AnimatePresence>

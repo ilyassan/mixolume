@@ -50,28 +50,66 @@ fn list_sessions(state: State<MixerState>) -> Result<Vec<AppSession>, String> {
     state.backend.list_sessions().map_err(mixer_error_to_string)
 }
 
+// TEMPORARY DIAGNOSTIC -- isolation test, see conversation. Touches nothing: no lock, no
+// backend, no state at all. If calling *this* at native drag-event rate still glitches, the
+// cost is in the WKWebView<->Rust IPC bridge itself, not anything our command handlers do.
 #[tauri::command]
-fn set_volume(state: State<MixerState>, session_id: String, volume: f32) -> Result<(), String> {
-    state
-        .backend
-        .set_volume(&session_id, volume)
-        .map_err(mixer_error_to_string)
+fn noop_diag() {}
+
+/// `async fn` + `spawn_blocking`, not a plain synchronous command: the actual work
+/// (`Mutex::lock()` plus, occasionally, real Core Audio HAL calls if a tap engine rebuild is
+/// in flight) is genuinely blocking, and a plain `fn` command hands that blocking work straight
+/// to whatever thread Tauri's IPC dispatch happens to run it on. Confirmed live (timing
+/// instrumentation) that this occasionally takes 11ms+ -- contending with the background poll
+/// loop for the same lock -- and moving it onto a dedicated blocking-pool thread via
+/// `spawn_blocking` means that stall, whenever it happens, never has a chance to hold up
+/// anything the UI's own responsiveness depends on.
+#[tauri::command]
+async fn set_volume(
+    state: State<'_, MixerState>,
+    session_id: String,
+    volume: f32,
+) -> Result<(), String> {
+    let backend = Arc::clone(&state.backend);
+    tokio::task::spawn_blocking(move || {
+        backend
+            .set_volume(&session_id, volume)
+            .map_err(mixer_error_to_string)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn set_muted(state: State<MixerState>, session_id: String, muted: bool) -> Result<(), String> {
-    state
-        .backend
-        .set_muted(&session_id, muted)
-        .map_err(mixer_error_to_string)
+async fn set_muted(
+    state: State<'_, MixerState>,
+    session_id: String,
+    muted: bool,
+) -> Result<(), String> {
+    let backend = Arc::clone(&state.backend);
+    tokio::task::spawn_blocking(move || {
+        backend
+            .set_muted(&session_id, muted)
+            .map_err(mixer_error_to_string)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn set_balance(state: State<MixerState>, session_id: String, balance: f32) -> Result<(), String> {
-    state
-        .backend
-        .set_balance(&session_id, balance)
-        .map_err(mixer_error_to_string)
+async fn set_balance(
+    state: State<'_, MixerState>,
+    session_id: String,
+    balance: f32,
+) -> Result<(), String> {
+    let backend = Arc::clone(&state.backend);
+    tokio::task::spawn_blocking(move || {
+        backend
+            .set_balance(&session_id, balance)
+            .map_err(mixer_error_to_string)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Starts an OS-native window-move drag, for the frontend's draggable header (Windows/Linux
@@ -96,6 +134,15 @@ fn begin_window_drag(
 #[tauri::command]
 fn get_ducking_settings(state: State<MixerState>) -> DuckingSettings {
     state.backend.get_ducking_settings()
+}
+
+/// The highest volume percent the current backend allows a session to be set to -- 100 on every
+/// backend except macOS's (200, boosted like VLC's own past-100% slider). The frontend uses this
+/// to size the volume slider's `max`, so Windows/Linux behave exactly as before with no branching
+/// of their own once this returns 100 for them unchanged.
+#[tauri::command]
+fn max_volume_percent(state: State<MixerState>) -> u32 {
+    state.backend.max_volume_percent()
 }
 
 /// Whether auto-duck is actually implemented on this platform -- it needs each priority app's
@@ -192,23 +239,136 @@ const POLL_INTERVAL: Duration = Duration::from_millis(150);
 /// duck trigger or being ducked).
 const DUCK_TRANSITION_POLL_INTERVAL: Duration = Duration::from_millis(30);
 
+/// How long to keep polling at [`DUCK_TRANSITION_POLL_INTERVAL`] after the last actual change to
+/// any session's `is_ducked`/`is_duck_trigger` flag -- generously above the "~91% of the ramp is
+/// already done within a single 150ms window" figure [`DUCK_TRANSITION_POLL_INTERVAL`]'s doc
+/// comment cites, so the frontend gets enough samples to animate the *whole* ramp smoothly, not
+/// just its first window.
+///
+/// Not simply "however long any session is ducked/triggering", which is what an earlier version
+/// of this did: two apps that continuously trigger ducking against each other (plausible any time
+/// two audio-producing apps are both open) would then pin the loop at 30ms indefinitely -- 5x
+/// [`POLL_INTERVAL`]'s `Mutex<Inner>` lock/unlock rate, competing with every `set_volume` call a
+/// slider drag sends. Confirmed live (`ps` CPU sampling during an active 2-app drag) as sustained
+/// 50-80% backend CPU for the entire interaction, not just a brief transition -- the likely cause
+/// of the "mostly smooth but occasionally drops/glitches" reported even after the drag's own
+/// display path stopped depending on the backend round-trip at all.
+const DUCK_TRANSITION_WINDOW: Duration = Duration::from_millis(600);
+
+/// One session as pushed over `sessions-changed`. Identical to [`AppSession`] except that
+/// `iconPng` is *omitted entirely* (rather than repeated) when it hasn't changed since the last
+/// push -- the frontend reuses whatever it already has for that id (see `mixer-store.ts`'s
+/// `resolvePushedIcons`).
+///
+/// This is not a size micro-optimisation. Tauri's `emit` does not hand the webview a binary or
+/// even a JSON payload: it builds a **JavaScript source string** with the serialized payload
+/// inlined as a literal and runs it through `evaluateJavaScript` (confirmed by reading
+/// `tauri-2.11.5`'s `event::emit_js_script`/`Webview::eval`). A 128px app icon is ~11KB of PNG,
+/// which serde renders as a `Vec<u8>` array literal of ~11,000 numbers -- roughly 50KB of
+/// JavaScript *source* per icon that WebKit has to parse, on the WebContent main thread, on every
+/// push. The poll loop pushes whenever anything differs from what it last sent, and a slider drag
+/// changes `volume` on essentially every tick, so during a drag that parse ran ~7 times a second
+/// (~33 while auto-duck's fast-poll window is armed) per tapped app -- competing directly with
+/// the frames the drag itself needs to paint. Icons never change for a live session id, so after
+/// the first push there is nothing to re-send.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PushedSession<'a> {
+    id: &'a str,
+    display_name: &'a str,
+    /// `Some` -> serialized normally (the byte array, or `null` for an app with no resolvable
+    /// icon); `None` -> field left out of the payload entirely, meaning "unchanged, keep yours".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icon_png: Option<&'a Option<Vec<u8>>>,
+    volume: f32,
+    effective_volume: f32,
+    muted: bool,
+    balance: f32,
+    is_active: bool,
+    is_duck_trigger: bool,
+    is_ducked: bool,
+}
+
+/// Builds the `sessions-changed` payload for `sessions`, dropping every icon that's byte-identical
+/// to what the previous push (`last_pushed`, i.e. the list this one is a delta against) already
+/// delivered for the same session id. A session id the previous push didn't contain always keeps
+/// its icon, so a newly-appearing session is never left without one.
+fn pushed_sessions<'a>(
+    sessions: &'a [AppSession],
+    last_pushed: Option<&[AppSession]>,
+) -> Vec<PushedSession<'a>> {
+    sessions
+        .iter()
+        .map(|session| {
+            let already_delivered = last_pushed.is_some_and(|previous| {
+                previous
+                    .iter()
+                    .any(|p| p.id == session.id && p.icon_png == session.icon_png)
+            });
+            PushedSession {
+                id: &session.id,
+                display_name: &session.display_name,
+                icon_png: if already_delivered {
+                    None
+                } else {
+                    Some(&session.icon_png)
+                },
+                volume: session.volume,
+                effective_volume: session.effective_volume,
+                muted: session.muted,
+                balance: session.balance,
+                is_active: session.is_active,
+                is_duck_trigger: session.is_duck_trigger,
+                is_ducked: session.is_ducked,
+            }
+        })
+        .collect()
+}
+
 fn spawn_session_poll_loop(app_handle: AppHandle, backend: Arc<dyn AudioMixerBackend>) {
     tauri::async_runtime::spawn(async move {
         let mut last: Option<Vec<AppSession>> = None;
+        let mut fast_poll_until: Option<Instant> = None;
+        // TEMPORARY DIAGNOSTIC -- remove after the mid-drag glitch investigation.
+        let mut tick_count: u32 = 0;
+        let mut fast_tick_count: u32 = 0;
+        let mut diag_window_start = Instant::now();
         loop {
-            let duck_active = last
-                .as_ref()
-                .is_some_and(|sessions| sessions.iter().any(|s| s.is_ducked || s.is_duck_trigger));
-            let interval = if duck_active {
+            let now = Instant::now();
+            let is_fast = fast_poll_until.is_some_and(|until| now < until);
+            let interval = if is_fast {
                 DUCK_TRANSITION_POLL_INTERVAL
             } else {
                 POLL_INTERVAL
             };
             tokio::time::sleep(interval).await;
-            match backend.list_sessions() {
+            let list_start = std::time::Instant::now();
+            let result = backend.list_sessions();
+            let list_elapsed = list_start.elapsed();
+            tick_count += 1;
+            if is_fast {
+                fast_tick_count += 1;
+            }
+            if diag_window_start.elapsed() > Duration::from_secs(1) {
+                eprintln!(
+                    "[poll-rate-diag] ticks_last_window={tick_count} fast_ticks={fast_tick_count} last_list_sessions={list_elapsed:?}"
+                );
+                tick_count = 0;
+                fast_tick_count = 0;
+                diag_window_start = Instant::now();
+            }
+            match result {
                 Ok(sessions) => {
+                    let duck_flags_changed =
+                        duck_flags(last.as_deref()) != duck_flags(Some(sessions.as_slice()));
+                    if duck_flags_changed {
+                        fast_poll_until = Some(Instant::now() + DUCK_TRANSITION_WINDOW);
+                    }
                     if last.as_ref() != Some(&sessions) {
-                        let _ = app_handle.emit("sessions-changed", &sessions);
+                        let _ = app_handle.emit(
+                            "sessions-changed",
+                            &pushed_sessions(&sessions, last.as_deref()),
+                        );
                         last = Some(sessions);
                     }
                 }
@@ -218,6 +378,19 @@ fn spawn_session_poll_loop(app_handle: AppHandle, backend: Arc<dyn AudioMixerBac
             }
         }
     });
+}
+
+/// Per-session `(id, is_ducked, is_duck_trigger)` view, used only to detect whether *any*
+/// session's ducking state actually changed between two polls -- see [`DUCK_TRANSITION_WINDOW`].
+/// `None` (no previous poll yet) never equals `Some(_)`, so the very first poll always counts as
+/// "changed", which is correct: there's nothing to compare against yet.
+fn duck_flags(sessions: Option<&[AppSession]>) -> Option<Vec<(&str, bool, bool)>> {
+    sessions.map(|sessions| {
+        sessions
+            .iter()
+            .map(|s| (s.id.as_str(), s.is_ducked, s.is_duck_trigger))
+            .collect()
+    })
 }
 
 /// Unique id for the (single) tray icon, so the "Show MiXolume" menu item can look it up via
@@ -600,8 +773,86 @@ pub fn run() {
             get_ducking_settings,
             ducking_supported,
             set_ducking_enabled,
-            set_duck_trigger_priority
+            set_duck_trigger_priority,
+            max_volume_percent,
+            noop_diag
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(id: &str, icon: Option<&[u8]>, volume: f32) -> AppSession {
+        AppSession {
+            id: id.to_string(),
+            display_name: id.to_string(),
+            icon_png: icon.map(<[u8]>::to_vec),
+            volume,
+            effective_volume: volume,
+            muted: false,
+            balance: 0.0,
+            is_active: true,
+            is_duck_trigger: false,
+            is_ducked: false,
+        }
+    }
+
+    fn payload(sessions: &[AppSession], last_pushed: Option<&[AppSession]>) -> serde_json::Value {
+        serde_json::to_value(pushed_sessions(sessions, last_pushed)).unwrap()
+    }
+
+    #[test]
+    fn first_push_carries_every_icon() {
+        let sessions = vec![session("a", Some(&[1, 2, 3]), 1.0)];
+        assert_eq!(
+            payload(&sessions, None)[0]["iconPng"],
+            serde_json::json!([1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn unchanged_icon_is_omitted_from_a_later_push() {
+        let first = vec![session("a", Some(&[1, 2, 3]), 1.0)];
+        let second = vec![session("a", Some(&[1, 2, 3]), 0.5)];
+        let pushed = payload(&second, Some(&first));
+        assert!(
+            pushed[0].get("iconPng").is_none(),
+            "an icon the frontend already has must not be re-serialized into the payload"
+        );
+        assert_eq!(pushed[0]["volume"], serde_json::json!(0.5));
+    }
+
+    #[test]
+    fn a_changed_icon_is_sent_again() {
+        let first = vec![session("a", Some(&[1, 2, 3]), 1.0)];
+        let second = vec![session("a", Some(&[9]), 1.0)];
+        assert_eq!(
+            payload(&second, Some(&first))[0]["iconPng"],
+            serde_json::json!([9])
+        );
+    }
+
+    #[test]
+    fn a_session_the_previous_push_did_not_contain_always_carries_its_icon() {
+        let first = vec![session("a", Some(&[1]), 1.0)];
+        let second = vec![session("a", Some(&[1]), 1.0), session("b", Some(&[2]), 1.0)];
+        let pushed = payload(&second, Some(&first));
+        assert!(pushed[0].get("iconPng").is_none());
+        assert_eq!(pushed[1]["iconPng"], serde_json::json!([2]));
+    }
+
+    #[test]
+    fn an_app_with_no_icon_sends_an_explicit_null_once() {
+        let sessions = vec![session("a", None, 1.0)];
+        assert_eq!(
+            payload(&sessions, None)[0]["iconPng"],
+            serde_json::Value::Null
+        );
+        assert!(payload(&sessions, Some(&sessions))[0]
+            .get("iconPng")
+            .is_none());
+    }
 }

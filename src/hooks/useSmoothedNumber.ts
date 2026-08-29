@@ -14,12 +14,17 @@ function easeOutCubic(t: number): number {
  * `effectiveVolume`), where an instant jump reads as a jarring glitch rather than a deliberate
  * user action.
  *
- * `instant` bypasses the easing (jumps to `target` on the very next animation frame instead of
- * over `EASED_DURATION_MS`) -- pass `true` while the user is actively dragging the control this
- * feeds, so their own input tracks the cursor instead of trailing behind the animation. Still
- * goes through the same `requestAnimationFrame`-driven state update as the eased path rather
- * than a separate synchronous branch: React's lint rules flag `setState` called directly in an
- * effect body, and routing the instant case through one RAF tick satisfies that for free.
+ * `instant` bypasses the easing entirely and returns `target` straight back, synchronously, with
+ * no state update and no `requestAnimationFrame` involved -- pass `true` while the user is
+ * actively dragging the control this feeds. This used to route the instant case through the same
+ * RAF-driven `setState` the eased path uses (satisfying a React lint rule against calling
+ * `setState` directly in an effect body), which meant every single call during a drag -- one per
+ * pointer tick -- forced an *extra*, wasted re-render whose result was thrown away by every
+ * caller that already had the live value in hand. Confirmed live as a real, measurable
+ * contributor to high CPU during dragging, not just a theoretical inefficiency. The effect below
+ * still runs on every instant call, but only to keep `currentRef` caught up (a plain ref write,
+ * not a state update) so a *later* eased transition starts from the right place -- that's cheap
+ * enough not to matter.
  *
  * Driving a Radix Slider's *value* through a single number like this (rather than CSS-
  * transitioning its internal `left`/`right` inline styles directly) sidesteps a real, confirmed
@@ -50,19 +55,34 @@ export function useSmoothedNumber(target: number, instant: boolean): number {
   useEffect(() => {
     if (frameRef.current !== null) {
       cancelAnimationFrame(frameRef.current);
+      frameRef.current = null;
+    }
+
+    // Just stay caught up -- no animation, no state update, so no re-render from this hook at
+    // all while `instant` is true. `useLiveDragValue` returns `target` directly in this branch
+    // (see below), never `display`, so there'd be nothing to render it for anyway.
+    if (instant) {
+      currentRef.current = target;
+      return;
     }
 
     const from = currentRef.current;
     const to = target;
     if (from === to) {
-      frameRef.current = null;
+      // Nothing to animate -- but `display` may still be stale from a preceding instant phase,
+      // which never touches it (see above). Confirmed live as the actual cause of a drag release
+      // visibly snapping back to a stale position before "correcting": releasing a drag commonly
+      // lands exactly on the value already tracked in `currentRef` (that's the whole point of
+      // keeping it in sync throughout the drag), which hit this exact branch and left `display`
+      // holding whatever it was from *before* the drag ever started -- since nothing forces this
+      // effect to re-run again until some unrelated future change happens to nudge `target`.
+      setDisplay(to);
       return;
     }
 
-    const duration = instant ? 0 : EASED_DURATION_MS;
     const startTime = performance.now();
     const tick = (now: number) => {
-      const t = duration === 0 ? 1 : Math.min((now - startTime) / duration, 1);
+      const t = Math.min((now - startTime) / EASED_DURATION_MS, 1);
       const value = from + (to - from) * easeOutCubic(t);
       currentRef.current = value;
       setDisplay(value);
@@ -78,5 +98,5 @@ export function useSmoothedNumber(target: number, instant: boolean): number {
     };
   }, [target, instant]);
 
-  return display;
+  return instant ? target : display;
 }
