@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 
 const EASED_DURATION_MS = 250;
 
@@ -52,7 +52,22 @@ export function useSmoothedNumber(target: number, instant: boolean): number {
   const currentRef = useRef(target);
   const frameRef = useRef<number | null>(null);
 
-  useEffect(() => {
+  // `useLayoutEffect`, not `useEffect` -- this is the actual fix, not a nicety. `useEffect` runs
+  // *after* the browser has already painted whatever this render function returned; when `instant`
+  // transitions from `true` to `false` in a given render, that render's return value is `display`
+  // (state) -- which, after any stretch of `instant: true` renders (the entire preceding drag),
+  // has not been touched at all, since the instant branch below deliberately skips `setDisplay`
+  // (see this hook's own module doc comment for why). So `display` is whatever it was from
+  // *before* this interaction even started, and a plain `useEffect` correcting it via `setDisplay`
+  // still only takes effect on the *next* render -- meaning the browser genuinely paints the stale
+  // value first, for one real frame, before self-correcting. Confirmed live, via an isolation
+  // ladder that ruled out every other layer of this app's stack (Zustand, the backend, Radix
+  // itself, Framer Motion) one at a time: a version of this hook wired to nothing but local state
+  // and a real backend call still reproduced the exact reported flicker, which narrowed it to
+  // here. `useLayoutEffect` runs synchronously before the browser paints, so the corrective
+  // `setDisplay` call below resolves before anything is ever drawn -- the stale render is
+  // computed but never actually shown on screen.
+  useLayoutEffect(() => {
     if (frameRef.current !== null) {
       cancelAnimationFrame(frameRef.current);
       frameRef.current = null;

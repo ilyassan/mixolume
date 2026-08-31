@@ -38,7 +38,7 @@ vi.mock("@/lib/tauri", () => ({
     error.includes("screen & system audio recording permission"),
 }));
 
-import { useMixerStore } from "./mixer-store";
+import { useMixerStore, __resetWriteGenerationsForTests } from "./mixer-store";
 import type { AppSession } from "@/lib/tauri";
 
 const session = (overrides: Partial<AppSession> = {}): AppSession => ({
@@ -52,17 +52,19 @@ const session = (overrides: Partial<AppSession> = {}): AppSession => ({
   isActive: true,
   isDuckTrigger: false,
   isDucked: false,
+  writeGeneration: 0,
   ...overrides,
 });
 
 describe("mixer-store", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    __resetWriteGenerationsForTests();
     capturedCallback.current = null;
     listSessions.mockResolvedValue([]);
-    setVolume.mockResolvedValue(undefined);
-    setMuted.mockResolvedValue(undefined);
-    setBalance.mockResolvedValue(undefined);
+    setVolume.mockResolvedValue(1);
+    setMuted.mockResolvedValue(1);
+    setBalance.mockResolvedValue(1);
     maxVolumePercent.mockResolvedValue(100);
     useMixerStore.setState({
       sessions: [],
@@ -281,6 +283,34 @@ describe("mixer-store", () => {
     expect(setVolume).toHaveBeenCalledWith("session-1", 0.9);
   });
 
+  it("setVolume() preserves an already-ducked session's duck ratio instead of showing full volume", () => {
+    // Regression test: an outright `effectiveVolume: volume` assumed the session wasn't
+    // currently ducked, so a volume change on an actively-ducked session briefly showed the
+    // *full* volume before the next backend push corrected it back down -- a real, visible
+    // ease-down flicker, not the harmless blip it was assumed to be.
+    useMixerStore.setState({
+      sessions: [
+        session({ volume: 0.8, effectiveVolume: 0.24, isDucked: true }), // 30% duck ratio
+      ],
+    });
+
+    useMixerStore.getState().setVolume("session-1", 0.4);
+
+    const { sessions } = useMixerStore.getState();
+    expect(sessions[0].volume).toBe(0.4);
+    expect(sessions[0].effectiveVolume).toBeCloseTo(0.12, 5); // same 30% ratio, not 0.4
+  });
+
+  it("setVolume() shows full volume for a non-ducked session, as before", () => {
+    useMixerStore.setState({
+      sessions: [session({ volume: 0.2, effectiveVolume: 0.2, isDucked: false })],
+    });
+
+    useMixerStore.getState().setVolume("session-1", 0.9);
+
+    expect(useMixerStore.getState().sessions[0].effectiveVolume).toBe(0.9);
+  });
+
   it("setVolume() only updates the matching session", () => {
     useMixerStore.setState({
       sessions: [session({ id: "a", volume: 0.1 }), session({ id: "b", volume: 0.1 })],
@@ -291,6 +321,78 @@ describe("mixer-store", () => {
     const { sessions } = useMixerStore.getState();
     expect(sessions.find((s) => s.id === "a")!.volume).toBe(0.7);
     expect(sessions.find((s) => s.id === "b")!.volume).toBe(0.1);
+  });
+
+  it("setVolume() freezes the session against a stale backend echo for a moment", async () => {
+    // Regression test: a plain click (no real drag, so `useDraggingSessionFreeze` never runs)
+    // used to have zero protection against the backend's independently-scheduled poll loop
+    // echoing back a pre-write snapshot and briefly overwriting the just-set optimistic value --
+    // visibly, the slider snapping back toward the old value before correcting again.
+    vi.useFakeTimers();
+    await useMixerStore.getState().init();
+    useMixerStore.setState({ sessions: [session({ volume: 0.2 })] });
+
+    useMixerStore.getState().setVolume("session-1", 0.9);
+    expect(useMixerStore.getState().draggingSessionId).toBe("session-1");
+
+    // A stale push racing the write -- buffered, not applied, while frozen.
+    capturedCallback.current!([session({ volume: 0.2 })]);
+    expect(useMixerStore.getState().sessions[0].volume).toBe(0.9);
+
+    // A later, correct push arrives and gets buffered too.
+    capturedCallback.current!([session({ volume: 0.9 })]);
+
+    vi.advanceTimersByTime(400);
+    expect(useMixerStore.getState().draggingSessionId).toBeNull();
+    expect(useMixerStore.getState().sessions[0].volume).toBe(0.9);
+    vi.useRealTimers();
+  });
+
+  it("a stale gesture's release doesn't cut short a newer gesture's freeze on the same session", async () => {
+    // Regression test: `setVolume` (a plain click) and the drag-freeze hook both arm the same
+    // `draggingSessionId` field for the same session across a rapid sequence of separate
+    // gestures. A session-id-only guard can't tell "my own release" from "some other, earlier
+    // gesture's release firing late" -- confirmed live as the actual root cause of the reported
+    // flicker (a freeze cut short after ~24ms instead of 400ms). `draggingGeneration` is the
+    // fix: only the release that captured the *current* generation may actually clear it.
+    await useMixerStore.getState().init();
+    useMixerStore.setState({ sessions: [session({ volume: 0.2 })] });
+
+    useMixerStore.getState().setVolume("session-1", 0.5);
+    const staleGeneration = useMixerStore.getState().draggingGeneration;
+
+    // A second, later gesture on the *same* session re-arms the freeze before the first
+    // gesture's own release ever fires.
+    useMixerStore.getState().setVolume("session-1", 0.9);
+    expect(useMixerStore.getState().draggingGeneration).not.toBe(staleGeneration);
+
+    // The first gesture's now-stale release call must not touch the second gesture's freeze.
+    useMixerStore.getState().endFreezeIfCurrent("session-1", staleGeneration);
+    expect(useMixerStore.getState().draggingSessionId).toBe("session-1");
+
+    // The second gesture's own (current) release call does clear it.
+    useMixerStore
+      .getState()
+      .endFreezeIfCurrent("session-1", useMixerStore.getState().draggingGeneration);
+    expect(useMixerStore.getState().draggingSessionId).toBeNull();
+  });
+
+  it("setVolume() doesn't steal the freeze from a different session that's actively being dragged", async () => {
+    vi.useFakeTimers();
+    await useMixerStore.getState().init();
+    useMixerStore.setState({
+      sessions: [session({ id: "session-1", volume: 0.5 }), session({ id: "session-2", volume: 0.2 })],
+      draggingSessionId: "session-1",
+    });
+
+    useMixerStore.getState().setVolume("session-2", 0.9);
+
+    expect(useMixerStore.getState().draggingSessionId).toBe("session-1");
+    vi.advanceTimersByTime(400);
+    // Still frozen for session-1 -- setVolume's own timeout for session-2 must not have fired
+    // and cleared it, since it never actually acquired the freeze in the first place.
+    expect(useMixerStore.getState().draggingSessionId).toBe("session-1");
+    vi.useRealTimers();
   });
 
   it("setMuted() optimistically updates local state immediately", () => {

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { AppSession } from "@/lib/tauri";
 
 export interface FadingSession extends AppSession {
@@ -56,7 +56,16 @@ export function useSessionListWithFadeOut(
   const lastActiveAtRef = useRef(new Map<string, number>());
   const deactivationTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
 
-  useEffect(() => {
+  // `useLayoutEffect`, not `useEffect` -- `rendered` (this hook's own state, derived from
+  // `sessions`) is what every `SessionRow` actually receives, not `sessions` itself. A plain
+  // `useEffect` here means: `sessions` (the store) updates, this component re-renders using
+  // whatever `rendered` was *before* that update (this effect hasn't run yet), and the browser
+  // paints that stale render -- only *then* does this effect run and call `setRendered` with
+  // fresh data, one render later. That's the exact same "state derived via a plain effect gets
+  // painted stale for one real frame" bug `useSmoothedNumber` had (see that hook's own doc
+  // comment for the full mechanism and how it was confirmed) -- same anti-pattern, different
+  // hook. `useLayoutEffect` resolves the correction before the browser paints anything.
+  useLayoutEffect(() => {
     const now = Date.now();
     const seenIds = new Set(sessions.map((session) => session.id));
 

@@ -50,12 +50,6 @@ fn list_sessions(state: State<MixerState>) -> Result<Vec<AppSession>, String> {
     state.backend.list_sessions().map_err(mixer_error_to_string)
 }
 
-// TEMPORARY DIAGNOSTIC -- isolation test, see conversation. Touches nothing: no lock, no
-// backend, no state at all. If calling *this* at native drag-event rate still glitches, the
-// cost is in the WKWebView<->Rust IPC bridge itself, not anything our command handlers do.
-#[tauri::command]
-fn noop_diag() {}
-
 /// `async fn` + `spawn_blocking`, not a plain synchronous command: the actual work
 /// (`Mutex::lock()` plus, occasionally, real Core Audio HAL calls if a tap engine rebuild is
 /// in flight) is genuinely blocking, and a plain `fn` command hands that blocking work straight
@@ -64,12 +58,16 @@ fn noop_diag() {}
 /// loop for the same lock -- and moving it onto a dedicated blocking-pool thread via
 /// `spawn_blocking` means that stall, whenever it happens, never has a chance to hold up
 /// anything the UI's own responsiveness depends on.
+// Return the session's new `write_generation` (see `AppSession::write_generation`'s doc comment)
+// rather than `()` -- the frontend records it the instant this call resolves, letting it
+// recognize (and discard) any later `sessions-changed` push whose data predates this write, no
+// matter how delayed that push's own `emit()` call turns out to be.
 #[tauri::command]
 async fn set_volume(
     state: State<'_, MixerState>,
     session_id: String,
     volume: f32,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let backend = Arc::clone(&state.backend);
     tokio::task::spawn_blocking(move || {
         backend
@@ -85,7 +83,7 @@ async fn set_muted(
     state: State<'_, MixerState>,
     session_id: String,
     muted: bool,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let backend = Arc::clone(&state.backend);
     tokio::task::spawn_blocking(move || {
         backend
@@ -101,7 +99,7 @@ async fn set_balance(
     state: State<'_, MixerState>,
     session_id: String,
     balance: f32,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let backend = Arc::clone(&state.backend);
     tokio::task::spawn_blocking(move || {
         backend
@@ -287,6 +285,10 @@ struct PushedSession<'a> {
     is_active: bool,
     is_duck_trigger: bool,
     is_ducked: bool,
+    /// Always included (unlike `icon_png`) -- the frontend needs it on every single push to
+    /// compare against its own last-known write for this session. See
+    /// `AppSession::write_generation`'s doc comment.
+    write_generation: u64,
 }
 
 /// Builds the `sessions-changed` payload for `sessions`, dropping every icon that's byte-identical
@@ -320,6 +322,7 @@ fn pushed_sessions<'a>(
                 is_active: session.is_active,
                 is_duck_trigger: session.is_duck_trigger,
                 is_ducked: session.is_ducked,
+                write_generation: session.write_generation,
             }
         })
         .collect()
@@ -329,10 +332,6 @@ fn spawn_session_poll_loop(app_handle: AppHandle, backend: Arc<dyn AudioMixerBac
     tauri::async_runtime::spawn(async move {
         let mut last: Option<Vec<AppSession>> = None;
         let mut fast_poll_until: Option<Instant> = None;
-        // TEMPORARY DIAGNOSTIC -- remove after the mid-drag glitch investigation.
-        let mut tick_count: u32 = 0;
-        let mut fast_tick_count: u32 = 0;
-        let mut diag_window_start = Instant::now();
         loop {
             let now = Instant::now();
             let is_fast = fast_poll_until.is_some_and(|until| now < until);
@@ -342,21 +341,7 @@ fn spawn_session_poll_loop(app_handle: AppHandle, backend: Arc<dyn AudioMixerBac
                 POLL_INTERVAL
             };
             tokio::time::sleep(interval).await;
-            let list_start = std::time::Instant::now();
             let result = backend.list_sessions();
-            let list_elapsed = list_start.elapsed();
-            tick_count += 1;
-            if is_fast {
-                fast_tick_count += 1;
-            }
-            if diag_window_start.elapsed() > Duration::from_secs(1) {
-                eprintln!(
-                    "[poll-rate-diag] ticks_last_window={tick_count} fast_ticks={fast_tick_count} last_list_sessions={list_elapsed:?}"
-                );
-                tick_count = 0;
-                fast_tick_count = 0;
-                diag_window_start = Instant::now();
-            }
             match result {
                 Ok(sessions) => {
                     let duck_flags_changed =
@@ -774,8 +759,7 @@ pub fn run() {
             ducking_supported,
             set_ducking_enabled,
             set_duck_trigger_priority,
-            max_volume_percent,
-            noop_diag
+            max_volume_percent
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -797,6 +781,7 @@ mod tests {
             is_active: true,
             is_duck_trigger: false,
             is_ducked: false,
+            write_generation: 0,
         }
     }
 

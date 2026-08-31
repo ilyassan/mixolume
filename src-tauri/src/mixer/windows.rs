@@ -63,6 +63,9 @@ struct Inner {
     /// ~150ms poll regardless of whether anything changed (which would mean constantly writing a
     /// volume even for sessions nothing is currently ducking).
     applied_ducked: HashMap<String, bool>,
+    /// Per-session `write_generation` (see `AppSession::write_generation`'s doc comment), bumped
+    /// by every `set_volume`/`set_muted`/`set_balance` call.
+    write_generations: HashMap<String, u64>,
 }
 
 /// Windows backend: per-app volume via WASAPI audio sessions, auto-duck via WASAPI process
@@ -81,6 +84,7 @@ impl WindowsMixerBackend {
                 captures: HashMap::new(),
                 target_volume: HashMap::new(),
                 applied_ducked: HashMap::new(),
+                write_generations: HashMap::new(),
             }),
         }
     }
@@ -90,6 +94,17 @@ impl Default for WindowsMixerBackend {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Bumps and returns the new `write_generation` for `session_id` -- called by every setter,
+/// under whatever lock on `Inner` that setter already holds.
+fn bump_generation(inner: &mut Inner, session_id: &str) -> u64 {
+    let entry = inner
+        .write_generations
+        .entry(session_id.to_string())
+        .or_insert(0);
+    *entry += 1;
+    *entry
 }
 
 /// Recognized by exact display-name match against apps MiXolume has already seen producing
@@ -440,6 +455,7 @@ impl AudioMixerBackend for WindowsMixerBackend {
                 inner.applied_ducked.insert(r.id.clone(), is_ducked);
             }
 
+            let write_generation = inner.write_generations.get(&r.id).copied().unwrap_or(0);
             sessions.push(AppSession {
                 id: r.id,
                 display_name: r.display_name,
@@ -451,6 +467,7 @@ impl AudioMixerBackend for WindowsMixerBackend {
                 is_active: r.is_active,
                 is_duck_trigger,
                 is_ducked,
+                write_generation,
             });
         }
 
@@ -480,7 +497,7 @@ impl AudioMixerBackend for WindowsMixerBackend {
         Ok(sessions)
     }
 
-    fn set_volume(&self, session_id: &str, volume: f32) -> Result<(), MixerError> {
+    fn set_volume(&self, session_id: &str, volume: f32) -> Result<u64, MixerError> {
         let volume = clamp_volume(volume);
         // Held for this whole call, including the WASAPI write below -- not just the
         // target-volume bookkeeping. Releasing it early (an earlier version of this did) leaves
@@ -512,11 +529,12 @@ impl AudioMixerBackend for WindowsMixerBackend {
                 .map_err(|e| MixerError::Platform(e.to_string()))?;
             simple_volume
                 .SetMasterVolume(to_apply, std::ptr::null())
-                .map_err(|e| MixerError::Platform(e.to_string()))
+                .map_err(|e| MixerError::Platform(e.to_string()))?;
         }
+        Ok(bump_generation(&mut inner, session_id))
     }
 
-    fn set_muted(&self, session_id: &str, muted: bool) -> Result<(), MixerError> {
+    fn set_muted(&self, session_id: &str, muted: bool) -> Result<u64, MixerError> {
         let control = find_session_control(session_id)?;
         unsafe {
             let simple_volume: ISimpleAudioVolume = control
@@ -524,8 +542,10 @@ impl AudioMixerBackend for WindowsMixerBackend {
                 .map_err(|e| MixerError::Platform(e.to_string()))?;
             simple_volume
                 .SetMute(BOOL::from(muted), std::ptr::null())
-                .map_err(|e| MixerError::Platform(e.to_string()))
+                .map_err(|e| MixerError::Platform(e.to_string()))?;
         }
+        let mut inner = self.inner.lock().unwrap();
+        Ok(bump_generation(&mut inner, session_id))
     }
 
     /// -1.0 (full left) to 1.0 (full right), applied via `IChannelAudioVolume` -- a separate
@@ -535,7 +555,7 @@ impl AudioMixerBackend for WindowsMixerBackend {
     /// Only meaningful for 2-channel (stereo) sessions -- a no-op (not an error) for anything
     /// else, since "left/right balance" doesn't have a sensible meaning for mono or
     /// surround-channel-count sessions.
-    fn set_balance(&self, session_id: &str, balance: f32) -> Result<(), MixerError> {
+    fn set_balance(&self, session_id: &str, balance: f32) -> Result<u64, MixerError> {
         let control = find_session_control(session_id)?;
         unsafe {
             let simple_volume: ISimpleAudioVolume = control
@@ -547,7 +567,8 @@ impl AudioMixerBackend for WindowsMixerBackend {
                 .cast()
                 .map_err(|e| MixerError::Platform(e.to_string()))?;
             if channel_volume.GetChannelCount().unwrap_or(0) != 2 {
-                return Ok(());
+                let mut inner = self.inner.lock().unwrap();
+                return Ok(bump_generation(&mut inner, session_id));
             }
             let balance = balance.clamp(-1.0, 1.0);
             let left = volume * (1.0 - balance.max(0.0));
@@ -557,8 +578,10 @@ impl AudioMixerBackend for WindowsMixerBackend {
                 .map_err(|e| MixerError::Platform(e.to_string()))?;
             channel_volume
                 .SetChannelVolume(1, right, std::ptr::null())
-                .map_err(|e| MixerError::Platform(e.to_string()))
+                .map_err(|e| MixerError::Platform(e.to_string()))?;
         }
+        let mut inner = self.inner.lock().unwrap();
+        Ok(bump_generation(&mut inner, session_id))
     }
 
     /// `app.exit()` calls `std::process::exit()` directly and does not run `Drop` for arbitrary

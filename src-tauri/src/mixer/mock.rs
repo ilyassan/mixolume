@@ -23,34 +23,37 @@ impl AudioMixerBackend for MockMixerBackend {
         Ok(self.sessions.lock().unwrap().clone())
     }
 
-    fn set_volume(&self, session_id: &str, volume: f32) -> Result<(), MixerError> {
+    fn set_volume(&self, session_id: &str, volume: f32) -> Result<u64, MixerError> {
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions
             .iter_mut()
             .find(|s| s.id == session_id)
             .ok_or_else(|| MixerError::SessionNotFound(session_id.to_string()))?;
         session.volume = clamp_volume(volume);
-        Ok(())
+        session.write_generation += 1;
+        Ok(session.write_generation)
     }
 
-    fn set_muted(&self, session_id: &str, muted: bool) -> Result<(), MixerError> {
+    fn set_muted(&self, session_id: &str, muted: bool) -> Result<u64, MixerError> {
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions
             .iter_mut()
             .find(|s| s.id == session_id)
             .ok_or_else(|| MixerError::SessionNotFound(session_id.to_string()))?;
         session.muted = muted;
-        Ok(())
+        session.write_generation += 1;
+        Ok(session.write_generation)
     }
 
-    fn set_balance(&self, session_id: &str, balance: f32) -> Result<(), MixerError> {
+    fn set_balance(&self, session_id: &str, balance: f32) -> Result<u64, MixerError> {
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions
             .iter_mut()
             .find(|s| s.id == session_id)
             .ok_or_else(|| MixerError::SessionNotFound(session_id.to_string()))?;
         session.balance = balance.clamp(-1.0, 1.0);
-        Ok(())
+        session.write_generation += 1;
+        Ok(session.write_generation)
     }
 }
 
@@ -70,6 +73,7 @@ mod tests {
             is_active: true,
             is_duck_trigger: false,
             is_ducked: false,
+            write_generation: 0,
         }
     }
 

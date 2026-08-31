@@ -58,6 +58,21 @@ pub struct AppSession {
     /// Auto-duck is currently lowering this app's volume because some *other* app is triggering
     /// it -- same platform support as `is_duck_trigger`.
     pub is_ducked: bool,
+    /// Monotonically increasing per-session counter, bumped by the backend every time
+    /// `set_volume`/`set_muted`/`set_balance` is called for this session -- lets the frontend
+    /// tell a genuinely fresh read apart from one that was captured *before* its own most recent
+    /// write landed, no matter how long that read's own push happens to take to actually arrive.
+    ///
+    /// Exists because the poll loop's `app_handle.emit()` call was confirmed live to
+    /// occasionally block for 100ms+ (contending with the WebView's main thread during an active
+    /// drag, which is itself busy dispatching that same drag's own IPC calls) -- long enough to
+    /// blow through the frontend's fixed-duration stale-echo protection window on its own. A
+    /// push whose data was read *before* a write the frontend already knows landed can still
+    /// arrive *after* that window closes if delayed like this, applying stale data with nothing
+    /// left to catch it. Comparing generations instead of racing a clock closes this
+    /// deterministically: the frontend only ever accepts a push at least as new as what it's
+    /// already written, regardless of how long the round trip took.
+    pub write_generation: u64,
 }
 
 /// Cross-app auto-duck settings: whether the feature runs at all, and which apps (by display
@@ -157,10 +172,13 @@ pub fn toggle_priority_trigger(
 pub trait AudioMixerBackend: Send + Sync {
     /// Every app currently known to be producing (or recently produced) sound.
     fn list_sessions(&self) -> Result<Vec<AppSession>, MixerError>;
-    fn set_volume(&self, session_id: &str, volume: f32) -> Result<(), MixerError>;
-    fn set_muted(&self, session_id: &str, muted: bool) -> Result<(), MixerError>;
+    /// Returns the session's new `write_generation` (see [`AppSession::write_generation`]) on
+    /// success, so the frontend can record exactly which write it just made without waiting for
+    /// a subsequent `list_sessions` push to tell it.
+    fn set_volume(&self, session_id: &str, volume: f32) -> Result<u64, MixerError>;
+    fn set_muted(&self, session_id: &str, muted: bool) -> Result<u64, MixerError>;
     /// -1.0 (full left) to 1.0 (full right), 0.0 centered.
-    fn set_balance(&self, session_id: &str, balance: f32) -> Result<(), MixerError>;
+    fn set_balance(&self, session_id: &str, balance: f32) -> Result<u64, MixerError>;
 
     /// Release any OS-level audio resources this backend is holding, synchronously, before the
     /// app process exits. Only macOS needs this: its backend reroutes audio through process

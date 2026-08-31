@@ -16,6 +16,7 @@ const makeSession = (overrides: Partial<AppSession> = {}): AppSession => ({
   isActive: true,
   isDuckTrigger: false,
   isDucked: false,
+  writeGeneration: 0,
   ...overrides,
 });
 

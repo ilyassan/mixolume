@@ -218,6 +218,7 @@ export const SessionRow = memo(function SessionRow({
           muted={muted}
           onVolumeChange={onVolumeChange}
           onUnmute={() => onMuteToggle(id, false)}
+          onMute={() => onMuteToggle(id, true)}
         />
       </div>
 

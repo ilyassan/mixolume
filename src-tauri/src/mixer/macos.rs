@@ -230,6 +230,10 @@ struct AppGainState {
     /// the realtime mixer -- balance only needed a per-channel gain instead of one scalar, not a
     /// pipeline redesign.
     balance: f32,
+    /// See [`crate::mixer::AppSession::write_generation`]. Bumped by every setter below,
+    /// regardless of which field changed -- any write from the frontend invalidates a stale read
+    /// of this session's data, not just the one field it touched.
+    generation: u64,
 }
 
 impl AppGainState {
@@ -239,24 +243,35 @@ impl AppGainState {
             volume: 1.0,
             muted: false,
             balance: 0.0,
+            generation: 0,
         }
     }
 
-    fn set_volume(&mut self, volume: f32) {
+    /// Bumped by every setter below and returned to the caller, which passes it straight back to
+    /// the frontend -- see [`crate::mixer::AppSession::write_generation`].
+    fn bump_generation(&mut self) -> u64 {
+        self.generation += 1;
+        self.generation
+    }
+
+    fn set_volume(&mut self, volume: f32) -> u64 {
         // Boosted, not `clamp_volume` -- macOS has no native "per-app volume" API to begin with
         // (every app's volume here is already just a software gain multiply on captured samples,
         // see `mix_capture_callback`'s doc comment), and that mix's final output is already
         // hard-clamped to `[-1.0, 1.0]` before being written out, so allowing gain above 1.0 here
         // needs no new clipping protection -- it reuses what's already there.
         self.volume = clamp_boosted_volume(volume);
+        self.bump_generation()
     }
 
-    fn set_muted(&mut self, muted: bool) {
+    fn set_muted(&mut self, muted: bool) -> u64 {
         self.muted = muted;
+        self.bump_generation()
     }
 
-    fn set_balance(&mut self, balance: f32) {
+    fn set_balance(&mut self, balance: f32) -> u64 {
         self.balance = balance.clamp(-1.0, 1.0);
+        self.bump_generation()
     }
 
     /// What the realtime callback should actually multiply the left/right channels by. Linear
@@ -1867,6 +1882,24 @@ struct Inner {
     /// *another* concurrent rebuild, compounding into exactly a full freeze. Confirmed live: the
     /// very regression this field fixes.
     pending_rebuild_target: Option<std::collections::HashSet<String>>,
+    /// Per-session id, whether that session was baked in as duck-trigger-*excluded* (i.e. not a
+    /// priority app) in the currently-installed `engine` -- set alongside `engine` itself, right
+    /// after a successful rebuild. `reconcile_engine` compares a freshly recomputed version of
+    /// this against it on every poll tick so a rebuild can be forced purely because *this*
+    /// changed, even when the tapped session set itself didn't.
+    ///
+    /// Exists because per-app exclusion is only ever decided from whatever `app_info_cache`
+    /// already has at rebuild time, and a priority-trigger app's very *first* appearance always
+    /// computes as excluded there -- its name can't possibly be resolved yet, since
+    /// `list_sessions` only warms that cache in its own loop, which runs *after*
+    /// `reconcile_engine` returns. Without this, nothing ever revisits that decision once the
+    /// name resolves a moment later unless some *unrelated* change to the tapped set happens to
+    /// trigger another rebuild anyway -- confirmed live as the actual cause of a real, reported
+    /// bug: auto-duck not triggering the first time a priority app played audio after Mixolume
+    /// started, only after the user repeated the action (silence, then audio again) a few times,
+    /// each attempt's silence/audio transition being its own chance for an unrelated rebuild to
+    /// stumble into correcting it.
+    installed_duck_excluded: HashMap<String, bool>,
 }
 
 /// macOS backend: per-app volume via Core Audio process taps + a private aggregate device +
@@ -1895,6 +1928,7 @@ impl MacosMixerBackend {
                 ducking_state: HashMap::new(),
                 rebuild_generation: 0,
                 pending_rebuild_target: None,
+                installed_duck_excluded: HashMap::new(),
             })),
         }
     }
@@ -1933,10 +1967,44 @@ impl MacosMixerBackend {
         let wanted: std::collections::HashSet<String> =
             active.iter().map(|p| session_id_for_pid(p.pid)).collect();
 
-        let unchanged = currently_tapped.len() == wanted.len()
+        // Computed here -- before the tap-set-unchanged check below, not just further down where
+        // it's needed for the actual rebuild -- specifically so a rebuild can be forced purely
+        // because *this* changed, even when `wanted` itself didn't. See `excluded` and
+        // `Inner::installed_duck_excluded`'s doc comments for why that's a real, confirmed case:
+        // a priority-trigger app's very first appearance is *always* computed as excluded here
+        // (its name can't possibly be in `app_info_cache` yet -- `list_sessions` only warms that
+        // cache in its own loop, which runs *after* this function returns), and per-app exclusion
+        // is otherwise only ever baked in at rebuild time, with no other trigger to reconsider it
+        // once the name resolves a moment later.
+        let excluded_flags: Vec<bool> = active
+            .iter()
+            .map(|p| {
+                let is_priority = matches!(
+                    inner.app_info_cache.get(&p.pid),
+                    Some(AppInfoCacheEntry::Resolved(name, _))
+                        if inner.ducking_settings.priority_triggers.iter().any(|e| e == name)
+                );
+                !is_priority
+            })
+            .collect();
+        let fresh_duck_excluded: HashMap<String, bool> = active
+            .iter()
+            .map(|p| session_id_for_pid(p.pid))
+            .zip(excluded_flags.iter().copied())
+            .collect();
+
+        let tap_set_unchanged = currently_tapped.len() == wanted.len()
             && wanted
                 .iter()
                 .all(|id| currently_tapped.contains(id.as_str()));
+        // Even when the tapped set itself hasn't changed, a session whose exclusion flag would
+        // now compute differently than what's actually installed still needs a rebuild to pick
+        // that up -- see this function's earlier comment on `excluded_flags` for the confirmed
+        // "ducking doesn't trigger the first time" bug this closes.
+        let exclusion_unchanged = wanted
+            .iter()
+            .all(|id| inner.installed_duck_excluded.get(id) == fresh_duck_excluded.get(id));
+        let unchanged = tap_set_unchanged && exclusion_unchanged;
         // At most one rebuild runs at a time, whatever set it's targeting -- see
         // `Inner::pending_rebuild_target`'s doc comment for why the in-flight window otherwise
         // reads as "0 tapped" to every poll tick that lands in it, and re-triggers yet another
@@ -1968,6 +2036,7 @@ impl MacosMixerBackend {
 
         if active.is_empty() {
             drop(old_engine);
+            inner.installed_duck_excluded.clear();
             return Ok(());
         }
 
@@ -1987,24 +2056,8 @@ impl MacosMixerBackend {
             })
             .collect();
 
-        // Best-effort only: reads whatever `app_info_cache` already has, never resolves a fresh
-        // name here. Defaults to excluded (not a priority app) when the name isn't cached yet --
-        // matches the opt-in model's own default (nothing triggers until explicitly added), and
-        // self-corrects on the next rebuild once `list_sessions`'s own loop warms the cache right
-        // after this returns. Avoids duplicating `resolve_app_info`'s NSRunningApplication/icon
-        // work (already a proven leak risk if called somewhere not covered by the cache, see
-        // `app_info_cache`'s doc comment).
-        let excluded_flags: Vec<bool> = active
-            .iter()
-            .map(|p| {
-                let is_priority = matches!(
-                    inner.app_info_cache.get(&p.pid),
-                    Some(AppInfoCacheEntry::Resolved(name, _))
-                        if inner.ducking_settings.priority_triggers.iter().any(|e| e == name)
-                );
-                !is_priority
-            })
-            .collect();
+        // `excluded_flags`/`fresh_duck_excluded` were already computed above, before the
+        // tap-set-unchanged check -- reused here as-is for the actual rebuild.
         let persisted_ducking_states: Vec<macos_ducking::PersistedDuckState> = active
             .iter()
             .map(|p| {
@@ -2081,6 +2134,7 @@ impl MacosMixerBackend {
                         }
                     }
                     inner.engine = Some(engine);
+                    inner.installed_duck_excluded = fresh_duck_excluded;
                 }
                 Err(err) => {
                     log::warn!("failed to rebuild tap engine: {err}");
@@ -2142,11 +2196,20 @@ impl AudioMixerBackend for MacosMixerBackend {
         // before ever applying a duck), so an un-gated read here could keep reporting a stale
         // "still ducking" to the UI for a session or two after the user turns it off.
         let duck_states = if inner.ducking_settings.enabled {
-            inner
-                .engine
-                .as_ref()
-                .map(|e| e.snapshot_ducking_state())
-                .unwrap_or_default()
+            match inner.engine.as_ref() {
+                Some(engine) => engine.snapshot_ducking_state(),
+                // `engine` is `None` for the whole time a rebuild is in flight, which is several
+                // poll ticks. Reporting "nothing is ducking" across that window flips every
+                // session's duck flags off and then back on again -- two changes the poll loop
+                // reads as real duck transitions, each arming its 30ms fast-poll window (see
+                // `DUCK_TRANSITION_WINDOW` in lib.rs) for 600ms over a rebuild that changed
+                // nothing about who's talking. `ducking_state` is the hysteresis snapshot
+                // `reconcile_engine` took off the outgoing engine, so it's the right answer for
+                // exactly this window -- and only this one: with no rebuild running, a missing
+                // engine genuinely means nothing is being tapped, let alone ducked.
+                None if inner.pending_rebuild_target.is_some() => inner.ducking_state.clone(),
+                None => HashMap::new(),
+            }
         } else {
             HashMap::new()
         };
@@ -2165,10 +2228,10 @@ impl AudioMixerBackend for MacosMixerBackend {
             // Copy out before touching `app_info_cache` below -- `state` borrows
             // `inner.gain_state` immutably, and the cache lookup needs `inner` mutably; ending
             // the borrow here (both fields are `Copy`) avoids the conflict.
-            let Some((volume, muted, balance)) = inner
+            let Some((volume, muted, balance, generation)) = inner
                 .gain_state
                 .get(&id)
-                .map(|s| (s.volume, s.muted, s.balance))
+                .map(|s| (s.volume, s.muted, s.balance, s.generation))
             else {
                 // Never seen producing output -- not a "known" session yet, matching the
                 // task's "lazily tap any newly-seen process" contract (nothing to report until
@@ -2229,6 +2292,7 @@ impl AudioMixerBackend for MacosMixerBackend {
                 is_active: p.is_running_output,
                 is_duck_trigger,
                 is_ducked,
+                write_generation: generation,
             });
         }
         // Drop cache entries for pids that no longer exist -- keeps this bounded over a long
@@ -2284,70 +2348,46 @@ impl AudioMixerBackend for MacosMixerBackend {
         150
     }
 
-    fn set_volume(&self, session_id: &str, volume: f32) -> Result<(), MixerError> {
-        // TEMPORARY DIAGNOSTIC -- remove after the mid-drag glitch investigation.
-        let t0 = std::time::Instant::now();
+    fn set_volume(&self, session_id: &str, volume: f32) -> Result<u64, MixerError> {
         let mut inner = self.inner.lock().unwrap();
-        let lock_wait = t0.elapsed();
         let state = inner
             .gain_state
             .get_mut(session_id)
             .ok_or_else(|| MixerError::SessionNotFound(session_id.to_string()))?;
-        state.set_volume(volume);
+        let generation = state.set_volume(volume);
         let effective = state.effective_gains();
-        let t1 = std::time::Instant::now();
         if let Some(engine) = &inner.engine {
             engine.set_gain(session_id, effective);
         }
-        let set_gain_elapsed = t1.elapsed();
-        if lock_wait > std::time::Duration::from_millis(3)
-            || set_gain_elapsed > std::time::Duration::from_millis(3)
-        {
-            eprintln!(
-                "[macos-set_volume-diag] lock_wait={lock_wait:?} set_gain={set_gain_elapsed:?}"
-            );
-        }
-        Ok(())
+        Ok(generation)
     }
 
-    fn set_muted(&self, session_id: &str, muted: bool) -> Result<(), MixerError> {
+    fn set_muted(&self, session_id: &str, muted: bool) -> Result<u64, MixerError> {
         let mut inner = self.inner.lock().unwrap();
         let state = inner
             .gain_state
             .get_mut(session_id)
             .ok_or_else(|| MixerError::SessionNotFound(session_id.to_string()))?;
-        state.set_muted(muted);
+        let generation = state.set_muted(muted);
         let effective = state.effective_gains();
         if let Some(engine) = &inner.engine {
             engine.set_gain(session_id, effective);
         }
-        Ok(())
+        Ok(generation)
     }
 
-    fn set_balance(&self, session_id: &str, balance: f32) -> Result<(), MixerError> {
-        // TEMPORARY DIAGNOSTIC -- remove after the mid-drag glitch investigation.
-        let t0 = std::time::Instant::now();
+    fn set_balance(&self, session_id: &str, balance: f32) -> Result<u64, MixerError> {
         let mut inner = self.inner.lock().unwrap();
-        let lock_wait = t0.elapsed();
         let state = inner
             .gain_state
             .get_mut(session_id)
             .ok_or_else(|| MixerError::SessionNotFound(session_id.to_string()))?;
-        state.set_balance(balance);
+        let generation = state.set_balance(balance);
         let effective = state.effective_gains();
-        let t1 = std::time::Instant::now();
         if let Some(engine) = &inner.engine {
             engine.set_gain(session_id, effective);
         }
-        let set_gain_elapsed = t1.elapsed();
-        if lock_wait > std::time::Duration::from_millis(3)
-            || set_gain_elapsed > std::time::Duration::from_millis(3)
-        {
-            eprintln!(
-                "[macos-set_balance-diag] lock_wait={lock_wait:?} set_gain={set_gain_elapsed:?}"
-            );
-        }
-        Ok(())
+        Ok(generation)
     }
 
     /// Called from the "Quit" menu handler before `app.exit()`. `app.exit()` calls

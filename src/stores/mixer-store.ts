@@ -59,10 +59,39 @@ function sessionsEqual(a: AppSession, b: AppSession): boolean {
 }
 
 /**
+ * Per-session id, the `writeGeneration` (see `AppSession.writeGeneration`'s doc comment) of the
+ * most recent `setVolume`/`setMuted`/`setBalance` this frontend has confirmed writing --
+ * recorded the instant each of those commands *resolves*, in `setVolume`/`setMuted`/`setBalance`
+ * below. `mergeSessions` uses this to reject an incoming push whose own generation is older,
+ * i.e. one whose data was read by the backend *before* this write landed there.
+ *
+ * This exists because `draggingSessionId`'s fixed 400ms freeze window, while still a real and
+ * useful defense, was confirmed live to not always be enough on its own: the backend's poll loop
+ * `emit()`s a push through a JS-eval round trip into the WebView, and that call was measured to
+ * occasionally block 100ms+ -- long enough, combined with however early the underlying read
+ * happened relative to the write, that a push can still land *after* the freeze already released
+ * and self-correct, still carrying data from before the write. A generation comparison has no
+ * such timing dependency: it's correct regardless of how long any single push took to arrive.
+ */
+const writeGenerations = new Map<string, number>();
+
+/** Records `generation` for `sessionId` -- but never backwards, in case two of this session's
+ * own commands ever resolved out of order (the backend applies them in the order they're
+ * dispatched, under one lock, but nothing guarantees their IPC responses race back in that same
+ * order). */
+function recordWriteGeneration(sessionId: string, generation: number): void {
+  const known = writeGenerations.get(sessionId);
+  if (known === undefined || generation > known) {
+    writeGenerations.set(sessionId, generation);
+  }
+}
+
+/**
  * Reconciles a freshly-pushed session list against what the store already has, preserving
- * object identity wherever nothing actually changed (see `sessionsEqual`'s doc comment) and
- * keeping the actively-dragged session's own frontend-owned object entirely (see
- * `setDraggingSessionId`'s doc comment).
+ * object identity wherever nothing actually changed (see `sessionsEqual`'s doc comment),
+ * discarding a session whose data predates this frontend's own most recent write for it (see
+ * `writeGenerations`'s doc comment), and keeping the actively-dragged session's own
+ * frontend-owned object entirely (see `setDraggingSessionId`'s doc comment).
  */
 function mergeSessions(
   previousSessions: AppSession[],
@@ -76,6 +105,14 @@ function mergeSessions(
       if (dragged) return dragged;
     }
     const previous = previousById.get(incoming.id);
+    const knownGeneration = writeGenerations.get(incoming.id);
+    if (
+      previous &&
+      knownGeneration !== undefined &&
+      incoming.writeGeneration < knownGeneration
+    ) {
+      return previous;
+    }
     if (previous && sessionsEqual(previous, incoming)) {
       return previous;
     }
@@ -109,6 +146,13 @@ interface MixerState {
    * `setDraggingSessionId`'s comment for why this exists.
    */
   draggingSessionId: string | null;
+  /**
+   * Bumped every time `draggingSessionId` is set to a non-null value -- lets a caller that just
+   * armed the freeze (`setDraggingSessionId`/`protectFromStaleEcho`) later release *only* if
+   * nothing re-armed it in between, via `endFreezeIfCurrent`. See that action's own doc comment
+   * for the real bug this exists to prevent.
+   */
+  draggingGeneration: number;
 
   /** Fetches the initial session list and subscribes to backend push updates. */
   init: () => Promise<void>;
@@ -142,6 +186,59 @@ interface MixerState {
    * didn't -- the gap was this recurring push, not anything in the drag-tick path itself.
    */
   setDraggingSessionId: (sessionId: string | null) => void;
+  /**
+   * Releases the freeze on `sessionId`, but *only* if `generation` (captured right after the
+   * matching `setDraggingSessionId(sessionId)` call that armed it) still matches
+   * `draggingGeneration` -- i.e. only if nothing has re-armed the freeze since.
+   *
+   * Both `useDraggingSessionFreeze`'s own grace-period timer and `protectFromStaleEcho` arm this
+   * same single `draggingSessionId` field, and a rapid sequence of separate gestures on the same
+   * session (a real click-drag pattern, not a hypothetical) can easily have one gesture's grace-
+   * period timer still pending when a *later* gesture re-arms the freeze for the same session id.
+   * A plain `if (draggingSessionId === sessionId)` guard (session id alone) can't tell those two
+   * cases apart -- it was confirmed live, via timing diagnostics, to let a stale timer from an
+   * earlier gesture release a newer gesture's freeze after only ~24ms instead of the intended
+   * 400ms, which is exactly what let a stale backend push apply immediately instead of being
+   * buffered, and is the root cause of the reported flicker. The generation number is the
+   * actual identity a "did anything change since I armed this" check needs.
+   */
+  endFreezeIfCurrent: (sessionId: string, generation: number) => void;
+}
+
+// Same value as `useDraggingSessionFreeze`'s `RELEASE_GRACE_PERIOD_MS` -- see that constant's
+// doc comment for why this specific duration. Not imported from there to avoid a hook-module ->
+// store-module dependency; the two are independent uses of the same "give the backend's poll
+// loop one full cycle" reasoning.
+const STALE_ECHO_PROTECTION_MS = 400;
+
+/**
+ * Freezes `sessionId` against a stale backend echo for a moment after an optimistic write --
+ * used by `setVolume`/`setBalance`/`setMuted` below, not just active pointer drags.
+ *
+ * Those three already had a real gap: the freeze/buffer machinery (`draggingSessionId`,
+ * `pendingSessionsDuringDrag`) only ever engaged for an *actual* drag gesture, via
+ * `useDraggingSessionFreeze`. A plain click (no pointer movement, just click-to-set) or a
+ * keyboard change goes through these actions directly with no such protection at all -- so the
+ * backend's own poll loop, running on its own independent ~150ms schedule, can have a poll
+ * already in flight that read the old value *before* this write lands, and its resulting push
+ * can arrive and overwrite the just-set optimistic value before a later, correct poll corrects
+ * it again. Confirmed live: a plain click from 20% to 80% visibly snapping back to 20% and then
+ * to 80% again, sometimes more than once. Reusing the exact same freeze this hook already relies
+ * on for drags closes this the same way.
+ *
+ * Deliberately does nothing if a *different* session is currently drag-frozen, rather than
+ * stealing that freeze -- `draggingSessionId` is a single field, and an active drag's own
+ * protection matters more than this one's.
+ */
+function protectFromStaleEcho(sessionId: string, get: () => MixerState): void {
+  if (get().draggingSessionId && get().draggingSessionId !== sessionId) {
+    return;
+  }
+  get().setDraggingSessionId(sessionId);
+  const generation = get().draggingGeneration;
+  setTimeout(() => {
+    get().endFreezeIfCurrent(sessionId, generation);
+  }, STALE_ECHO_PROTECTION_MS);
 }
 
 let unlisten: (() => void) | null = null;
@@ -161,6 +258,7 @@ export const useMixerStore = create<MixerState>((set, get) => ({
   needsPermission: false,
   maxVolumePercent: 100,
   draggingSessionId: null,
+  draggingGeneration: 0,
 
   init: async () => {
     if (get().isInitialized) {
@@ -252,20 +350,28 @@ export const useMixerStore = create<MixerState>((set, get) => ({
 
   setVolume: (sessionId, volume) => {
     set((state) => ({
-      sessions: state.sessions.map((session) =>
-        // Optimistically assumes not currently ducked (the common case) so a normal drag feels
-        // immediate -- if the session actually is mid-duck, the next backend push (within
-        // ~700ms) corrects `effectiveVolume` back down. A duck happening to start/end in that
-        // exact window is a rare, self-correcting cosmetic blip, not a real bug.
-        session.id === sessionId
-          ? { ...session, volume, effectiveVolume: volume }
-          : session,
-      ),
+      sessions: state.sessions.map((session) => {
+        if (session.id !== sessionId) return session;
+        // Preserves whatever duck ratio was already in effect, rather than assuming the session
+        // isn't currently ducked -- an outright `effectiveVolume: volume` was wrong for a ducked
+        // session (it visibly showed the *full* volume, then eased back down once the next
+        // backend push corrected it once the freeze below cleared -- itself a real, if smaller,
+        // instance of the flicker this store's freeze/buffer machinery exists to prevent, not
+        // the harmless "rare, self-correcting cosmetic blip" this comment used to claim it was).
+        // `session.volume` can be 0 (muted or genuinely silent) -- the ratio is undefined then,
+        // so fall back to the un-ducked case rather than dividing by zero.
+        const duckRatio =
+          session.isDucked && session.volume > 0 ? session.effectiveVolume / session.volume : 1;
+        return { ...session, volume, effectiveVolume: volume * duckRatio };
+      }),
     }));
+    protectFromStaleEcho(sessionId, get);
 
-    setVolumeCommand(sessionId, volume).catch((error) => {
-      console.error(`Failed to set volume for ${sessionId}:`, error);
-    });
+    setVolumeCommand(sessionId, volume)
+      .then((generation) => recordWriteGeneration(sessionId, generation))
+      .catch((error) => {
+        console.error(`Failed to set volume for ${sessionId}:`, error);
+      });
   },
 
   setMuted: (sessionId, muted) => {
@@ -274,10 +380,13 @@ export const useMixerStore = create<MixerState>((set, get) => ({
         session.id === sessionId ? { ...session, muted } : session,
       ),
     }));
+    protectFromStaleEcho(sessionId, get);
 
-    setMutedCommand(sessionId, muted).catch((error) => {
-      console.error(`Failed to set muted for ${sessionId}:`, error);
-    });
+    setMutedCommand(sessionId, muted)
+      .then((generation) => recordWriteGeneration(sessionId, generation))
+      .catch((error) => {
+        console.error(`Failed to set muted for ${sessionId}:`, error);
+      });
   },
 
   setBalance: (sessionId, balance) => {
@@ -286,15 +395,21 @@ export const useMixerStore = create<MixerState>((set, get) => ({
         session.id === sessionId ? { ...session, balance } : session,
       ),
     }));
+    protectFromStaleEcho(sessionId, get);
 
-    setBalanceCommand(sessionId, balance).catch((error) => {
-      console.error(`Failed to set balance for ${sessionId}:`, error);
-    });
+    setBalanceCommand(sessionId, balance)
+      .then((generation) => recordWriteGeneration(sessionId, generation))
+      .catch((error) => {
+        console.error(`Failed to set balance for ${sessionId}:`, error);
+      });
   },
 
   setDraggingSessionId: (sessionId) => {
     if (sessionId !== null) {
-      set({ draggingSessionId: sessionId });
+      set((state) => ({
+        draggingSessionId: sessionId,
+        draggingGeneration: state.draggingGeneration + 1,
+      }));
       return;
     }
     // Drag (plus its grace period, see `useDraggingSessionFreeze`) has ended -- apply whatever
@@ -313,6 +428,14 @@ export const useMixerStore = create<MixerState>((set, get) => ({
       set({ draggingSessionId: null });
     }
   },
+
+  endFreezeIfCurrent: (sessionId, generation) => {
+    const state = get();
+    if (state.draggingSessionId !== sessionId || state.draggingGeneration !== generation) {
+      return;
+    }
+    get().setDraggingSessionId(null);
+  },
 }));
 
 // Exposed for tests / potential cleanup on hot-reload; not part of the
@@ -320,4 +443,11 @@ export const useMixerStore = create<MixerState>((set, get) => ({
 export const __teardownMixerStoreListener = () => {
   unlisten?.();
   unlisten = null;
+};
+
+// Exposed for tests only, same reasoning as `__teardownMixerStoreListener` -- `writeGenerations`
+// is module-level state outside the Zustand store itself (see its own doc comment), so
+// `useMixerStore.setState(...)` alone can't reset it between test cases.
+export const __resetWriteGenerationsForTests = () => {
+  writeGenerations.clear();
 };

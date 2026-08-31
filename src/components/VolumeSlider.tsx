@@ -1,3 +1,4 @@
+import { useRef } from "react";
 import { Slider } from "@/components/ui/slider";
 import { useLiveDragValue } from "@/hooks/useLiveDragValue";
 import { useThrottledCallback } from "@/hooks/useThrottledCallback";
@@ -33,6 +34,14 @@ interface VolumeSliderProps {
    * (forced to 0 below) is, so clicking the mute button to unmute still restores exactly where it
    * was; dragging instead commits wherever the user actually drags to. */
   onUnmute: () => void;
+  /** Called whenever the slider reaches 0% -- live, the instant a drag tick crosses into it, not
+   * only once the gesture ends -- since 0% is treated as equivalent to muted, both audibly
+   * (already true: `effectiveVolume` is 0 either way) and in every place the UI reflects `muted`
+   * specifically (the mute button's own icon, most visibly). Dragging back up away from 0% within
+   * the same gesture unmutes again immediately too -- see the `mutedDuringDragRef` tracking below
+   * for how that crossing is detected without re-deriving it from the `muted` prop, which can't
+   * have caught up to a mid-drag call to this yet. */
+  onMute: () => void;
 }
 
 /**
@@ -62,23 +71,43 @@ export function VolumeSlider({
   muted,
   onVolumeChange,
   onUnmute,
+  onMute,
 }: VolumeSliderProps) {
   // Muted reads as 0, not wherever `volume` happens to be set -- the backend's stored `volume` is
   // untouched (see `onUnmute`'s doc comment above), this is purely how it's displayed.
-  const { displayValue, isDragging, beginDrag, updateDrag, endDrag } = useLiveDragValue(
-    muted ? 0 : percent,
-  );
+  const { displayValue, isDragging, isDraggingNow, beginDrag, updateDrag, endDrag, commitInstant } =
+    useLiveDragValue(muted ? 0 : percent);
 
   // Watches `isDragging` itself, rather than being wired into the Slider's own
   // onPointerDown/Up/Cancel individually, so this also covers `useLiveDragValue`'s window-level
   // backstop (a missed pointerup) -- both paths change `isDragging`, so both are covered here.
-  useDraggingSessionFreeze(sessionId, isDragging);
+  const { beginFreeze } = useDraggingSessionFreeze(sessionId, isDragging);
+
+  // Whether *this* drag gesture has already crossed into 0% and called `onMute` for it -- lets
+  // the live per-tick check below tell "still muted from this same crossing" apart from "just
+  // crossed, call onMute", and "moved back above 0%, call onUnmute" apart from "still above 0%,
+  // nothing to do" -- without re-reading the `muted` prop, which lags a mid-drag mute/unmute call
+  // by a render (the store round trip this whole file otherwise stays off of during a drag).
+  // Reset at the start of every new gesture.
+  const mutedDuringDragRef = useRef(false);
 
   const sendVolumeThrottled = useThrottledCallback((nextPercent: number) => {
     setVolumeCommand(sessionId, nextPercent / 100).catch((error) => {
       console.error(`Failed to set volume for ${sessionId}:`, error);
     });
   }, BACKEND_UPDATE_INTERVAL_MS);
+
+  // Shared by both commit paths below (drag release and a plain click/keyboard change) -- see
+  // `onMute`'s own doc comment for why settling at 0% also mutes. Guarded by
+  // `mutedDuringDragRef`: a drag gesture that already crossed into 0% mid-drag already called
+  // `onMute` live for it (see `onValueChange` below) -- this only still needs to fire for the
+  // plain-click path, which never touches that ref at all.
+  const commitVolume = (nextPercent: number) => {
+    onVolumeChange(sessionId, nextPercent / 100);
+    if (nextPercent <= 0 && !mutedDuringDragRef.current) {
+      onMute();
+    }
+  };
 
   return (
     <div className="mt-1.5 flex items-center gap-2">
@@ -98,35 +127,49 @@ export function VolumeSlider({
         step={0.1}
         disabled={disabled}
         onValueChange={([next]) => {
-          if (isDragging) {
+          // `isDraggingNow()`, never the `isDragging` state -- the first tick of a track-click or
+          // track-drag arrives in the same event dispatch as `onPointerDown`, before any render.
+          // See `isDraggingNow`'s doc comment in `useLiveDragValue`.
+          if (isDraggingNow()) {
             updateDrag(next);
             sendVolumeThrottled(next);
+            if (next <= 0 && !mutedDuringDragRef.current) {
+              mutedDuringDragRef.current = true;
+              onMute();
+            } else if (next > 0 && mutedDuringDragRef.current) {
+              mutedDuringDragRef.current = false;
+              onUnmute();
+            }
           } else {
             // Not a pointer drag (e.g. arrow-key adjustment) -- no high-frequency tick to
             // protect against, so go through the store normally like any other change.
             if (muted) {
               onUnmute();
             }
-            onVolumeChange(sessionId, next / 100);
+            commitInstant(next);
+            commitVolume(next);
           }
         }}
-        onPointerDown={() => {
+        onPointerDown={(event) => {
+          mutedDuringDragRef.current = false;
           if (muted) {
             onUnmute();
           }
-          beginDrag();
+          // Whether the pointer actually grabbed the thumb, vs. landing elsewhere on the track --
+          // see `beginDrag`'s own doc comment in `useLiveDragValue` for why this changes how the
+          // gesture's first tick is handled (instant live-tracking vs. easing to the click).
+          const grabbedThumb =
+            (event.target as HTMLElement).closest('[data-slot="slider-thumb"]') !== null;
+          // Synchronous, same event dispatch as `beginDrag()` -- see `beginFreeze`'s doc comment
+          // in `useDraggingSessionFreeze` for why this can't wait for a `useEffect` to catch up.
+          beginFreeze();
+          beginDrag(grabbedThumb);
         }}
         onPointerUp={() => {
-          const final = endDrag();
-          if (final !== null) {
-            onVolumeChange(sessionId, final / 100);
-          }
+          endDrag(commitVolume);
         }}
         onPointerCancel={() => {
-          const final = endDrag();
-          if (final !== null) {
-            onVolumeChange(sessionId, final / 100);
-          }
+          endDrag(commitVolume);
         }}
         className="flex-1"
       />

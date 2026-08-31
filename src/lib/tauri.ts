@@ -22,6 +22,13 @@ export interface AppSession {
   isDuckTrigger: boolean;
   /** Auto-duck is currently lowering this app's volume because another app is triggering it. */
   isDucked: boolean;
+  /** Monotonically increasing per-session counter, bumped by the backend on every
+   * `setVolume`/`setMuted`/`setBalance` call -- lets the frontend recognize (and discard) a push
+   * whose data was read before its own most recent write landed, no matter how delayed that
+   * push's own delivery turns out to be. See the Rust `AppSession::write_generation` doc comment
+   * for the full rationale (a confirmed, occasionally 100ms+, delay in the backend's own
+   * `emit()` call that a fixed-duration protection window can't reliably outlast). */
+  writeGeneration: number;
 }
 
 /**
@@ -68,14 +75,18 @@ export interface DuckingSettings {
 
 export const listSessions = () => invoke<AppSession[]>("list_sessions");
 
+// Each resolves with the session's new `writeGeneration` -- see `AppSession.writeGeneration`'s
+// doc comment. `mixer-store.ts` records it immediately so it can recognize a later push that
+// still reflects data read before this write landed, regardless of how long that push itself
+// took to arrive.
 export const setVolume = (sessionId: string, volume: number) =>
-  invoke<void>("set_volume", { sessionId, volume });
+  invoke<number>("set_volume", { sessionId, volume });
 
 export const setMuted = (sessionId: string, muted: boolean) =>
-  invoke<void>("set_muted", { sessionId, muted });
+  invoke<number>("set_muted", { sessionId, muted });
 
 export const setBalance = (sessionId: string, balance: number) =>
-  invoke<void>("set_balance", { sessionId, balance });
+  invoke<number>("set_balance", { sessionId, balance });
 
 // The highest volume percent the current backend allows a session to be set to -- 100 everywhere
 // except macOS (200, boosted like VLC's own past-100% slider). Drives the volume slider's `max`.

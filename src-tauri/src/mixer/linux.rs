@@ -37,14 +37,32 @@
 
 use std::collections::HashMap;
 use std::process::Command;
+use std::sync::Mutex;
 
 use super::{clamp_volume, AppSession, AudioMixerBackend, MixerError};
 
-pub struct LinuxMixerBackend;
+pub struct LinuxMixerBackend {
+    /// Per-session `write_generation` (see `AppSession::write_generation`'s doc comment) --
+    /// tracked here rather than read back from `pactl` (which has no such concept) since this
+    /// backend otherwise keeps no state of its own at all, re-parsing everything fresh from
+    /// `pactl list sink-inputs` on every call.
+    generations: Mutex<HashMap<String, u64>>,
+}
 
 impl LinuxMixerBackend {
     pub fn new() -> Self {
-        Self
+        Self {
+            generations: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Bumps and returns the new generation for `session_id`, called after every successful
+    /// write. Also used to backfill freshly-`pactl`-parsed sessions in `list_sessions`.
+    fn bump_generation(&self, session_id: &str) -> u64 {
+        let mut generations = self.generations.lock().unwrap();
+        let entry = generations.entry(session_id.to_string()).or_insert(0);
+        *entry += 1;
+        *entry
     }
 }
 
@@ -70,6 +88,14 @@ impl AudioMixerBackend for LinuxMixerBackend {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut sessions = parse_sink_inputs(&stdout);
+        // `parse_sink_inputs` has no access to `self.generations` (kept pure/fixture-testable,
+        // see its own doc comment), so backfill each session's real generation here.
+        {
+            let generations = self.generations.lock().unwrap();
+            for session in &mut sessions {
+                session.write_generation = generations.get(&session.id).copied().unwrap_or(0);
+            }
+        }
         // `pactl` empirically lists sink-inputs in ascending creation-index order, which is more
         // stable in practice than the other two backends' enumeration APIs -- but it's not a
         // documented guarantee either, so this sorts explicitly rather than relying on that
@@ -86,7 +112,7 @@ impl AudioMixerBackend for LinuxMixerBackend {
         Ok(sessions)
     }
 
-    fn set_volume(&self, session_id: &str, volume: f32) -> Result<(), MixerError> {
+    fn set_volume(&self, session_id: &str, volume: f32) -> Result<u64, MixerError> {
         let percentage = (clamp_volume(volume) * 100.0).round() as i32;
         run_pactl(
             &[
@@ -95,10 +121,11 @@ impl AudioMixerBackend for LinuxMixerBackend {
                 &format!("{percentage}%"),
             ],
             session_id,
-        )
+        )?;
+        Ok(self.bump_generation(session_id))
     }
 
-    fn set_muted(&self, session_id: &str, muted: bool) -> Result<(), MixerError> {
+    fn set_muted(&self, session_id: &str, muted: bool) -> Result<u64, MixerError> {
         run_pactl(
             &[
                 "set-sink-input-mute",
@@ -106,7 +133,8 @@ impl AudioMixerBackend for LinuxMixerBackend {
                 if muted { "1" } else { "0" },
             ],
             session_id,
-        )
+        )?;
+        Ok(self.bump_generation(session_id))
     }
 
     /// -1.0 (full left) to 1.0 (full right). `pactl` has no direct "set balance" subcommand --
@@ -115,7 +143,7 @@ impl AudioMixerBackend for LinuxMixerBackend {
     /// of a single shared one. Assumes a 2-channel (front-left, front-right) sink input, matching
     /// the `list_sessions` doc comment's own example `pactl` output -- a session with a different
     /// channel count/map would need per-channel-index handling this doesn't attempt.
-    fn set_balance(&self, session_id: &str, balance: f32) -> Result<(), MixerError> {
+    fn set_balance(&self, session_id: &str, balance: f32) -> Result<u64, MixerError> {
         // We don't currently track the session's volume ourselves (list_sessions re-parses it
         // fresh from pactl every call), so re-read it here rather than assuming/guessing one --
         // otherwise this would silently reset volume to 100% every time balance changes.
@@ -131,7 +159,8 @@ impl AudioMixerBackend for LinuxMixerBackend {
                 &format!("{right}%"),
             ],
             session_id,
-        )
+        )?;
+        Ok(self.bump_generation(session_id))
     }
 }
 
@@ -276,6 +305,8 @@ fn parse_block(id: &str, lines: &[&str]) -> AppSession {
         is_active,
         is_duck_trigger: false,
         is_ducked: false,
+        // Backfilled by `list_sessions` from `self.generations` -- see that call site's comment.
+        write_generation: 0,
     }
 }
 

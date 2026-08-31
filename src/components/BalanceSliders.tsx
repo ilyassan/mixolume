@@ -1,3 +1,4 @@
+import type { PointerEvent } from "react";
 import { Slider } from "@/components/ui/slider";
 import { balanceToChannels, balanceFromLeftFraction, balanceFromRightFraction } from "@/lib/balance";
 import { useLiveDragValue } from "@/hooks/useLiveDragValue";
@@ -55,7 +56,7 @@ export function BalanceSliders({
   // is enough to freeze this session's reference in the store -- both affect the same session's
   // balance.
   const isDragging = leftDrag.isDragging || rightDrag.isDragging;
-  useDraggingSessionFreeze(sessionId, isDragging);
+  const { beginFreeze } = useDraggingSessionFreeze(sessionId, isDragging);
 
   const commitLeft = (nextLeftPercent: number) => {
     if (muted) {
@@ -85,17 +86,27 @@ export function BalanceSliders({
     );
   }, BACKEND_UPDATE_INTERVAL_MS);
 
-  const beginLeftDrag = () => {
+  // Whether the pointer actually grabbed the thumb, vs. landing elsewhere on the track -- see
+  // `beginDrag`'s own doc comment in `useLiveDragValue` for why this changes how the gesture's
+  // first tick is handled (instant live-tracking vs. easing to the click).
+  const grabbedThumb = (event: PointerEvent) =>
+    (event.target as HTMLElement).closest('[data-slot="slider-thumb"]') !== null;
+
+  const beginLeftDrag = (event: PointerEvent) => {
     if (muted) {
       onUnmute();
     }
-    leftDrag.beginDrag();
+    // Synchronous, same event dispatch as `beginDrag()` -- see `beginFreeze`'s doc comment in
+    // `useDraggingSessionFreeze` for why this can't wait for a `useEffect` to catch up.
+    beginFreeze();
+    leftDrag.beginDrag(grabbedThumb(event));
   };
-  const beginRightDrag = () => {
+  const beginRightDrag = (event: PointerEvent) => {
     if (muted) {
       onUnmute();
     }
-    rightDrag.beginDrag();
+    beginFreeze();
+    rightDrag.beginDrag(grabbedThumb(event));
   };
 
   return (
@@ -112,25 +123,22 @@ export function BalanceSliders({
           step={0.1}
           disabled={disabled}
           onValueChange={([next]) => {
-            if (leftDrag.isDragging) {
+            // `isDraggingNow()`, never the `isDragging` state -- see `VolumeSlider.tsx`'s
+            // identical branch and `isDraggingNow`'s doc comment in `useLiveDragValue`.
+            if (leftDrag.isDraggingNow()) {
               leftDrag.updateDrag(next);
               sendLeftThrottled(next);
             } else {
+              leftDrag.commitInstant(next);
               commitLeft(next);
             }
           }}
           onPointerDown={beginLeftDrag}
           onPointerUp={() => {
-            const final = leftDrag.endDrag();
-            if (final !== null) {
-              commitLeft(final);
-            }
+            leftDrag.endDrag(commitLeft);
           }}
           onPointerCancel={() => {
-            const final = leftDrag.endDrag();
-            if (final !== null) {
-              commitLeft(final);
-            }
+            leftDrag.endDrag(commitLeft);
           }}
           className="flex-1"
         />
@@ -147,25 +155,21 @@ export function BalanceSliders({
           step={0.1}
           disabled={disabled}
           onValueChange={([next]) => {
-            if (rightDrag.isDragging) {
+            // See the left slider's identical branch above.
+            if (rightDrag.isDraggingNow()) {
               rightDrag.updateDrag(next);
               sendRightThrottled(next);
             } else {
+              rightDrag.commitInstant(next);
               commitRight(next);
             }
           }}
           onPointerDown={beginRightDrag}
           onPointerUp={() => {
-            const final = rightDrag.endDrag();
-            if (final !== null) {
-              commitRight(final);
-            }
+            rightDrag.endDrag(commitRight);
           }}
           onPointerCancel={() => {
-            const final = rightDrag.endDrag();
-            if (final !== null) {
-              commitRight(final);
-            }
+            rightDrag.endDrag(commitRight);
           }}
           className="flex-1"
         />
