@@ -34,6 +34,17 @@
 //! recoverable only via `IAudioPolicyConfigFactory::ClearAllPersistedApplicationDefaultEndpoints`
 //! (not a reinstall or reboot). That's why every call site here is deliberately conservative
 //! about apartment-joining and role coverage rather than assuming either is a one-time concern.
+//!
+//! Some apps (confirmed live with Zoom) run as more than one OS process that each open their
+//! own independent WASAPI session under the exact same display name -- Windows' own native
+//! Volume Mixer shows this too, it's not specific to this app. `group_sessions_by_display_name`
+//! merges those into one row per `list_sessions` call, and `resolve_member_pids` lets
+//! `set_volume`/`set_muted`/`set_balance`/`set_session_output_device` fan a single UI action out
+//! to every process that's really "the same app", instead of controlling only one of them.
+//! Browser tabs were considered for the same treatment and ruled out: a browser opens exactly
+//! one WASAPI session per *process*, not per tab (confirmed via Chromium's own audio
+//! architecture) -- there's nothing at this layer to even distinguish one tab's audio from
+//! another's, so per-tab control would need to live inside the browser itself, not here.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -111,6 +122,14 @@ struct Inner {
     /// the user never touched. Requiring two consecutive identical reads before trusting a
     /// change costs one extra ~150ms tick of latency on a genuine change, which is imperceptible.
     output_device_confirmed: HashMap<String, Option<String>>,
+    /// Maps a *group* session id (see this module's doc comment and
+    /// `group_sessions_by_display_name`) to every pid that's currently a member -- rebuilt from
+    /// scratch on every `list_sessions` call, never accumulated. Read by `resolve_member_pids`
+    /// so `set_volume`/`set_muted`/`set_balance`/`set_session_output_device` can fan a single
+    /// write out to every pid the merged row actually represents. A display name only one pid
+    /// currently has is never inserted here at all, so a session id's absence unambiguously
+    /// means "not a group, parse it as `win-{pid}` instead".
+    session_groups: HashMap<String, Vec<u32>>,
 }
 
 /// Windows backend: per-app volume via WASAPI audio sessions, auto-duck via WASAPI process
@@ -133,6 +152,7 @@ impl WindowsMixerBackend {
                 output_policy_factory: None,
                 output_device_raw: HashMap::new(),
                 output_device_confirmed: HashMap::new(),
+                session_groups: HashMap::new(),
             }),
         }
     }
@@ -380,6 +400,20 @@ fn pid_from_session_id(id: &str) -> Option<u32> {
     id.strip_prefix("win-").and_then(|s| s.parse::<u32>().ok())
 }
 
+/// The pid(s) `session_id` actually refers to -- more than one if it's a *group* id (see this
+/// module's doc comment and `group_sessions_by_display_name`), otherwise exactly the single pid
+/// `win-{pid}` encodes. Every setter (`set_volume`/`set_muted`/`set_balance`/
+/// `set_session_output_device`) starts here instead of parsing `session_id` directly, so a
+/// write against a merged row's id fans out to every process it actually represents.
+fn resolve_member_pids(inner: &Inner, session_id: &str) -> Result<Vec<u32>, MixerError> {
+    if let Some(pids) = inner.session_groups.get(session_id) {
+        return Ok(pids.clone());
+    }
+    pid_from_session_id(session_id)
+        .map(|pid| vec![pid])
+        .ok_or_else(|| MixerError::SessionNotFound(session_id.to_string()))
+}
+
 fn find_session_control(
     inner: &mut Inner,
     session_id: &str,
@@ -393,6 +427,81 @@ fn find_session_control(
         .ok_or_else(|| MixerError::SessionNotFound(session_id.to_string()))?;
     resolve_session_control(inner, target_pid, candidates)
         .ok_or_else(|| MixerError::SessionNotFound(session_id.to_string()))
+}
+
+/// Merges every `AppSession` sharing a `display_name` into one representative row, and records
+/// each merged group's current member pids in `inner.session_groups` (cleared and rebuilt here
+/// every call) -- see this module's doc comment for why this exists (confirmed live with Zoom)
+/// and `resolve_member_pids` for how a setter fans a write back out to every member.
+///
+/// A display name only one pid currently has passes through completely untouched -- the
+/// overwhelmingly common case, and it costs nothing extra: no group is recorded for it at all.
+///
+/// For a real group, the merged row's own fields come from whichever member has the *lowest*
+/// pid (an arbitrary but stable-ish choice -- it only changes if that specific process exits,
+/// not on every tick just because `HashMap` iteration order isn't fixed), except:
+/// - `is_active`/`is_duck_trigger`/`is_ducked`: true if *any* member is, so the merged row
+///   reflects the group as a whole rather than hiding a still-active member behind a quiet one.
+/// - `icon_png`: the first member that actually has one, in case the anchor's own resolution
+///   happened to fail for it specifically (rare, but no reason to show no icon when another
+///   member's succeeded).
+/// - `write_generation`: read from `inner.write_generations` under the *group* id, since that's
+///   the only id `set_volume`/`set_muted`/`set_balance` ever bump a generation for once a
+///   session is part of a group (see `resolve_member_pids`'s callers) -- each member's own
+///   per-pid generation entry is irrelevant once it's absorbed into a group, since nothing
+///   reads it directly anymore.
+fn group_sessions_by_display_name(inner: &mut Inner, sessions: Vec<AppSession>) -> Vec<AppSession> {
+    let mut by_name: HashMap<String, Vec<AppSession>> = HashMap::new();
+    for session in sessions {
+        by_name
+            .entry(session.display_name.clone())
+            .or_default()
+            .push(session);
+    }
+
+    inner.session_groups.clear();
+    let mut merged = Vec::with_capacity(by_name.len());
+    for (_, mut members) in by_name {
+        if members.len() == 1 {
+            merged.push(members.pop().expect("just checked len() == 1"));
+            continue;
+        }
+        members.sort_by_key(|s| pid_from_session_id(&s.id).unwrap_or(u32::MAX));
+        let member_pids: Vec<u32> = members
+            .iter()
+            .filter_map(|s| pid_from_session_id(&s.id))
+            .collect();
+        let group_id = format!("win-group-{}", member_pids[0]);
+        inner
+            .session_groups
+            .insert(group_id.clone(), member_pids.clone());
+
+        let anchor = members.remove(0);
+        let is_active = anchor.is_active || members.iter().any(|s| s.is_active);
+        let is_duck_trigger = anchor.is_duck_trigger || members.iter().any(|s| s.is_duck_trigger);
+        let is_ducked = anchor.is_ducked || members.iter().any(|s| s.is_ducked);
+        let icon_png = anchor
+            .icon_png
+            .clone()
+            .or_else(|| members.iter().find_map(|s| s.icon_png.clone()));
+        let write_generation = inner.write_generations.get(&group_id).copied().unwrap_or(0);
+
+        merged.push(AppSession {
+            id: group_id,
+            display_name: anchor.display_name.clone(),
+            icon_png,
+            volume: anchor.volume,
+            effective_volume: anchor.effective_volume,
+            muted: anchor.muted,
+            balance: anchor.balance,
+            is_active,
+            is_duck_trigger,
+            is_ducked,
+            write_generation,
+            output_device_id: anchor.output_device_id.clone(),
+        });
+    }
+    merged
 }
 
 /// Resolve a friendly display name and, best-effort, a PNG-encoded icon for the given pid.
@@ -737,6 +846,12 @@ impl AudioMixerBackend for WindowsMixerBackend {
             .output_device_confirmed
             .retain(|id, _| live_ids.contains(id));
 
+        // Merges same-named sessions (e.g. Zoom's multiple processes) into one row -- deliberately
+        // *after* the retains above, which need every individual pid's own `win-{pid}` id still
+        // present in `live_ids` to keep that pid's own bookkeeping alive; the merged group id
+        // itself never appears in any of those maps.
+        let mut sessions = group_sessions_by_display_name(&mut inner, sessions);
+
         // `IAudioSessionEnumerator` (behind `enumerate_session_controls`) has no documented
         // ordering guarantee either, matching macOS's `kAudioHardwarePropertyProcessObjectList`
         // -- see the identical sort in `macos.rs`'s `list_sessions` for the full rationale (an
@@ -755,7 +870,7 @@ impl AudioMixerBackend for WindowsMixerBackend {
 
     fn set_volume(&self, session_id: &str, volume: f32) -> Result<u64, MixerError> {
         let volume = clamp_volume(volume);
-        // Held for this whole call, including the WASAPI write below -- not just the
+        // Held for this whole call, including every member's WASAPI write below -- not just the
         // target-volume bookkeeping. Releasing it early (an earlier version of this did) leaves
         // a real race against `list_sessions`'s own per-session duck-transition write: a slider
         // drag landing in the gap between "read `applied_ducked`" and "actually write the
@@ -766,43 +881,74 @@ impl AudioMixerBackend for WindowsMixerBackend {
         // `macos.rs`'s `Inner`-guarded setters already hold their lock across their own
         // engine-mutating calls for the same reason.
         let mut inner = self.inner.lock().unwrap();
-        inner.target_volume.insert(session_id.to_string(), volume);
-        let is_ducked = inner
-            .applied_ducked
-            .get(session_id)
-            .copied()
-            .unwrap_or(false);
-        let effective = if is_ducked {
-            volume * DUCK_GAIN_MULTIPLIER
-        } else {
-            volume
-        };
+        // Fans out to every member pid if `session_id` is a group (e.g. Zoom's several
+        // processes) -- see `resolve_member_pids`'s doc comment. Exactly one pid otherwise, so
+        // this loop is a no-op-shaped identity for the overwhelmingly common case.
+        let member_pids = resolve_member_pids(&inner, session_id)?;
+        let mut applied_to_any = false;
+        for pid in member_pids {
+            let member_id = session_id_for(pid);
+            inner.target_volume.insert(member_id.clone(), volume);
+            let is_ducked = inner
+                .applied_ducked
+                .get(&member_id)
+                .copied()
+                .unwrap_or(false);
+            let effective = if is_ducked {
+                volume * DUCK_GAIN_MULTIPLIER
+            } else {
+                volume
+            };
 
-        let control = find_session_control(&mut inner, session_id)?;
-        unsafe {
-            let simple_volume: ISimpleAudioVolume = control
-                .cast()
-                .map_err(|e| MixerError::Platform(e.to_string()))?;
-            simple_volume
-                .SetMasterVolume(effective, std::ptr::null())
-                .map_err(|e| MixerError::Platform(e.to_string()))?;
+            // Best-effort per member: one process in a group failing (e.g. it just exited)
+            // shouldn't block the volume from being applied to every other member that's still
+            // there -- the call only fails outright if *none* of them could be reached.
+            let Ok(control) = find_session_control(&mut inner, &member_id) else {
+                continue;
+            };
+            unsafe {
+                let Ok(simple_volume) = control.cast::<ISimpleAudioVolume>() else {
+                    continue;
+                };
+                if simple_volume
+                    .SetMasterVolume(effective, std::ptr::null())
+                    .is_ok()
+                {
+                    applied_to_any = true;
+                }
+            }
+        }
+        if !applied_to_any {
+            return Err(MixerError::SessionNotFound(session_id.to_string()));
         }
         Ok(bump_generation(&mut inner, session_id))
     }
 
     fn set_muted(&self, session_id: &str, muted: bool) -> Result<u64, MixerError> {
-        // Locked for the whole call, like `set_volume` -- `find_session_control` needs it (see
-        // `resolve_session_control`'s doc comment) to correctly pick between more than one live
-        // session control for this pid, not just to bump the write generation afterward.
+        // Locked for the whole call, like `set_volume` -- see its own comment. Same fan-out
+        // reasoning applies here too.
         let mut inner = self.inner.lock().unwrap();
-        let control = find_session_control(&mut inner, session_id)?;
-        unsafe {
-            let simple_volume: ISimpleAudioVolume = control
-                .cast()
-                .map_err(|e| MixerError::Platform(e.to_string()))?;
-            simple_volume
-                .SetMute(BOOL::from(muted), std::ptr::null())
-                .map_err(|e| MixerError::Platform(e.to_string()))?;
+        let member_pids = resolve_member_pids(&inner, session_id)?;
+        let mut applied_to_any = false;
+        for pid in member_pids {
+            let member_id = session_id_for(pid);
+            let Ok(control) = find_session_control(&mut inner, &member_id) else {
+                continue;
+            };
+            unsafe {
+                let Ok(simple_volume) = control.cast::<ISimpleAudioVolume>() else {
+                    continue;
+                };
+                if simple_volume
+                    .SetMute(BOOL::from(muted), std::ptr::null())
+                    .is_ok()
+                {
+                    applied_to_any = true;
+                }
+            }
+        }
+        if !applied_to_any {
+            return Err(MixerError::SessionNotFound(session_id.to_string()));
         }
         Ok(bump_generation(&mut inner, session_id))
     }
@@ -815,30 +961,40 @@ impl AudioMixerBackend for WindowsMixerBackend {
     /// else, since "left/right balance" doesn't have a sensible meaning for mono or
     /// surround-channel-count sessions.
     fn set_balance(&self, session_id: &str, balance: f32) -> Result<u64, MixerError> {
-        // Locked for the whole call -- see `set_muted`'s matching comment.
+        // Locked for the whole call -- see `set_muted`'s matching comment. Same fan-out
+        // reasoning applies here too.
         let mut inner = self.inner.lock().unwrap();
-        let control = find_session_control(&mut inner, session_id)?;
-        unsafe {
-            let simple_volume: ISimpleAudioVolume = control
-                .cast()
-                .map_err(|e| MixerError::Platform(e.to_string()))?;
-            let volume = simple_volume.GetMasterVolume().unwrap_or(1.0);
+        let member_pids = resolve_member_pids(&inner, session_id)?;
+        let mut applied_to_any = false;
+        for pid in member_pids {
+            let member_id = session_id_for(pid);
+            let Ok(control) = find_session_control(&mut inner, &member_id) else {
+                continue;
+            };
+            unsafe {
+                let Ok(simple_volume) = control.cast::<ISimpleAudioVolume>() else {
+                    continue;
+                };
+                let volume = simple_volume.GetMasterVolume().unwrap_or(1.0);
 
-            let channel_volume: IChannelAudioVolume = control
-                .cast()
-                .map_err(|e| MixerError::Platform(e.to_string()))?;
-            if channel_volume.GetChannelCount().unwrap_or(0) != 2 {
-                return Ok(bump_generation(&mut inner, session_id));
+                let Ok(channel_volume) = control.cast::<IChannelAudioVolume>() else {
+                    continue;
+                };
+                if channel_volume.GetChannelCount().unwrap_or(0) != 2 {
+                    // Not stereo -- nothing to do for this member, but that's not a failure.
+                    applied_to_any = true;
+                    continue;
+                }
+                let balance = balance.clamp(-1.0, 1.0);
+                let left = volume * (1.0 - balance.max(0.0));
+                let right = volume * (1.0 + balance.min(0.0));
+                let _ = channel_volume.SetChannelVolume(0, left, std::ptr::null());
+                let _ = channel_volume.SetChannelVolume(1, right, std::ptr::null());
+                applied_to_any = true;
             }
-            let balance = balance.clamp(-1.0, 1.0);
-            let left = volume * (1.0 - balance.max(0.0));
-            let right = volume * (1.0 + balance.min(0.0));
-            channel_volume
-                .SetChannelVolume(0, left, std::ptr::null())
-                .map_err(|e| MixerError::Platform(e.to_string()))?;
-            channel_volume
-                .SetChannelVolume(1, right, std::ptr::null())
-                .map_err(|e| MixerError::Platform(e.to_string()))?;
+        }
+        if !applied_to_any {
+            return Err(MixerError::SessionNotFound(session_id.to_string()));
         }
         Ok(bump_generation(&mut inner, session_id))
     }
@@ -938,13 +1094,26 @@ impl AudioMixerBackend for WindowsMixerBackend {
         session_id: &str,
         device_id: Option<&str>,
     ) -> Result<(), MixerError> {
-        let pid = pid_from_session_id(session_id)
-            .ok_or_else(|| MixerError::SessionNotFound(session_id.to_string()))?;
         let mut inner = self.inner.lock().unwrap();
+        // Fans out to every member pid if `session_id` is a group -- routing "Zoom" to
+        // headphones should mean every one of its processes, matching the single-app mental
+        // model the rest of this backend's grouping already applies to volume/mute/balance.
+        let member_pids = resolve_member_pids(&inner, session_id)?;
         let factory = output_policy_factory(&mut inner).ok_or_else(|| {
             MixerError::Platform("failed to activate IAudioPolicyConfigFactory".to_string())
         })?;
-        windows_output_routing::set_session_output_device(factory, pid, device_id)
+        let mut applied_to_any = false;
+        for pid in member_pids {
+            if windows_output_routing::set_session_output_device(factory, pid, device_id).is_ok() {
+                applied_to_any = true;
+            }
+        }
+        if !applied_to_any {
+            return Err(MixerError::Platform(
+                "failed to set output device for any member".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
