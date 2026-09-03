@@ -6,6 +6,9 @@ const {
   setMuted,
   setBalance,
   maxVolumePercent,
+  outputRoutingSupported,
+  listOutputDevices,
+  setSessionOutputDevice,
   capturedCallback,
   unlistenMock,
 } = vi.hoisted(() => {
@@ -16,6 +19,12 @@ const {
     setMuted: vi.fn(),
     setBalance: vi.fn(),
     maxVolumePercent: vi.fn(),
+    // Defaults to unsupported, matching every backend that doesn't override
+    // `output_routing_supported` -- tests that specifically exercise output routing set this to
+    // resolve `true` themselves.
+    outputRoutingSupported: vi.fn().mockResolvedValue(false),
+    listOutputDevices: vi.fn().mockResolvedValue([]),
+    setSessionOutputDevice: vi.fn(),
     capturedCallback: { current: null as null | ((s: unknown[]) => void) },
     unlistenMock,
   };
@@ -27,6 +36,9 @@ vi.mock("@/lib/tauri", () => ({
   setMuted: (...args: unknown[]) => setMuted(...args),
   setBalance: (...args: unknown[]) => setBalance(...args),
   maxVolumePercent: (...args: unknown[]) => maxVolumePercent(...args),
+  outputRoutingSupported: (...args: unknown[]) => outputRoutingSupported(...args),
+  listOutputDevices: (...args: unknown[]) => listOutputDevices(...args),
+  setSessionOutputDevice: (...args: unknown[]) => setSessionOutputDevice(...args),
   listenToSessionsChanged: vi.fn((callback: (s: unknown[]) => void) => {
     capturedCallback.current = callback;
     return Promise.resolve(unlistenMock);
@@ -53,6 +65,7 @@ const session = (overrides: Partial<AppSession> = {}): AppSession => ({
   isDuckTrigger: false,
   isDucked: false,
   writeGeneration: 0,
+  outputDeviceId: null,
   ...overrides,
 });
 

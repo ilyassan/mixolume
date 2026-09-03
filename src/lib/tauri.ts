@@ -29,6 +29,17 @@ export interface AppSession {
    * for the full rationale (a confirmed, occasionally 100ms+, delay in the backend's own
    * `emit()` call that a fixed-duration protection window can't reliably outlast). */
   writeGeneration: number;
+  /** The output device this session is routed to, or `null` when it's following the system
+   * default. `null` on every backend that doesn't implement output routing yet -- check
+   * `outputRoutingSupported()` before showing a device picker at all. */
+  outputDeviceId: string | null;
+}
+
+// Mirrors the Rust `OutputDevice` struct. `id` is backend-specific and opaque here -- only ever
+// round-tripped back through `setSessionOutputDevice`.
+export interface OutputDevice {
+  id: string;
+  name: string;
 }
 
 /**
@@ -115,6 +126,20 @@ export const setDuckingEnabled = (enabled: boolean) =>
 export const setDuckTriggerPriority = (displayName: string, isPriority: boolean) =>
   invoke<void>("set_duck_trigger_priority", { displayName, isPriority });
 
+// Currently Windows only (via the undocumented `IAudioPolicyConfigFactory` WinRT API, the same
+// one behind Windows' own Settings > Sound > Volume mixer per-app device picker). Reports `false`
+// elsewhere so the UI can hide the device picker instead of showing a control that no-ops.
+export const outputRoutingSupported = () =>
+  invoke<boolean>("output_routing_supported");
+
+export const listOutputDevices = () =>
+  invoke<OutputDevice[]>("list_output_devices");
+
+export const setSessionOutputDevice = (
+  sessionId: string,
+  deviceId: string | null,
+) => invoke<void>("set_session_output_device", { sessionId, deviceId });
+
 // ===== EVENTS =====
 
 // Rust pushes the updated session list whenever it changes (on its own polling interval - not
@@ -124,5 +149,16 @@ export const listenToSessionsChanged = (
   callback: (sessions: SessionPush[]) => void,
 ) =>
   listen<SessionPush[]>("sessions-changed", (event) => {
+    callback(event.payload);
+  });
+
+// Rust pushes a fresh output-device list whenever a device is plugged/unplugged (its own slower
+// ~2s polling interval, separate from the session list's -- see `OUTPUT_DEVICES_POLL_INTERVAL`
+// in lib.rs), so the picker's dropdown options stay live instead of frozen at whatever was
+// plugged in when the app started.
+export const listenToOutputDevicesChanged = (
+  callback: (devices: OutputDevice[]) => void,
+) =>
+  listen<OutputDevice[]>("output-devices-changed", (event) => {
     callback(event.payload);
   });

@@ -3,7 +3,7 @@ mod mixer;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use mixer::{AppSession, AudioMixerBackend, DuckingSettings, MixerError};
+use mixer::{AppSession, AudioMixerBackend, DuckingSettings, MixerError, OutputDevice};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State};
@@ -174,6 +174,36 @@ fn set_duck_trigger_priority(
         .map_err(mixer_error_to_string)
 }
 
+/// Whether the current backend can route an individual app's audio to a specific output device
+/// -- currently Windows only (via the undocumented `IAudioPolicyConfigFactory` WinRT API, the
+/// same one behind Windows' own Settings > Sound > Volume mixer per-app device picker). The
+/// Settings/session UI uses this to hide the device picker entirely where it's unsupported,
+/// matching `ducking_supported`'s capability-flag pattern.
+#[tauri::command]
+fn output_routing_supported(state: State<MixerState>) -> bool {
+    state.backend.output_routing_supported()
+}
+
+#[tauri::command]
+fn list_output_devices(state: State<MixerState>) -> Result<Vec<OutputDevice>, String> {
+    state
+        .backend
+        .list_output_devices()
+        .map_err(mixer_error_to_string)
+}
+
+#[tauri::command]
+fn set_session_output_device(
+    state: State<MixerState>,
+    session_id: String,
+    device_id: Option<String>,
+) -> Result<(), String> {
+    state
+        .backend
+        .set_session_output_device(&session_id, device_id.as_deref())
+        .map_err(mixer_error_to_string)
+}
+
 /// What a completed update check found, reported to the frontend as `{ "status": "upToDate" }`
 /// or `{ "status": "installed", "version": "..." }` -- distinct from a plain bool so the Settings
 /// UI can tell the user something actionable instead of "check the console" (see PLAN.md's
@@ -289,6 +319,16 @@ struct PushedSession<'a> {
     /// compare against its own last-known write for this session. See
     /// `AppSession::write_generation`'s doc comment.
     write_generation: u64,
+    /// Always included, like every other field except `icon_png` -- this was missing entirely
+    /// until now, which was a real, confirmed bug: every push silently dropped it, so
+    /// `mixer-store.ts`'s `resolvePushedIcons` (which spreads the rest of a `PushedSession`
+    /// as-is) produced `outputDeviceId: undefined` on every single push, overwriting whatever
+    /// correct value `setSessionOutputDevice`'s own optimistic local write had just set. The
+    /// picker's `?? SYSTEM_DEFAULT_VALUE` fallback then displayed that as "System default" --
+    /// which is exactly the "looks selected for a moment, then reverts" symptom, even though the
+    /// backend's own OS-level routing (and `list_sessions()`'s full, correct `AppSession`) never
+    /// actually stopped being right the whole time.
+    output_device_id: Option<&'a str>,
 }
 
 /// Builds the `sessions-changed` payload for `sessions`, dropping every icon that's byte-identical
@@ -323,9 +363,47 @@ fn pushed_sessions<'a>(
                 is_duck_trigger: session.is_duck_trigger,
                 is_ducked: session.is_ducked,
                 write_generation: session.write_generation,
+                output_device_id: session.output_device_id.as_deref(),
             }
         })
         .collect()
+}
+
+/// How often to re-enumerate output devices and push a fresh list if it changed -- see
+/// `spawn_output_devices_poll_loop`'s doc comment. Slower than [`POLL_INTERVAL`]: a device
+/// being plugged/unplugged is rare compared to a volume changing, and each check is a real
+/// WASAPI device enumeration (cheap, but not free), not just a `HashMap` lookup.
+const OUTPUT_DEVICES_POLL_INTERVAL: Duration = Duration::from_millis(2000);
+
+/// Keeps the frontend's output-device list (the picker's dropdown options) in sync with what's
+/// actually plugged in, instead of the one-shot fetch at `init()` time it used to be -- that
+/// meant a device plugged in *after* the app started never appeared as a selectable option at
+/// all, and a device unplugged while still selected for some session just silently stayed in
+/// the list forever. A no-op loop (never even starts polling) on a backend that doesn't support
+/// output routing at all, matching `output_routing_supported`'s existing capability-flag
+/// pattern elsewhere -- no reason to burn a poll tick calling into a backend that only ever
+/// returns the trait's default empty list.
+fn spawn_output_devices_poll_loop(app_handle: AppHandle, backend: Arc<dyn AudioMixerBackend>) {
+    if !backend.output_routing_supported() {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        let mut last: Option<Vec<OutputDevice>> = None;
+        loop {
+            tokio::time::sleep(OUTPUT_DEVICES_POLL_INTERVAL).await;
+            match backend.list_output_devices() {
+                Ok(devices) => {
+                    if last.as_ref() != Some(&devices) {
+                        let _ = app_handle.emit("output-devices-changed", &devices);
+                        last = Some(devices);
+                    }
+                }
+                Err(err) => {
+                    log::warn!("failed to list output devices: {err}");
+                }
+            }
+        }
+    });
 }
 
 fn spawn_session_poll_loop(app_handle: AppHandle, backend: Arc<dyn AudioMixerBackend>) {
@@ -720,7 +798,8 @@ pub fn run() {
             app.manage(MixerState {
                 backend: backend.clone(),
             });
-            spawn_session_poll_loop(app.handle().clone(), backend);
+            spawn_session_poll_loop(app.handle().clone(), backend.clone());
+            spawn_output_devices_poll_loop(app.handle().clone(), backend);
             setup_tray(app)?;
 
             // Silent background update check, like Sparkle on macOS -- release builds only (a
@@ -759,7 +838,10 @@ pub fn run() {
             ducking_supported,
             set_ducking_enabled,
             set_duck_trigger_priority,
-            max_volume_percent
+            max_volume_percent,
+            output_routing_supported,
+            list_output_devices,
+            set_session_output_device
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -782,6 +864,7 @@ mod tests {
             is_duck_trigger: false,
             is_ducked: false,
             write_generation: 0,
+            output_device_id: None,
         }
     }
 

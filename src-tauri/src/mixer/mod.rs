@@ -13,7 +13,11 @@ pub mod macos_ducking;
 #[cfg(target_os = "windows")]
 pub mod windows;
 #[cfg(target_os = "windows")]
+pub mod windows_audio;
+#[cfg(target_os = "windows")]
 pub mod windows_ducking;
+#[cfg(target_os = "windows")]
+pub mod windows_output_routing;
 
 /// Voice-activity classification/debounce logic shared by macOS's and Windows' auto-duck
 /// backends -- pure `webrtc_vad` + atomics, no platform-specific code, so it's not behind a
@@ -73,6 +77,22 @@ pub struct AppSession {
     /// deterministically: the frontend only ever accepts a push at least as new as what it's
     /// already written, regardless of how long the round trip took.
     pub write_generation: u64,
+    /// The output device this session is currently routed to, if it's been explicitly set away
+    /// from the system default -- `None` means "following whatever the system default output
+    /// device is", matching how the OS itself represents "no per-app override" (see
+    /// [`AudioMixerBackend::set_session_output_device`]'s doc comment). Always `None` on a
+    /// backend that doesn't implement output routing yet.
+    pub output_device_id: Option<String>,
+}
+
+/// One output (render) device the user could route an app's audio to -- e.g. "Speakers",
+/// "Headphones (USB DAC)". `id` is backend-specific and opaque to the frontend; it's only ever
+/// round-tripped back through [`AudioMixerBackend::set_session_output_device`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputDevice {
+    pub id: String,
+    pub name: String,
 }
 
 /// Cross-app auto-duck settings: whether the feature runs at all, and which apps (by display
@@ -120,11 +140,25 @@ pub fn clamp_volume(volume: f32) -> f32 {
 
 /// Ceiling for backends that support boosting a session past its normal 100% volume (like VLC's
 /// own boosted-volume slider) -- currently macOS only, see [`AudioMixerBackend::max_volume_percent`].
+/// A real Windows implementation was tried and reverted: WASAPI has no per-session volume API
+/// that goes past unity, so it needs either muting-then-recapturing the same session (confirmed
+/// live to blind that session's own process-loopback capture -- Windows evidently applies a
+/// session's mute/volume at or before the point loopback capture taps it) or summing a second,
+/// externally-rendered layer on top of the untouched original (works, but the second layer's
+/// unavoidable capture/render round-trip lands slightly after the original's effectively-instant
+/// output, audible as a faint echo/comb-filter coloration). The only approach real specialized
+/// tools (VoiceMeeter, VB-Cable-based boosters) use for clean quality is rerouting the target app
+/// to a virtual audio device via a driver -- out of scope here; even EarTrumpet, the most-used
+/// per-app Windows volume mixer, doesn't attempt boost past 100% for the same reason.
+/// `allow(dead_code)`: only macOS calls this outside this file's own tests, so a Windows/Linux
+/// `cargo check`/`clippy` sees no non-test caller.
+#[allow(dead_code)]
 pub const MAX_BOOSTED_VOLUME: f32 = 1.5;
 
 /// Same as [`clamp_volume`] but allows up to [`MAX_BOOSTED_VOLUME`] -- used only by backends that
 /// actually support boosting (their `set_volume` calls this instead of `clamp_volume`), so
 /// backends that don't yet are entirely unaffected by this ceiling existing at all.
+#[allow(dead_code)]
 pub fn clamp_boosted_volume(volume: f32) -> f32 {
     volume.clamp(0.0, MAX_BOOSTED_VOLUME)
 }
@@ -213,6 +247,29 @@ pub trait AudioMixerBackend: Send + Sync {
     ) -> Result<(), MixerError> {
         Ok(())
     }
+
+    /// Whether this backend can route an individual app's audio to a specific output device --
+    /// false for every backend that doesn't override it, so the frontend can hide the device
+    /// picker entirely rather than show a control that would silently no-op, the same
+    /// capability-flag pattern `ducking_supported` already uses.
+    fn output_routing_supported(&self) -> bool {
+        false
+    }
+    /// Every currently available output (render) device. Empty for a backend that doesn't
+    /// implement output routing -- pairs with `output_routing_supported`, which the frontend
+    /// checks first, so an empty list here is never itself ambiguous with "supported but none
+    /// found" in practice.
+    fn list_output_devices(&self) -> Result<Vec<OutputDevice>, MixerError> {
+        Ok(Vec::new())
+    }
+    /// Routes `session_id`'s audio to `device_id`, or back to the system default when `None`.
+    fn set_session_output_device(
+        &self,
+        _session_id: &str,
+        _device_id: Option<&str>,
+    ) -> Result<(), MixerError> {
+        Ok(())
+    }
 }
 
 /// One currently-running app, by name -- macOS-only internal use (matching well-known
@@ -223,6 +280,9 @@ pub trait AudioMixerBackend: Send + Sync {
 /// for many apps at once turned out to be inherently slow (real per-icon AppKit decode cost) and
 /// caused a multi-second/-minute Settings freeze, so it was reverted; only the name is needed
 /// for matching against a known-apps list, so that's all this carries now.
+/// Only constructed by macOS's `list_running_applications` -- genuinely dead code on any other
+/// target, not something to find a Windows/Linux use for.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RunningAppInfo {
     pub name: String,

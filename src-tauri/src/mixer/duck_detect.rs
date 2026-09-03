@@ -21,7 +21,12 @@ use std::sync::Arc;
 use webrtc_vad::{SampleRate, Vad, VadMode};
 
 /// A [`SpeechDetector`]'s hysteresis counters, as a plain snapshot -- what survives an engine
-/// rebuild. See [`HysteresisCounters`]'s doc comment for why this exists at all.
+/// rebuild. See [`HysteresisCounters`]'s doc comment for why this exists at all. Only ever
+/// constructed/consumed by macOS's `DuckingRuntime` (Core Audio forces an engine rebuild on every
+/// app start/stop; Windows' one-thread-per-app capture never rebuilds anything, so it has no
+/// analogous need to snapshot/restore this) -- genuinely dead code when this crate is compiled
+/// for any other target, not something to "fix" by finding a Windows use for it.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PersistedDuckState {
     pub speech_run: u32,
@@ -84,6 +89,8 @@ pub struct HysteresisCounters {
 }
 
 impl HysteresisCounters {
+    /// macOS-only (see [`PersistedDuckState`]'s doc comment).
+    #[allow(dead_code)]
     pub fn seeded(state: PersistedDuckState) -> Self {
         Self {
             speech_run: AtomicU32::new(state.speech_run),
@@ -92,7 +99,9 @@ impl HysteresisCounters {
         }
     }
 
-    /// Safe to call from any thread -- see the struct doc comment.
+    /// Safe to call from any thread -- see the struct doc comment. macOS-only (see
+    /// [`PersistedDuckState`]'s doc comment).
+    #[allow(dead_code)]
     pub fn snapshot(&self) -> PersistedDuckState {
         PersistedDuckState {
             speech_run: self.speech_run.load(Ordering::Relaxed),
@@ -209,7 +218,10 @@ impl SpeechDetector {
     }
 
     /// The debounced trigger state as of the last [`Self::process_frame`] call, without
-    /// re-running any classification.
+    /// re-running any classification. macOS-only: `windows_ducking.rs` uses `process_frame`'s own
+    /// return value directly instead (see [`PersistedDuckState`]'s doc comment for the broader
+    /// "Windows doesn't rebuild its detectors" context this falls out of).
+    #[allow(dead_code)]
     pub fn is_triggering(&self) -> bool {
         self.hysteresis.is_triggering.load(Ordering::Relaxed)
     }

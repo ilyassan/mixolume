@@ -4,11 +4,16 @@ import {
   isPermissionError,
   listSessions,
   listenToSessionsChanged,
+  listenToOutputDevicesChanged,
+  type OutputDevice,
   type SessionPush,
   maxVolumePercent as maxVolumePercentCommand,
   setVolume as setVolumeCommand,
   setMuted as setMutedCommand,
   setBalance as setBalanceCommand,
+  outputRoutingSupported as outputRoutingSupportedCommand,
+  listOutputDevices as listOutputDevicesCommand,
+  setSessionOutputDevice as setSessionOutputDeviceCommand,
 } from "@/lib/tauri";
 
 function iconPngEqual(a: number[] | null, b: number[] | null): boolean {
@@ -54,6 +59,7 @@ function sessionsEqual(a: AppSession, b: AppSession): boolean {
     a.isActive === b.isActive &&
     a.isDuckTrigger === b.isDuckTrigger &&
     a.isDucked === b.isDucked &&
+    a.outputDeviceId === b.outputDeviceId &&
     iconPngEqual(a.iconPng, b.iconPng)
   );
 }
@@ -142,6 +148,26 @@ interface MixerState {
    */
   maxVolumePercent: number;
   /**
+   * Whether the current backend can route an individual app's audio to a specific output device
+   * -- currently Windows only (see `outputRoutingSupported` in lib.rs). Defaults to `false` until
+   * `init()`'s fetch resolves, so the device picker stays hidden rather than flashing in.
+   */
+  outputRoutingSupported: boolean;
+  /** Every currently available output device -- refreshed at `init()` and kept live afterward
+   * via `listenToOutputDevicesChanged` (a device plugged/unplugged shows up here within its own
+   * ~2s poll interval, not just at app startup). See `outputRoutingSupported`'s doc comment for
+   * why this is worth fetching unconditionally rather than gating it behind a check that itself
+   * needs a round trip first. */
+  outputDevices: OutputDevice[];
+  /**
+   * Every device id -> name pair ever seen in `outputDevices`, accumulated and never pruned --
+   * unlike `outputDevices` itself, which only ever lists what's *currently* plugged in. Lets
+   * `OutputDevicePicker` show a session that's routed to a since-unplugged device by its real
+   * name ("Headphones (disconnected)") instead of a bare, unexplained "Unknown device" the
+   * moment it drops out of the live list.
+   */
+  knownDeviceNames: Record<string, string>;
+  /**
    * The session id a slider is actively being pointer-dragged for right now, if any -- see
    * `setDraggingSessionId`'s comment for why this exists.
    */
@@ -166,6 +192,9 @@ interface MixerState {
   setMuted: (sessionId: string, muted: boolean) => void;
   /** Optimistically updates left/right balance locally and asks the backend to apply it. */
   setBalance: (sessionId: string, balance: number) => void;
+  /** Optimistically routes a session to `deviceId` (or back to the system default when `null`)
+   * locally and asks the backend to apply it. Only meaningful when `outputRoutingSupported`. */
+  setSessionOutputDevice: (sessionId: string, deviceId: string | null) => void;
   /**
    * Called by `useDraggingSessionFreeze` (used from both `VolumeSlider` and `BalanceSliders`)
    * around a drag gesture, plus a short grace period after it ends -- see that hook's own doc
@@ -242,6 +271,7 @@ function protectFromStaleEcho(sessionId: string, get: () => MixerState): void {
 }
 
 let unlisten: (() => void) | null = null;
+let unlistenOutputDevices: (() => void) | null = null;
 
 /**
  * The most recent backend push received while a drag was in progress, held here (not in React
@@ -251,12 +281,28 @@ let unlisten: (() => void) | null = null;
  */
 let pendingSessionsDuringDrag: AppSession[] | null = null;
 
+/** Folds `devices` into `knownDeviceNames` -- see that field's own doc comment. Pure so both
+ * `init()`'s initial fetch and `listenToOutputDevicesChanged`'s ongoing pushes can share it. */
+function mergeKnownDeviceNames(
+  known: Record<string, string>,
+  devices: OutputDevice[],
+): Record<string, string> {
+  const merged = { ...known };
+  for (const device of devices) {
+    merged[device.id] = device.name;
+  }
+  return merged;
+}
+
 export const useMixerStore = create<MixerState>((set, get) => ({
   sessions: [],
   isLoaded: false,
   isInitialized: false,
   needsPermission: false,
   maxVolumePercent: 100,
+  outputRoutingSupported: false,
+  outputDevices: [],
+  knownDeviceNames: {},
   draggingSessionId: null,
   draggingGeneration: 0,
 
@@ -270,6 +316,36 @@ export const useMixerStore = create<MixerState>((set, get) => ({
       .then((maxVolumePercent) => set({ maxVolumePercent }))
       .catch((error) => {
         console.error("Failed to load max volume percent:", error);
+      });
+
+    outputRoutingSupportedCommand()
+      .then(async (outputRoutingSupported) => {
+        set({ outputRoutingSupported });
+        if (!outputRoutingSupported) {
+          return;
+        }
+        listOutputDevicesCommand()
+          .then((outputDevices) =>
+            set((state) => ({
+              outputDevices,
+              knownDeviceNames: mergeKnownDeviceNames(state.knownDeviceNames, outputDevices),
+            })),
+          )
+          .catch((error) => {
+            console.error("Failed to load output devices:", error);
+          });
+        // Keeps the picker's dropdown options live as devices are plugged/unplugged --
+        // otherwise this list would stay frozen at whatever was connected when the app started
+        // (see `listenToOutputDevicesChanged`'s own doc comment).
+        unlistenOutputDevices = await listenToOutputDevicesChanged((outputDevices) => {
+          set((state) => ({
+            outputDevices,
+            knownDeviceNames: mergeKnownDeviceNames(state.knownDeviceNames, outputDevices),
+          }));
+        });
+      })
+      .catch((error) => {
+        console.error("Failed to check output routing support:", error);
       });
 
     const stopListening = await listenToSessionsChanged((pushed) => {
@@ -404,6 +480,19 @@ export const useMixerStore = create<MixerState>((set, get) => ({
       });
   },
 
+  setSessionOutputDevice: (sessionId, deviceId) => {
+    set((state) => ({
+      sessions: state.sessions.map((session) =>
+        session.id === sessionId ? { ...session, outputDeviceId: deviceId } : session,
+      ),
+    }));
+    protectFromStaleEcho(sessionId, get);
+
+    setSessionOutputDeviceCommand(sessionId, deviceId).catch((error) => {
+      console.error(`Failed to set output device for ${sessionId}:`, error);
+    });
+  },
+
   setDraggingSessionId: (sessionId) => {
     if (sessionId !== null) {
       set((state) => ({
@@ -443,6 +532,8 @@ export const useMixerStore = create<MixerState>((set, get) => ({
 export const __teardownMixerStoreListener = () => {
   unlisten?.();
   unlisten = null;
+  unlistenOutputDevices?.();
+  unlistenOutputDevices = null;
 };
 
 // Exposed for tests only, same reasoning as `__teardownMixerStoreListener` -- `writeGenerations`

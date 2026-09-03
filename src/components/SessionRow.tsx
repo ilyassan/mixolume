@@ -5,8 +5,10 @@ import { Button } from "@/components/ui/button";
 import { SessionIcon } from "@/components/SessionIcon";
 import { VolumeSlider } from "@/components/VolumeSlider";
 import { BalanceSliders } from "@/components/BalanceSliders";
+import { OutputDevicePicker } from "@/components/OutputDevicePicker";
 import { useMixerStore } from "@/stores/mixer-store";
 import type { FadingSession } from "@/hooks/useSessionListWithFadeOut";
+import type { OutputDevice } from "@/lib/tauri";
 
 interface SessionRowProps {
   session: FadingSession;
@@ -17,6 +19,15 @@ interface SessionRowProps {
    * backend. Sizes the main volume slider's `max`; the L/R balance sliders stay 0-100 always,
    * since balance is a pan ratio, not itself boostable. */
   maxVolumePercent: number;
+  /** Whether the current backend can route this session's audio to a specific output device --
+   * currently Windows only. `outputDevices`/`onOutputDeviceChange` are only ever used when this
+   * is true. */
+  outputRoutingSupported: boolean;
+  outputDevices: OutputDevice[];
+  /** Every output device id -> name ever seen, including ones no longer plugged in -- lets the
+   * picker label a since-unplugged device by name instead of a bare "Unknown device". */
+  knownDeviceNames: Record<string, string>;
+  onOutputDeviceChange: (sessionId: string, deviceId: string | null) => void;
 }
 
 // Memoized: `useSessionListWithFadeOut` now reuses the same `session` object reference for a
@@ -33,6 +44,10 @@ export const SessionRow = memo(function SessionRow({
   onMuteToggle,
   onBalanceChange,
   maxVolumePercent,
+  outputRoutingSupported,
+  outputDevices,
+  knownDeviceNames,
+  onOutputDeviceChange,
 }: SessionRowProps) {
   const {
     id,
@@ -44,6 +59,7 @@ export const SessionRow = memo(function SessionRow({
     isActive,
     isDuckTrigger,
     isDucked,
+    outputDeviceId,
     removing,
   } = session;
   // What's actually coming out right now, not the target -- a ducked app should visibly read
@@ -53,10 +69,11 @@ export const SessionRow = memo(function SessionRow({
   // `value`, which combined with the Slider's own step to make dragging visibly hop between
   // whole percents instead of gliding with the pointer, confirmed live.
   const percent = effectiveVolume * 100;
-  // Advanced panel (balance, and room for whatever gets added later) stays collapsed by
-  // default -- opened automatically only if a row already has a non-center balance (e.g. after
-  // a relaunch), so returning users don't lose sight of a setting they already made.
-  const [expanded, setExpanded] = useState(balance !== 0);
+  // Advanced panel (balance, output device routing) stays collapsed by default -- opened
+  // automatically only if a row already has a non-center balance or a non-default output device
+  // set (e.g. after a relaunch), so returning users don't lose sight of a setting they already
+  // made.
+  const [expanded, setExpanded] = useState(balance !== 0 || outputDeviceId !== null);
   // Whether *any* row (not necessarily this one) is currently being drag-adjusted -- see
   // `layout` below for why this row needs to know about every other row's drag state, not just
   // its own.
@@ -241,6 +258,17 @@ export const SessionRow = memo(function SessionRow({
               onBalanceChange={onBalanceChange}
               onUnmute={() => onMuteToggle(id, false)}
             />
+            {outputRoutingSupported && (
+              <OutputDevicePicker
+                sessionId={id}
+                displayName={displayName}
+                outputDeviceId={outputDeviceId}
+                devices={outputDevices}
+                knownDeviceNames={knownDeviceNames}
+                disabled={removing}
+                onChange={onOutputDeviceChange}
+              />
+            )}
           </motion.div>
         )}
       </AnimatePresence>

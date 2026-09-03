@@ -74,6 +74,7 @@ mod tests {
             is_duck_trigger: false,
             is_ducked: false,
             write_generation: 0,
+            output_device_id: None,
         }
     }
 

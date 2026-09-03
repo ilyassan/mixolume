@@ -307,6 +307,9 @@ fn parse_block(id: &str, lines: &[&str]) -> AppSession {
         is_ducked: false,
         // Backfilled by `list_sessions` from `self.generations` -- see that call site's comment.
         write_generation: 0,
+        // Output routing isn't implemented on Linux yet -- see `mod.rs`'s
+        // `AudioMixerBackend::output_routing_supported` default.
+        output_device_id: None,
     }
 }
 

@@ -23,6 +23,10 @@ function App() {
   const setMuted = useMixerStore((state) => state.setMuted);
   const setBalance = useMixerStore((state) => state.setBalance);
   const maxVolumePercent = useMixerStore((state) => state.maxVolumePercent);
+  const outputRoutingSupported = useMixerStore((state) => state.outputRoutingSupported);
+  const outputDevices = useMixerStore((state) => state.outputDevices);
+  const knownDeviceNames = useMixerStore((state) => state.knownDeviceNames);
+  const setSessionOutputDevice = useMixerStore((state) => state.setSessionOutputDevice);
 
   const [inactiveExpanded, setInactiveExpanded] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -121,6 +125,10 @@ function App() {
                   onMuteToggle={setMuted}
                   onBalanceChange={setBalance}
                   maxVolumePercent={maxVolumePercent}
+                  outputRoutingSupported={outputRoutingSupported}
+                  outputDevices={outputDevices}
+                  knownDeviceNames={knownDeviceNames}
+                  onOutputDeviceChange={setSessionOutputDevice}
                 />
               ))}
             </AnimatePresence>
@@ -163,6 +171,10 @@ function App() {
                             onMuteToggle={setMuted}
                             onBalanceChange={setBalance}
                             maxVolumePercent={maxVolumePercent}
+                            outputRoutingSupported={outputRoutingSupported}
+                            outputDevices={outputDevices}
+                            knownDeviceNames={knownDeviceNames}
+                            onOutputDeviceChange={setSessionOutputDevice}
                           />
                         ))}
                       </AnimatePresence>

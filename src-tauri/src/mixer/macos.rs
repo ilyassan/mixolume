@@ -2293,6 +2293,9 @@ impl AudioMixerBackend for MacosMixerBackend {
                 is_duck_trigger,
                 is_ducked,
                 write_generation: generation,
+                // Output routing isn't implemented on macOS yet -- see `mod.rs`'s
+                // `AudioMixerBackend::output_routing_supported` default.
+                output_device_id: None,
             });
         }
         // Drop cache entries for pids that no longer exist -- keeps this bounded over a long
