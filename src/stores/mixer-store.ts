@@ -14,6 +14,10 @@ import {
   outputRoutingSupported as outputRoutingSupportedCommand,
   listOutputDevices as listOutputDevicesCommand,
   setSessionOutputDevice as setSessionOutputDeviceCommand,
+  duckingSupported as duckingSupportedCommand,
+  getDuckingSettings as getDuckingSettingsCommand,
+  setDuckingEnabled as setDuckingEnabledCommand,
+  setDuckTriggerPriority as setDuckTriggerPriorityCommand,
 } from "@/lib/tauri";
 
 function iconPngEqual(a: number[] | null, b: number[] | null): boolean {
@@ -159,14 +163,26 @@ interface MixerState {
    * why this is worth fetching unconditionally rather than gating it behind a check that itself
    * needs a round trip first. */
   outputDevices: OutputDevice[];
-  /**
-   * Every device id -> name pair ever seen in `outputDevices`, accumulated and never pruned --
-   * unlike `outputDevices` itself, which only ever lists what's *currently* plugged in. Lets
-   * `OutputDevicePicker` show a session that's routed to a since-unplugged device by its real
-   * name ("Headphones (disconnected)") instead of a bare, unexplained "Unknown device" the
-   * moment it drops out of the live list.
-   */
-  knownDeviceNames: Record<string, string>;
+  /** Whether auto-duck is implemented at all on this backend -- macOS and Windows, not Linux
+   * (see `duckingSupported` in `tauri.ts`). Defaults to `false` until `init()`'s fetch resolves,
+   * matching `outputRoutingSupported`'s own reasoning. */
+  duckingSupported: boolean;
+  /** True once the initial ducking-settings fetch has settled (success or failure) -- lets
+   * `SettingsView` tell "still loading" apart from "loaded, and there's genuinely nothing
+   * configured yet" without needing its own separate fetch. Fetched here, at `init()` time (i.e.
+   * essentially at app launch), rather than lazily when Settings is first opened, specifically so
+   * that by the time a user can actually click into Settings, this has almost always already
+   * resolved -- see the fix this replaced for the details of the visible stutter that came from
+   * only starting this fetch after `SettingsView` itself mounted (which itself only happens after
+   * the page-transition's own exit animation completes), a full serial chain of delays for
+   * something that has nothing to do with which page is currently showing. */
+  duckingSettingsLoaded: boolean;
+  duckingEnabled: boolean;
+  priorityTriggers: string[];
+  /** PNG icon bytes for each name in `priorityTriggers`, keyed the same way -- see the Rust
+   * `DuckingSettings::priority_trigger_icons` doc comment for why this exists (keeps a real icon
+   * showing in Settings even for an app that's quit or never made a sound this run). */
+  priorityTriggerIcons: Record<string, number[]>;
   /**
    * The session id a slider is actively being pointer-dragged for right now, if any -- see
    * `setDraggingSessionId`'s comment for why this exists.
@@ -195,6 +211,12 @@ interface MixerState {
   /** Optimistically routes a session to `deviceId` (or back to the system default when `null`)
    * locally and asks the backend to apply it. Only meaningful when `outputRoutingSupported`. */
   setSessionOutputDevice: (sessionId: string, deviceId: string | null) => void;
+  /** Optimistically toggles auto-duck locally and asks the backend to apply it, reverting on
+   * failure. */
+  setDuckingEnabled: (enabled: boolean) => void;
+  /** Optimistically adds (`isPriority: true`) or removes (`false`) `displayName` from
+   * `priorityTriggers` locally and asks the backend to apply it, reverting on failure. */
+  setDuckTriggerPriority: (displayName: string, isPriority: boolean) => void;
   /**
    * Called by `useDraggingSessionFreeze` (used from both `VolumeSlider` and `BalanceSliders`)
    * around a drag gesture, plus a short grace period after it ends -- see that hook's own doc
@@ -281,19 +303,6 @@ let unlistenOutputDevices: (() => void) | null = null;
  */
 let pendingSessionsDuringDrag: AppSession[] | null = null;
 
-/** Folds `devices` into `knownDeviceNames` -- see that field's own doc comment. Pure so both
- * `init()`'s initial fetch and `listenToOutputDevicesChanged`'s ongoing pushes can share it. */
-function mergeKnownDeviceNames(
-  known: Record<string, string>,
-  devices: OutputDevice[],
-): Record<string, string> {
-  const merged = { ...known };
-  for (const device of devices) {
-    merged[device.id] = device.name;
-  }
-  return merged;
-}
-
 export const useMixerStore = create<MixerState>((set, get) => ({
   sessions: [],
   isLoaded: false,
@@ -302,7 +311,11 @@ export const useMixerStore = create<MixerState>((set, get) => ({
   maxVolumePercent: 100,
   outputRoutingSupported: false,
   outputDevices: [],
-  knownDeviceNames: {},
+  duckingSupported: false,
+  duckingSettingsLoaded: false,
+  duckingEnabled: false,
+  priorityTriggers: [],
+  priorityTriggerIcons: {},
   draggingSessionId: null,
   draggingGeneration: 0,
 
@@ -325,12 +338,7 @@ export const useMixerStore = create<MixerState>((set, get) => ({
           return;
         }
         listOutputDevicesCommand()
-          .then((outputDevices) =>
-            set((state) => ({
-              outputDevices,
-              knownDeviceNames: mergeKnownDeviceNames(state.knownDeviceNames, outputDevices),
-            })),
-          )
+          .then((outputDevices) => set({ outputDevices }))
           .catch((error) => {
             console.error("Failed to load output devices:", error);
           });
@@ -338,14 +346,37 @@ export const useMixerStore = create<MixerState>((set, get) => ({
         // otherwise this list would stay frozen at whatever was connected when the app started
         // (see `listenToOutputDevicesChanged`'s own doc comment).
         unlistenOutputDevices = await listenToOutputDevicesChanged((outputDevices) => {
-          set((state) => ({
-            outputDevices,
-            knownDeviceNames: mergeKnownDeviceNames(state.knownDeviceNames, outputDevices),
-          }));
+          set({ outputDevices });
         });
       })
       .catch((error) => {
         console.error("Failed to check output routing support:", error);
+      });
+
+    duckingSupportedCommand()
+      .then((duckingSupported) => {
+        set({ duckingSupported });
+        if (!duckingSupported) {
+          set({ duckingSettingsLoaded: true });
+          return;
+        }
+        getDuckingSettingsCommand()
+          .then((settings) => {
+            set({
+              duckingEnabled: settings.enabled,
+              priorityTriggers: settings.priorityTriggers,
+              priorityTriggerIcons: settings.priorityTriggerIcons,
+              duckingSettingsLoaded: true,
+            });
+          })
+          .catch((error) => {
+            console.error("Failed to load ducking settings:", error);
+            set({ duckingSettingsLoaded: true });
+          });
+      })
+      .catch((error) => {
+        console.error("Failed to check ducking support:", error);
+        set({ duckingSettingsLoaded: true });
       });
 
     const stopListening = await listenToSessionsChanged((pushed) => {
@@ -490,6 +521,28 @@ export const useMixerStore = create<MixerState>((set, get) => ({
 
     setSessionOutputDeviceCommand(sessionId, deviceId).catch((error) => {
       console.error(`Failed to set output device for ${sessionId}:`, error);
+    });
+  },
+
+  setDuckingEnabled: (enabled) => {
+    const previous = get().duckingEnabled;
+    set({ duckingEnabled: enabled });
+    setDuckingEnabledCommand(enabled).catch((error) => {
+      console.error("Failed to update auto-duck:", error);
+      set({ duckingEnabled: previous });
+    });
+  },
+
+  setDuckTriggerPriority: (displayName, isPriority) => {
+    const previous = get().priorityTriggers;
+    set({
+      priorityTriggers: isPriority
+        ? [...previous, displayName]
+        : previous.filter((name) => name !== displayName),
+    });
+    setDuckTriggerPriorityCommand(displayName, isPriority).catch((error) => {
+      console.error("Failed to update auto-duck trigger:", error);
+      set({ priorityTriggers: previous });
     });
   },
 

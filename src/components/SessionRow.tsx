@@ -20,13 +20,10 @@ interface SessionRowProps {
    * since balance is a pan ratio, not itself boostable. */
   maxVolumePercent: number;
   /** Whether the current backend can route this session's audio to a specific output device --
-   * currently Windows only. `outputDevices`/`onOutputDeviceChange` are only ever used when this
-   * is true. */
+   * macOS and Windows. `outputDevices`/`onOutputDeviceChange` are only ever used when this is
+   * true. */
   outputRoutingSupported: boolean;
   outputDevices: OutputDevice[];
-  /** Every output device id -> name ever seen, including ones no longer plugged in -- lets the
-   * picker label a since-unplugged device by name instead of a bare "Unknown device". */
-  knownDeviceNames: Record<string, string>;
   onOutputDeviceChange: (sessionId: string, deviceId: string | null) => void;
 }
 
@@ -46,7 +43,6 @@ export const SessionRow = memo(function SessionRow({
   maxVolumePercent,
   outputRoutingSupported,
   outputDevices,
-  knownDeviceNames,
   onOutputDeviceChange,
 }: SessionRowProps) {
   const {
@@ -264,7 +260,6 @@ export const SessionRow = memo(function SessionRow({
                 displayName={displayName}
                 outputDeviceId={outputDeviceId}
                 devices={outputDevices}
-                knownDeviceNames={knownDeviceNames}
                 disabled={removing}
                 onChange={onOutputDeviceChange}
               />

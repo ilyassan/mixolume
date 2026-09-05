@@ -192,8 +192,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::macos_ducking::{self, DuckingRuntime};
+use super::macos_output_routing;
 use super::{
-    clamp_boosted_volume, AppSession, AudioMixerBackend, DuckingSettings, MixerError,
+    clamp_boosted_volume, AppSession, AudioMixerBackend, DuckingSettings, MixerError, OutputDevice,
     RunningAppInfo,
 };
 
@@ -208,6 +209,13 @@ use super::{
 /// convention (see `mixer/windows.rs`).
 fn session_id_for_pid(pid: i32) -> String {
     format!("macos-{pid}")
+}
+
+/// Inverse of [`session_id_for_pid`] -- recovers the pid a session id was minted for. Needed by
+/// `set_session_output_device` to look up the app's display name (persisted routing is keyed by
+/// name, not session id -- see [`macos_output_routing`]'s doc comment for why).
+fn pid_for_session_id(session_id: &str) -> Option<i32> {
+    session_id.strip_prefix("macos-")?.parse().ok()
 }
 
 /// Per-app volume + mute state, independent of whether the app is currently tapped.
@@ -582,7 +590,7 @@ use objc2_core_audio::{
     CATapMuteBehavior,
 };
 use objc2_core_audio_types::{AudioBufferList, AudioTimeStamp};
-use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString};
+use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSPoint, NSRect, NSSize, NSString};
 
 /// How many parent-process hops [`resolve_named_running_app`] will follow before giving up.
 /// Chromium-family helper processes are typically one hop from the browser's main process; this
@@ -693,11 +701,14 @@ const ICON_MAX_PIXELS_WIDE: NSInteger = 128;
 unsafe fn icon_to_png(icon: &objc2_app_kit::NSImage) -> Option<Vec<u8>> {
     let reps = icon.representations();
 
-    // Prefer whichever bundled bitmap representation is smallest while still >= our target --
-    // no drawing/resizing needed, just picking a differently-sized copy the icon set already
-    // has. Reps below the target are only used as a last resort (so a tiny icon set still
-    // produces *something* rather than nothing), and the full TIFF/master representation is
-    // the final fallback for icons with no bitmap reps at all (synthesized/vector-only images).
+    // Prefer whichever bundled bitmap representation is smallest while still >= our target, to
+    // avoid drawing/resizing when the icon set already has a copy close to the size we want.
+    // Reps below the target are only used as a last resort (so a tiny icon set still produces
+    // *something* rather than nothing), and the full TIFF/master representation is the final
+    // fallback for icons with no bitmap reps at all (synthesized/vector-only images). Some icon
+    // sets (confirmed live: WhatsApp's) have nothing between a small rep and a 1024x1024 master,
+    // so `best_at_or_above` alone can still land on something far bigger than the target -- see
+    // the resize step below, which catches that case regardless of which branch picked `bitmap`.
     let mut best_at_or_above: Option<(NSInteger, Retained<objc2_app_kit::NSBitmapImageRep>)> = None;
     let mut best_below: Option<(NSInteger, Retained<objc2_app_kit::NSBitmapImageRep>)> = None;
     for rep in reps.iter() {
@@ -730,6 +741,18 @@ unsafe fn icon_to_png(icon: &objc2_app_kit::NSImage) -> Option<Vec<u8>> {
         )?
     };
 
+    // Whatever branch picked `bitmap` above, it may still be wider than our target (the
+    // at-or-above branch has no upper bound of its own, and the TIFF-master fallback is
+    // essentially guaranteed to be). Resizing down here, rather than only selecting among
+    // existing reps, guarantees a bounded, cacheable PNG size regardless of what sizes a given
+    // icon set happens to bundle -- see `MAX_CACHEABLE_ICON_BYTES`'s doc comment for the
+    // confirmed-live case (WhatsApp, 1.35MB uncapped) this closes.
+    let bitmap = if bitmap.pixelsWide() > ICON_MAX_PIXELS_WIDE {
+        resize_bitmap(&bitmap, ICON_MAX_PIXELS_WIDE)?
+    } else {
+        bitmap
+    };
+
     // `CopiedKey = NSString` explicitly: an empty slice gives the compiler nothing to infer it
     // from, and `NSBitmapImageRepPropertyKey` (the dictionary's `KeyType`) is itself `NSString`,
     // so `NSString` is the natural (and only sensible) choice satisfying `NSCopying` here.
@@ -741,6 +764,48 @@ unsafe fn icon_to_png(icon: &objc2_app_kit::NSImage) -> Option<Vec<u8>> {
         &empty_properties,
     )?;
     Some(png_data.to_vec())
+}
+
+/// Draws `bitmap` down into a fresh `target_width` x `target_width` bitmap, via a temporary
+/// in-memory `NSGraphicsContext` -- the standard AppKit way to resample an image, using only
+/// frameworks already linked for `icon_to_png` itself (no new dependency). Only reached for icon
+/// sets with nothing near [`ICON_MAX_PIXELS_WIDE`] already (see call site), so this draws once per
+/// distinct app process ever seen, not per poll tick -- `icon_to_png`'s only caller,
+/// `resolve_app_info`, is itself cached per pid by `Inner::app_info_cache`.
+unsafe fn resize_bitmap(
+    bitmap: &objc2_app_kit::NSBitmapImageRep,
+    target_width: NSInteger,
+) -> Option<Retained<objc2_app_kit::NSBitmapImageRep>> {
+    // SAFETY: a null `planes` pointer is documented as valid -- it tells AppKit to allocate and
+    // own the pixel buffer itself, which is exactly what we want for a throwaway resize target.
+    let target = objc2_app_kit::NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+        objc2_app_kit::NSBitmapImageRep::alloc(),
+        std::ptr::null_mut(),
+        target_width,
+        target_width,
+        8,
+        4,
+        true,
+        false,
+        objc2_app_kit::NSDeviceRGBColorSpace,
+        0,
+        0,
+    )?;
+
+    let context = objc2_app_kit::NSGraphicsContext::graphicsContextWithBitmapImageRep(&target)?;
+    let previous_context = objc2_app_kit::NSGraphicsContext::currentContext();
+    objc2_app_kit::NSGraphicsContext::setCurrentContext(Some(&context));
+    let size = NSSize {
+        width: target_width as f64,
+        height: target_width as f64,
+    };
+    bitmap.drawInRect(NSRect {
+        origin: NSPoint { x: 0.0, y: 0.0 },
+        size,
+    });
+    objc2_app_kit::NSGraphicsContext::setCurrentContext(previous_context.as_deref());
+
+    Some(target)
 }
 
 /// Every currently-running "regular" (dock-visible) app, by name -- used only to check which
@@ -884,6 +949,77 @@ unsafe fn read_property_array<T: Copy + Default>(
     );
     check_status(status, "AudioObjectGetPropertyData (array)")?;
     Ok(values)
+}
+
+/// Like [`global_address`] but for a property that only exists in a specific scope (e.g.
+/// `kAudioObjectPropertyScopeOutput`) rather than the global one every other read in this file
+/// uses. Kept as its own function instead of adding a `scope` parameter to `global_address`
+/// itself -- that function is called broadly elsewhere in this file on the (so far always true)
+/// assumption that global scope is correct, and giving it a parameter would force every existing
+/// call site to specify one for no benefit.
+fn scoped_address(selector: u32, scope: u32) -> AudioObjectPropertyAddress {
+    AudioObjectPropertyAddress {
+        mSelector: selector,
+        mScope: scope,
+        mElement: ca::kAudioObjectPropertyElementMain,
+    }
+}
+
+/// Same as [`read_property_array`], but reads a scope-specific property instead of a global one
+/// -- needed for [`has_output_stream`], which must ask "does this device have any *output*
+/// streams" specifically, not just "any streams at all" (a device's global stream list mixes
+/// input and output streams together).
+///
+/// # Safety
+/// Same contract as [`read_property_array`].
+unsafe fn read_property_array_scoped<T: Copy + Default>(
+    object_id: AudioObjectID,
+    selector: u32,
+    scope: u32,
+) -> Result<Vec<T>, MixerError> {
+    let mut address = scoped_address(selector, scope);
+    let mut size: u32 = 0;
+    let status = ca::AudioObjectGetPropertyDataSize(
+        object_id,
+        std::ptr::NonNull::from(&mut address),
+        0,
+        std::ptr::null(),
+        std::ptr::NonNull::from(&mut size),
+    );
+    check_status(status, "AudioObjectGetPropertyDataSize (scoped)")?;
+
+    let count = size as usize / std::mem::size_of::<T>();
+    let mut values: Vec<T> = vec![T::default(); count];
+    let mut actual_size = size;
+    let status = ca::AudioObjectGetPropertyData(
+        object_id,
+        std::ptr::NonNull::from(&mut address),
+        0,
+        std::ptr::null(),
+        std::ptr::NonNull::from(&mut actual_size),
+        std::ptr::NonNull::new(values.as_mut_ptr() as *mut _)
+            .ok_or_else(|| MixerError::Platform("null output buffer".to_string()))?,
+    );
+    check_status(status, "AudioObjectGetPropertyData (scoped array)")?;
+    Ok(values)
+}
+
+/// Whether `device_id` has at least one *output* stream -- the filter [`list_output_devices_native`]
+/// uses to exclude input-only devices (microphones, etc.) from the picker. `kAudioDevicePropertyStreams`
+/// scoped to `kAudioObjectPropertyScopeOutput` returns only that device's output-side streams (an
+/// input-only device reports zero here, even though its *global*-scoped stream list is non-empty).
+fn has_output_stream(device_id: AudioObjectID) -> bool {
+    // Element type doesn't matter beyond its size -- `AudioStreamID` is itself just an
+    // `AudioObjectID` (u32) in this crate, matching Core Audio's own C typedef.
+    unsafe {
+        read_property_array_scoped::<AudioObjectID>(
+            device_id,
+            ca::kAudioDevicePropertyStreams,
+            ca::kAudioObjectPropertyScopeOutput,
+        )
+    }
+    .map(|streams| !streams.is_empty())
+    .unwrap_or(false)
 }
 
 /// One audio process as reported by the HAL, translated into plain Rust data. Mirrors sonicflow's
@@ -1473,6 +1609,20 @@ where
     value
 }
 
+/// UID prefix every private capture aggregate this backend creates is stamped with (see
+/// [`build_aggregate_description`]) -- [`list_output_devices_native`] filters on this to exclude
+/// MiXolume's own aggregates from the output-device picker. `kAudioAggregateDeviceIsPrivateKey`
+/// only hides a device from *other processes'* enumeration, not from the process that created it
+/// (confirmed live: without this filter, "MiXolume Capture" showed up as a selectable output
+/// device in MiXolume's own picker) -- so this can't rely on Core Audio to do the filtering.
+const OWN_AGGREGATE_UID_PREFIX: &str = "com.mixolume.aggregate.";
+
+/// Pure predicate behind [`OWN_AGGREGATE_UID_PREFIX`]'s filtering, pulled out so it's
+/// unit-testable without a live Core Audio device UID.
+fn is_own_aggregate_uid(uid: &str) -> bool {
+    uid.starts_with(OWN_AGGREGATE_UID_PREFIX)
+}
+
 /// Build the `kAudioAggregateDeviceUIDKey`/etc. description dictionary Core Audio expects for
 /// `AudioHardwareCreateAggregateDevice`. See risk item 3 in the module doc comment.
 ///
@@ -1497,7 +1647,7 @@ fn build_aggregate_description(
 > {
     use objc2_core_foundation::{CFArray, CFBoolean, CFDictionary, CFRetained, CFString, CFType};
 
-    let aggregate_uid = CFString::from_str(&format!("com.mixolume.aggregate.{}", uuid_v4_ish()));
+    let aggregate_uid = CFString::from_str(&format!("{OWN_AGGREGATE_UID_PREFIX}{}", uuid_v4_ish()));
     let aggregate_name = CFString::from_str("MiXolume Capture");
     let output_uid_cf = CFString::from_str(output_device_uid);
 
@@ -1647,10 +1797,18 @@ mod screen_capture_permission {
     }
 }
 
-/// The live tap+aggregate+playback rig for whatever set of processes is currently producing
-/// output. Torn down and rebuilt (via `Drop`, then a fresh [`TapEngine::new`]) whenever that set
-/// changes -- Core Audio has no documented way to add/remove a tap from a running aggregate
-/// device, matching both reference repos' own architecture.
+/// One session's connection to the current rebuild's process/gain/routing snapshot: the process
+/// itself, its session id, its initial (left, right) gain, and its explicit output-routing target
+/// UID (`None` = follow system default). Named so [`TapEngine::new`]'s signature and
+/// `reconcile_engine`'s owned/borrowed variants of it don't repeat this shape inline -- same
+/// reasoning as [`IoProcFn`] above (clippy's `type_complexity` lint flags the inline version).
+type ActiveSession<Process> = (Process, String, (f32, f32), Option<String>);
+
+/// One destination device's worth of the tap+aggregate+playback rig -- everything
+/// [`TapEngine`] used to hold a single instance of, before per-app output routing meant a session
+/// set could span more than one destination device at once. Every currently-active session
+/// belongs to exactly one `TapGroup` (the one for its resolved output device, or the group for
+/// the system default if it has no explicit routing / its chosen device is no longer present).
 ///
 /// Field order matters here: a struct with no custom `Drop` impl drops its fields in declaration
 /// order, and `taps` is declared *last* on purpose. `ProcessTap::drop` un-mutes the tapped
@@ -1659,9 +1817,21 @@ mod screen_capture_permission {
 /// unmutes means teardown is a clean stop-then-resume instead of a brief double-audio overlap
 /// (the mixed pipeline's tail still flowing to the speakers at the same moment the native path
 /// wakes back up).
-struct TapEngine {
-    /// session_id -> index into `taps`/`gain_slots`, in tap-creation order.
+struct TapGroup {
+    /// The destination device this group's `capture`/`playback` are actually built against --
+    /// lets [`TapEngine::reconcile`] match a group against its predecessor across rebuilds by
+    /// *device*, independent of `groups`' own `Vec` position (which can shift between rebuilds as
+    /// destination devices come and go).
+    target_device_id: AudioObjectID,
+    /// session_id -> index into `taps`/`gain_slots`, in tap-creation order, *local to this group*
+    /// -- see [`TapEngine::slot_of`] for the engine-wide lookup this backs.
     slot_of: HashMap<String, usize>,
+    /// Per-member duck-trigger exclusion flag this group's [`DuckingRuntime`] was actually built
+    /// with -- compared against a freshly-recomputed version in [`TapEngine::reconcile`] to
+    /// decide whether a member's exclusion status has changed since, the same reason
+    /// `Inner::installed_duck_excluded` exists at the whole-engine level, just scoped to this one
+    /// group's own members.
+    installed_excluded: HashMap<String, bool>,
     gain_slots: Arc<Vec<AtomicGainSlot>>,
     #[allow(dead_code)]
     capture: CaptureAggregate,
@@ -1671,47 +1841,97 @@ struct TapEngine {
     taps: Vec<ProcessTap>,
 }
 
+/// The live tap+aggregate+playback rig for whatever set of processes is currently producing
+/// output, split into one [`TapGroup`] per destination output device actually in use.
+///
+/// Rebuilding is **incremental**, at the granularity of one group, not the whole engine --
+/// [`TapEngine::reconcile`] reuses any group whose target device and exact member set (and their
+/// duck-exclusion flags) are unchanged from the previous engine, completely untouched: no
+/// teardown, no audio interruption. Only a group that actually changed (or a device with no prior
+/// group at all) is torn down and rebuilt. This matters specifically because, before this existed,
+/// a change confined to *one* group (e.g. an unrelated app on the system default device starting
+/// to talk, which can change the tapped-session set) forced *every* group to be torn down and
+/// rebuilt, including ones whose own membership never changed at all -- confirmed live as the
+/// cause of an audible glitch: a session routed to a stable, non-default device (e.g. headphones)
+/// briefly played through the *system default* device instead, during the gap between its own tap
+/// being destroyed (which un-mutes its native output path immediately, per `ProcessTap::drop`) and
+/// the freshly-rebuilt tap re-establishing the mute.
+///
+/// Auto-duck is deliberately **not** shared across groups in this version: each `TapGroup` gets
+/// its own independent [`DuckingRuntime`], unaware of any other group's tapped sessions. An app
+/// routed to one output device will not duck (or be ducked by) an app routed to a different one --
+/// a known, deliberate v1 limitation (see the output-routing plan this shipped from), not an
+/// oversight. Reusing [`macos_ducking::HysteresisCounters`]'s existing safe-cross-thread-read
+/// primitive to share trigger state across groups is the scoped fast-follow if that turns out to
+/// matter in practice; sharing one `DuckingRuntime` instance across groups' *independent* realtime
+/// callbacks outright would violate its documented single-owning-callback safety contract.
+struct TapEngine {
+    groups: Vec<TapGroup>,
+    /// session_id -> (which `groups` entry, index into that group's `taps`/`gain_slots`).
+    slot_of: HashMap<String, (usize, usize)>,
+}
+
+/// Groups indices into `targets` by their target device id, preserving first-seen order (both
+/// which device is encountered first, and which index within that device's group comes first).
+/// Pure, no Core Audio calls -- the one piece of the output-routing engine split that's
+/// unit-testable without live hardware; everything around it needs a real `AudioObjectID`/HAL
+/// call to exercise.
+fn partition_by_target(targets: &[AudioObjectID]) -> Vec<(AudioObjectID, Vec<usize>)> {
+    let mut order: Vec<AudioObjectID> = Vec::new();
+    let mut members: HashMap<AudioObjectID, Vec<usize>> = HashMap::new();
+    for (index, &target) in targets.iter().enumerate() {
+        members.entry(target).or_insert_with(|| {
+            order.push(target);
+            Vec::new()
+        });
+        members.get_mut(&target).unwrap().push(index);
+    }
+    order
+        .into_iter()
+        .map(|target| (target, members.remove(&target).unwrap_or_default()))
+        .collect()
+}
+
 impl TapEngine {
-    fn new(
-        active: &[(&AudioProcessInfo, String, (f32, f32))], // (process, session_id, initial (left, right) gain)
+    /// Builds one destination device's `TapGroup` from scratch -- real Core Audio HAL work
+    /// (tap creation, aggregate-device creation, both IOProc installs). Used by
+    /// [`TapEngine::reconcile`] for any group it decides can't be reused as-is.
+    fn build_group(
+        device_id: AudioObjectID,
+        member_indices: &[usize],
+        active: &[ActiveSession<&AudioProcessInfo>],
+        ducking_excluded_flags: &[bool],
+        ducking_persisted_states: &[macos_ducking::PersistedDuckState],
         ducking_enabled_live: Arc<AtomicBool>,
-        ducking_excluded_flags: Vec<bool>,
-        ducking_persisted_states: Vec<macos_ducking::PersistedDuckState>,
-    ) -> Result<Self, MixerError> {
-        if !screen_capture_permission::ensure_granted() {
-            return Err(MixerError::Platform(
-                "waiting for screen & system audio recording permission".to_string(),
-            ));
-        }
+    ) -> Result<TapGroup, MixerError> {
+        let output_uid = read_device_uid(device_id)?;
 
-        let system_object: AudioObjectID = ca::kAudioObjectSystemObject as AudioObjectID;
-        let output_device_id: AudioObjectID =
-            unsafe { read_property(system_object, ca::kAudioHardwarePropertyDefaultOutputDevice)? };
-        let output_uid = read_device_uid(output_device_id)?;
-
-        let mut taps = Vec::with_capacity(active.len());
-        let mut slot_of = HashMap::with_capacity(active.len());
-        let mut initial_gains = Vec::with_capacity(active.len());
-        for (index, (process, session_id, gain)) in active.iter().enumerate() {
+        let mut taps = Vec::with_capacity(member_indices.len());
+        let mut local_slot_of = HashMap::with_capacity(member_indices.len());
+        let mut installed_excluded = HashMap::with_capacity(member_indices.len());
+        let mut initial_gains = Vec::with_capacity(member_indices.len());
+        let mut local_excluded = Vec::with_capacity(member_indices.len());
+        let mut local_persisted = Vec::with_capacity(member_indices.len());
+        for (local_index, &global_index) in member_indices.iter().enumerate() {
+            let (process, session_id, gain, _) = &active[global_index];
             let tap = ProcessTap::new(process.object_id, session_id)?;
-            slot_of.insert(session_id.clone(), index);
+            local_slot_of.insert(session_id.clone(), local_index);
+            installed_excluded.insert(session_id.clone(), ducking_excluded_flags[global_index]);
             initial_gains.push(*gain);
+            local_excluded.push(ducking_excluded_flags[global_index]);
+            local_persisted.push(ducking_persisted_states[global_index]);
             taps.push(tap);
-        }
-        if taps.is_empty() {
-            return Err(MixerError::Platform(
-                "TapEngine::new called with no active processes".to_string(),
-            ));
         }
 
         let gain_slots: Arc<Vec<AtomicGainSlot>> =
             Arc::new(initial_gains.into_iter().map(AtomicGainSlot::new).collect());
-
         let ring = Arc::new(FloatRingBuffer::new(8192));
+        // Own, independent `DuckingRuntime` per group -- see `TapEngine`'s doc comment for why
+        // this doesn't (yet) duck across groups.
         let duck = Arc::new(DuckingRuntime::new(
             ducking_enabled_live,
-            ducking_excluded_flags,
-            ducking_persisted_states,
+            local_excluded,
+            local_persisted,
         ));
 
         let mut capture = CaptureAggregate::new(
@@ -1723,16 +1943,139 @@ impl TapEngine {
         )?;
         capture.start()?;
 
-        let mut playback = PlaybackTap::new(output_device_id);
+        let mut playback = PlaybackTap::new(device_id);
         playback.start(ring)?;
 
-        Ok(Self {
-            slot_of,
-            taps,
+        Ok(TapGroup {
+            target_device_id: device_id,
+            slot_of: local_slot_of,
+            installed_excluded,
             gain_slots,
             capture,
             playback,
+            taps,
         })
+    }
+
+    /// Incrementally rebuilds against `previous` (if any): a group whose target device, exact
+    /// member set, and every member's duck-exclusion flag are all unchanged from `previous` is
+    /// moved over untouched (no teardown, no audio interruption) -- see this struct's own doc
+    /// comment for why that matters. Everything else about the previous engine's groups (targets
+    /// no longer wanted at all, or ones whose membership/exclusion actually changed) is torn down;
+    /// any group being replaced at the *same* target device is dropped before its replacement is
+    /// built, preserving the existing "never two aggregates on one physical device at once"
+    /// invariant.
+    fn reconcile(
+        previous: Option<TapEngine>,
+        active: &[ActiveSession<&AudioProcessInfo>],
+        ducking_enabled_live: Arc<AtomicBool>,
+        ducking_excluded_flags: Vec<bool>,
+        ducking_persisted_states: Vec<macos_ducking::PersistedDuckState>,
+    ) -> Result<Self, MixerError> {
+        if active.is_empty() {
+            return Err(MixerError::Platform(
+                "TapEngine::reconcile called with no active processes".to_string(),
+            ));
+        }
+        if !screen_capture_permission::ensure_granted() {
+            return Err(MixerError::Platform(
+                "waiting for screen & system audio recording permission".to_string(),
+            ));
+        }
+
+        let system_object: AudioObjectID = ca::kAudioObjectSystemObject as AudioObjectID;
+        let default_device_id: AudioObjectID =
+            unsafe { read_property(system_object, ca::kAudioHardwarePropertyDefaultOutputDevice)? };
+
+        // Resolve each session's target *before* partitioning -- a routing choice pointing at a
+        // since-unplugged device (`resolve_device_by_uid` returning `None`) folds back into the
+        // system-default group rather than getting its own broken one, matching
+        // `AppSession::output_device_id`'s "`None` means follow system default" contract.
+        let targets: Vec<AudioObjectID> = active
+            .iter()
+            .map(|(_, _, _, routed_uid)| {
+                routed_uid
+                    .as_deref()
+                    .and_then(resolve_device_by_uid)
+                    .unwrap_or(default_device_id)
+            })
+            .collect();
+        let fresh_excluded: HashMap<&str, bool> = active
+            .iter()
+            .map(|(_, session_id, _, _)| session_id.as_str())
+            .zip(ducking_excluded_flags.iter().copied())
+            .collect();
+
+        let mut old_groups_by_target: HashMap<AudioObjectID, TapGroup> = previous
+            .map(|engine| {
+                engine
+                    .groups
+                    .into_iter()
+                    .map(|g| (g.target_device_id, g))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut groups: Vec<TapGroup> = Vec::new();
+        let mut slot_of = HashMap::with_capacity(active.len());
+
+        // Sequential, never concurrent -- matches `reconcile_engine`'s existing
+        // single-background-thread-only-does-rebuilds discipline, and avoids untested concurrent
+        // `AudioHardwareCreateAggregateDevice`/autoreleasepool interaction.
+        for (device_id, member_indices) in partition_by_target(&targets) {
+            let desired_members: std::collections::HashSet<&str> = member_indices
+                .iter()
+                .map(|&i| active[i].1.as_str())
+                .collect();
+
+            let candidate = old_groups_by_target.remove(&device_id);
+            let reusable = candidate.as_ref().is_some_and(|old| {
+                let old_members: std::collections::HashSet<&str> =
+                    old.slot_of.keys().map(String::as_str).collect();
+                old_members == desired_members
+                    && desired_members.iter().all(|id| {
+                        fresh_excluded.get(id).copied() == old.installed_excluded.get(*id).copied()
+                    })
+            });
+
+            let group = match candidate {
+                Some(old) if reusable => old,
+                Some(stale) => {
+                    // Explicitly dropped *before* building the replacement at this same target
+                    // device -- not left to whenever `old_groups_by_target` itself falls out of
+                    // scope -- so the old aggregate/playback are fully torn down before a new one
+                    // claims the same physical device.
+                    drop(stale);
+                    Self::build_group(
+                        device_id,
+                        &member_indices,
+                        active,
+                        &ducking_excluded_flags,
+                        &ducking_persisted_states,
+                        Arc::clone(&ducking_enabled_live),
+                    )?
+                }
+                None => Self::build_group(
+                    device_id,
+                    &member_indices,
+                    active,
+                    &ducking_excluded_flags,
+                    &ducking_persisted_states,
+                    Arc::clone(&ducking_enabled_live),
+                )?,
+            };
+
+            let group_index = groups.len();
+            for (session_id, &local_index) in &group.slot_of {
+                slot_of.insert(session_id.clone(), (group_index, local_index));
+            }
+            groups.push(group);
+        }
+        // Any group left in `old_groups_by_target` targets a device nothing wants anymore --
+        // dropped here, tearing it down, since it was never reclaimed into `groups` above.
+        drop(old_groups_by_target);
+
+        Ok(Self { groups, slot_of })
     }
 
     /// Reads back the current ducking hysteresis state for every tapped app, keyed by session
@@ -1742,20 +2085,21 @@ impl TapEngine {
     /// callback might still be running) -- see [`macos_ducking::HysteresisCounters`]'s doc
     /// comment for why that's actually true and not just hoped-for.
     fn snapshot_ducking_state(&self) -> HashMap<String, macos_ducking::PersistedDuckState> {
-        let snapshots = self.capture.duck.snapshot_all();
-        self.slot_of
-            .iter()
-            .filter_map(|(session_id, &index)| {
-                snapshots
-                    .get(index)
-                    .map(|state| (session_id.clone(), *state))
-            })
-            .collect()
+        let mut result = HashMap::new();
+        for group in &self.groups {
+            let snapshots = group.capture.duck.snapshot_all();
+            for (session_id, &index) in &group.slot_of {
+                if let Some(state) = snapshots.get(index) {
+                    result.insert(session_id.clone(), *state);
+                }
+            }
+        }
+        result
     }
 
     fn set_gain(&self, session_id: &str, effective_gains: (f32, f32)) {
-        if let Some(&idx) = self.slot_of.get(session_id) {
-            self.gain_slots[idx].store(effective_gains);
+        if let Some(&(group_index, index)) = self.slot_of.get(session_id) {
+            self.groups[group_index].gain_slots[index].store(effective_gains);
         }
     }
 }
@@ -1784,6 +2128,99 @@ fn read_device_uid(device_id: AudioObjectID) -> Result<String, MixerError> {
         }
         Ok((*raw).to_string())
     }
+}
+
+/// A device's user-facing name (`kAudioObjectPropertyName`), e.g. "MacBook Pro Speakers" or
+/// "AirPods Pro". Same CFString get-rule read shape as [`read_device_uid`]/[`read_process_bundle_id`]
+/// -- `None` on any failure rather than propagating an error, since [`list_output_devices_native`]
+/// should still list a device it otherwise found even if this one read fails for it.
+fn read_device_name(device_id: AudioObjectID) -> Option<String> {
+    // SAFETY: same get-rule CFString bridging as `read_device_uid`, wrapped into an owned
+    // `String` immediately.
+    unsafe {
+        let mut address = global_address(ca::kAudioObjectPropertyName);
+        let mut size = std::mem::size_of::<*const NSString>() as u32;
+        let mut raw: *const NSString = std::ptr::null();
+        let status = ca::AudioObjectGetPropertyData(
+            device_id,
+            std::ptr::NonNull::from(&mut address),
+            0,
+            std::ptr::null(),
+            std::ptr::NonNull::from(&mut size),
+            std::ptr::NonNull::new(&mut raw as *mut _ as *mut _)?,
+        );
+        if status != 0 || raw.is_null() {
+            return None;
+        }
+        let name = (*raw).to_string();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
+    }
+}
+
+/// Enumerate every output-capable device the HAL currently knows about, for
+/// [`AudioMixerBackend::list_output_devices`]. Walks `kAudioHardwarePropertyDevices` (every
+/// device, input and output alike), keeping only the ones [`has_output_stream`] confirms actually
+/// have an output side, skipping any whose UID or name can't be read (an unusable entry the
+/// frontend couldn't route to or label anyway), and excluding MiXolume's own private capture
+/// aggregates by their [`OWN_AGGREGATE_UID_PREFIX`]-stamped UID -- see that constant's doc comment
+/// for why this can't be left to Core Audio's own "private" flag to handle.
+fn list_output_devices_native() -> Result<Vec<OutputDevice>, MixerError> {
+    let system_object: AudioObjectID = ca::kAudioObjectSystemObject as AudioObjectID;
+    let device_ids: Vec<AudioObjectID> =
+        unsafe { read_property_array(system_object, ca::kAudioHardwarePropertyDevices)? };
+
+    Ok(device_ids
+        .into_iter()
+        .filter(|&id| has_output_stream(id))
+        .filter_map(|id| {
+            let uid = read_device_uid(id).ok()?;
+            if is_own_aggregate_uid(&uid) {
+                return None;
+            }
+            let name = read_device_name(id)?;
+            Some(OutputDevice { id: uid, name })
+        })
+        .collect())
+}
+
+/// Reverse of [`read_device_uid`]: resolves a previously-read device UID back to a live
+/// `AudioObjectID`, for a session whose routing target needs to be looked up again on every
+/// engine rebuild (UIDs, not object ids, are what's persisted -- object ids aren't guaranteed
+/// stable across device reconnects). `None` if the device is no longer present (e.g. unplugged
+/// since the user picked it) -- the caller falls back to the system default in that case.
+///
+/// `kAudioHardwarePropertyTranslateUIDToDevice` takes the UID as a qualifier (not as the object
+/// being read), documented and confirmed by every real-world reference use of this property:
+/// the CFStringRef qualifier goes in, an `AudioObjectID` comes back out through the normal
+/// data/size out-parameters, `kAudioObjectUnknown` (0) meaning "no such device".
+fn resolve_device_by_uid(uid: &str) -> Option<AudioObjectID> {
+    use objc2_core_foundation::CFString;
+
+    let system_object: AudioObjectID = ca::kAudioObjectSystemObject as AudioObjectID;
+    let uid_cf = CFString::from_str(uid);
+    let uid_ptr: *const CFString = &*uid_cf;
+
+    let mut device_id: AudioObjectID = ca::kAudioObjectUnknown as AudioObjectID;
+    let mut size = std::mem::size_of::<AudioObjectID>() as u32;
+    let mut address = global_address(ca::kAudioHardwarePropertyTranslateUIDToDevice);
+    let status = unsafe {
+        ca::AudioObjectGetPropertyData(
+            system_object,
+            std::ptr::NonNull::from(&mut address),
+            std::mem::size_of::<*const CFString>() as u32,
+            &uid_ptr as *const _ as *const std::ffi::c_void,
+            std::ptr::NonNull::from(&mut size),
+            std::ptr::NonNull::new(&mut device_id as *mut _ as *mut _)?,
+        )
+    };
+    if status != 0 || device_id == ca::kAudioObjectUnknown as AudioObjectID {
+        return None;
+    }
+    Some(device_id)
 }
 
 // =================================================================================================
@@ -1900,6 +2337,25 @@ struct Inner {
     /// each attempt's silence/audio transition being its own chance for an unrelated rebuild to
     /// stumble into correcting it.
     installed_duck_excluded: HashMap<String, bool>,
+    /// Per-session id, the output device UID baked into the currently-installed `engine`'s
+    /// `TapGroup` split, for sessions that have an explicit routing choice -- set alongside
+    /// `engine` itself, right after a successful rebuild. Same "compare a freshly recomputed
+    /// version against this on every poll tick" pattern as `installed_duck_excluded`, so a
+    /// routing change forces a rebuild even when the tapped session set itself hasn't changed --
+    /// which group a session belongs to is only ever decided at rebuild time.
+    installed_output_routing: HashMap<String, String>,
+    /// Persisted output-routing choices, keyed by app *display name* -- loaded once at startup
+    /// (see [`macos_output_routing::load_settings`]) and updated in place whenever
+    /// `set_session_output_device` resolves a session to a known name. By-name, not by-session-id,
+    /// for the same reason [`DuckingSettings::priority_triggers`] is: a session id embeds the pid,
+    /// which changes every relaunch, so it can't be what a routing choice survives on.
+    output_routing_by_name: HashMap<String, String>,
+    /// Runtime output-routing state, keyed by session id -- what `list_sessions`/the tap engine
+    /// actually read from. Seeded from `output_routing_by_name` the first time a session's display
+    /// name resolves (mirrors how `gain_state.entry(id).or_default()` seeds fresh per-session
+    /// state), then updated directly by `set_session_output_device` from then on. Not persisted
+    /// itself -- `output_routing_by_name` is the durable copy.
+    output_routing_by_session: HashMap<String, String>,
 }
 
 /// macOS backend: per-app volume via Core Audio process taps + a private aggregate device +
@@ -1916,6 +2372,7 @@ impl MacosMixerBackend {
     pub fn new() -> Self {
         let ducking_settings = macos_ducking::load_settings();
         let ducking_enabled_live = Arc::new(AtomicBool::new(ducking_settings.enabled));
+        let output_routing_by_name = macos_output_routing::load_settings().by_app_name;
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 gain_state: HashMap::new(),
@@ -1929,6 +2386,9 @@ impl MacosMixerBackend {
                 rebuild_generation: 0,
                 pending_rebuild_target: None,
                 installed_duck_excluded: HashMap::new(),
+                installed_output_routing: HashMap::new(),
+                output_routing_by_name,
+                output_routing_by_session: HashMap::new(),
             })),
         }
     }
@@ -1945,17 +2405,28 @@ impl MacosMixerBackend {
         // "Active" for tap purposes means reporting so right now, *or* within its hold window --
         // see `Inner::active_hold_until`'s doc comment for why reacting to the raw signal alone
         // would tear down and rebuild the whole engine over transient flicker, not a real change.
+        //
+        // A session with an *explicit* output-routing choice is also kept tapped continuously
+        // for as long as its process stays alive, regardless of how long it's been silent --
+        // tearing it down between, say, songs would mean every resumed playback pays the real,
+        // measured cost of a full rebuild (creating a fresh tap + aggregate device + playback
+        // pipeline) before `CATapMuteBehavior::MutedWhenTapped` silences its native output path
+        // again, during which its audio briefly plays from *whatever the system default output
+        // device is* instead of the device the user actually routed it to -- confirmed live as an
+        // audible, several-hundred-millisecond misroute at the start of playback, not just a
+        // hypothetical latency. Keeping a routed session's tap warm the whole time its process is
+        // running closes that gap entirely for pause/resume; it only reopens on a fresh app
+        // relaunch, since a brand new pid has no routing entry until it's been heard playing at
+        // least once (see `Inner::output_routing_by_session`'s seeding in `list_sessions`).
         let active: Vec<&AudioProcessInfo> = processes
             .iter()
             .filter(|p| {
+                let id = session_id_for_pid(p.pid);
                 is_wanted_for_reconciliation(
                     p.is_running_output,
-                    inner
-                        .active_hold_until
-                        .get(&session_id_for_pid(p.pid))
-                        .copied(),
+                    inner.active_hold_until.get(&id).copied(),
                     now,
-                )
+                ) || inner.output_routing_by_session.contains_key(&id)
             })
             .collect();
 
@@ -1992,6 +2463,19 @@ impl MacosMixerBackend {
             .map(|p| session_id_for_pid(p.pid))
             .zip(excluded_flags.iter().copied())
             .collect();
+        // Same "computed fresh, before the unchanged check, so a rebuild can be forced purely
+        // because this changed" pattern as `fresh_duck_excluded` above -- a session whose output
+        // routing changed needs a rebuild even when the tapped set itself didn't, since which
+        // `TapGroup` a session belongs to is decided entirely at rebuild time.
+        let fresh_output_routing: HashMap<String, String> = wanted
+            .iter()
+            .filter_map(|id| {
+                inner
+                    .output_routing_by_session
+                    .get(id)
+                    .map(|device_id| (id.clone(), device_id.clone()))
+            })
+            .collect();
 
         let tap_set_unchanged = currently_tapped.len() == wanted.len()
             && wanted
@@ -2004,7 +2488,10 @@ impl MacosMixerBackend {
         let exclusion_unchanged = wanted
             .iter()
             .all(|id| inner.installed_duck_excluded.get(id) == fresh_duck_excluded.get(id));
-        let unchanged = tap_set_unchanged && exclusion_unchanged;
+        let routing_unchanged = wanted
+            .iter()
+            .all(|id| inner.installed_output_routing.get(id) == fresh_output_routing.get(id));
+        let unchanged = tap_set_unchanged && exclusion_unchanged && routing_unchanged;
         // At most one rebuild runs at a time, whatever set it's targeting -- see
         // `Inner::pending_rebuild_target`'s doc comment for why the in-flight window otherwise
         // reads as "0 tapped" to every poll tick that lands in it, and re-triggers yet another
@@ -2029,21 +2516,23 @@ impl MacosMixerBackend {
                 .extend(old_engine.snapshot_ducking_state());
         }
 
-        // Detached from `inner` here, torn down further below -- Core Audio aggregate/tap ids
-        // aren't reusable, so the old engine has to be gone before the new one is built, and we
-        // don't want two aggregates fighting over the same real output device even briefly.
+        // Detached from `inner` here -- moved into the background thread below, where
+        // `TapEngine::reconcile` decides, group by group, which of its `TapGroup`s can be reused
+        // untouched (see that function's own doc comment) and which need tearing down and
+        // rebuilding, rather than unconditionally tearing down everything up front.
         let old_engine = inner.engine.take();
 
         if active.is_empty() {
             drop(old_engine);
             inner.installed_duck_excluded.clear();
+            inner.installed_output_routing.clear();
             return Ok(());
         }
 
         // Owned (not borrowed) so this can be handed to the background thread below -- see that
         // thread's own comment for why the actual `TapEngine::new` call must not happen here,
         // still holding this lock.
-        let active_with_state: Vec<(AudioProcessInfo, String, (f32, f32))> = active
+        let active_with_state: Vec<ActiveSession<AudioProcessInfo>> = active
             .iter()
             .map(|p| {
                 let id = session_id_for_pid(p.pid);
@@ -2052,7 +2541,8 @@ impl MacosMixerBackend {
                     .entry(id.clone())
                     .or_default()
                     .effective_gains();
-                ((*p).clone(), id, gains)
+                let routed_uid = inner.output_routing_by_session.get(&id).cloned();
+                ((*p).clone(), id, gains, routed_uid)
             })
             .collect();
 
@@ -2089,15 +2579,17 @@ impl MacosMixerBackend {
         let ducking_enabled_live = Arc::clone(&inner.ducking_enabled_live);
         let inner_arc = Arc::clone(inner_arc);
         std::thread::spawn(move || {
-            // Tearing the outgoing engine down is itself real HAL work -- `AudioDeviceStop`
-            // blocks until the in-flight IOProc callback returns, and destroying the aggregate
-            // device is a round-trip to `coreaudiod` -- so it belongs on this side of the lock
-            // for exactly the same reason the build below does. Still strictly before the build,
-            // which is the ordering the "no two aggregates at once" invariant needs.
-            drop(old_engine);
-            let active_refs: Vec<(&AudioProcessInfo, String, (f32, f32))> = active_with_state
+            // Tearing down a *replaced* group is itself real HAL work -- `AudioDeviceStop` blocks
+            // until the in-flight IOProc callback returns, and destroying an aggregate device is
+            // a round-trip to `coreaudiod` -- which is why this whole reconcile happens off the
+            // lock, same as building a group is. `TapEngine::reconcile` does this per-group,
+            // strictly before building that group's replacement (see its own doc comment) --
+            // groups it reuses untouched incur none of this cost at all.
+            let active_refs: Vec<ActiveSession<&AudioProcessInfo>> = active_with_state
                 .iter()
-                .map(|(process, id, gains)| (process, id.clone(), *gains))
+                .map(|(process, id, gains, routed_uid)| {
+                    (process, id.clone(), *gains, routed_uid.clone())
+                })
                 .collect();
             // A freshly-spawned thread has no autorelease pool of its own, and this path creates
             // real Objective-C temporaries (`CATapDescription`, the `NSString`/`NSArray` it's
@@ -2105,7 +2597,8 @@ impl MacosMixerBackend {
             // see `Inner::app_info_cache`'s doc comment for the confirmed-on-real-hardware leak
             // an unpooled AppKit/Core Audio call path produced.
             let result = objc2::rc::autoreleasepool(|_pool| {
-                TapEngine::new(
+                TapEngine::reconcile(
+                    old_engine,
                     &active_refs,
                     ducking_enabled_live,
                     excluded_flags,
@@ -2135,6 +2628,7 @@ impl MacosMixerBackend {
                     }
                     inner.engine = Some(engine);
                     inner.installed_duck_excluded = fresh_duck_excluded;
+                    inner.installed_output_routing = fresh_output_routing;
                 }
                 Err(err) => {
                     log::warn!("failed to rebuild tap engine: {err}");
@@ -2270,6 +2764,43 @@ impl AudioMixerBackend for MacosMixerBackend {
                     (format!("pid {pid}"), None)
                 }
             };
+            // Seed this session's runtime routing target from whatever was persisted under this
+            // app's name, the first time that name is known -- see `Inner::output_routing_by_session`'s
+            // doc comment. A still-`Pending` name (the `format!("pid {pid}")` placeholder above)
+            // just fails this lookup harmlessly; it retries on a later poll tick once the real
+            // name resolves.
+            if !inner.output_routing_by_session.contains_key(&id) {
+                if let Some(device_id) = inner.output_routing_by_name.get(&display_name).cloned() {
+                    inner
+                        .output_routing_by_session
+                        .insert(id.clone(), device_id);
+                }
+            }
+            let output_device_id = inner.output_routing_by_session.get(&id).cloned();
+            // Cache this app's icon against its duck-trigger entry (if it has one), the first
+            // time a real icon is actually resolved for it -- see `DuckingSettings::
+            // priority_trigger_icons`'s doc comment for why the Settings UI needs this to keep
+            // showing a real icon once the app quits or goes a whole run without making sound.
+            if let Some(icon_bytes) = &icon_png {
+                if icon_bytes.len() <= super::MAX_CACHEABLE_ICON_BYTES
+                    && inner
+                        .ducking_settings
+                        .priority_triggers
+                        .iter()
+                        .any(|name| name == &display_name)
+                    && inner
+                        .ducking_settings
+                        .priority_trigger_icons
+                        .get(&display_name)
+                        != Some(icon_bytes)
+                {
+                    inner
+                        .ducking_settings
+                        .priority_trigger_icons
+                        .insert(display_name.clone(), icon_bytes.clone());
+                    macos_ducking::save_settings(&inner.ducking_settings);
+                }
+            }
             let is_duck_trigger = duck_states.get(&id).is_some_and(|s| s.is_triggering);
             // Ducked by *someone else* -- an app currently triggering never ducks itself,
             // matching the exact same condition `mix_capture_callback`'s mixing pass applies to
@@ -2293,9 +2824,7 @@ impl AudioMixerBackend for MacosMixerBackend {
                 is_duck_trigger,
                 is_ducked,
                 write_generation: generation,
-                // Output routing isn't implemented on macOS yet -- see `mod.rs`'s
-                // `AudioMixerBackend::output_routing_supported` default.
-                output_device_id: None,
+                output_device_id,
             });
         }
         // Drop cache entries for pids that no longer exist -- keeps this bounded over a long
@@ -2325,6 +2854,9 @@ impl AudioMixerBackend for MacosMixerBackend {
             .retain(|id, _| live_session_ids.contains(id));
         inner
             .active_hold_until
+            .retain(|id, _| live_session_ids.contains(id));
+        inner
+            .output_routing_by_session
             .retain(|id, _| live_session_ids.contains(id));
         // `kAudioHardwarePropertyProcessObjectList` (the source of `processes`, and therefore of
         // this order) has no documented ordering guarantee, and nothing upstream imposes one --
@@ -2449,12 +2981,87 @@ impl AudioMixerBackend for MacosMixerBackend {
         is_priority: bool,
     ) -> Result<(), MixerError> {
         let mut inner = self.inner.lock().unwrap();
-        super::toggle_priority_trigger(
-            &mut inner.ducking_settings.priority_triggers,
-            display_name,
-            is_priority,
-        );
+        super::toggle_priority_trigger(&mut inner.ducking_settings, display_name, is_priority);
         macos_ducking::save_settings(&inner.ducking_settings);
+        Ok(())
+    }
+
+    fn output_routing_supported(&self) -> bool {
+        true
+    }
+
+    fn list_output_devices(&self) -> Result<Vec<OutputDevice>, MixerError> {
+        let devices = list_output_devices_native()?;
+        // Piggybacks on this call's own device enumeration (already run every ~2s by
+        // `spawn_output_devices_poll_loop` in `lib.rs`) to also forget any routing choice that
+        // points at a device no longer in the live list -- confirmed live as a real gap: without
+        // this, a session stayed "routed" to a since-unplugged device forever (both in the
+        // running session's own state and in the on-disk settings file), showing a stale,
+        // unselectable option in the picker and never falling back to actually audible output on
+        // the system default. Clearing both maps (not just the runtime one) is deliberate: the
+        // user unplugging a device is treated as abandoning that choice, not a request to
+        // silently resume routing there if the same device UID ever reappears.
+        let live_uids: std::collections::HashSet<&str> =
+            devices.iter().map(|d| d.id.as_str()).collect();
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .output_routing_by_session
+            .retain(|_, device_id| live_uids.contains(device_id.as_str()));
+        let before = inner.output_routing_by_name.len();
+        inner
+            .output_routing_by_name
+            .retain(|_, device_id| live_uids.contains(device_id.as_str()));
+        if inner.output_routing_by_name.len() != before {
+            macos_output_routing::save_settings(&macos_output_routing::OutputRoutingSettings {
+                by_app_name: inner.output_routing_by_name.clone(),
+            });
+        }
+        Ok(devices)
+    }
+
+    fn set_session_output_device(
+        &self,
+        session_id: &str,
+        device_id: Option<&str>,
+    ) -> Result<(), MixerError> {
+        let mut inner = self.inner.lock().unwrap();
+        match device_id {
+            Some(device_id) => {
+                inner
+                    .output_routing_by_session
+                    .insert(session_id.to_string(), device_id.to_string());
+            }
+            None => {
+                inner.output_routing_by_session.remove(session_id);
+            }
+        }
+
+        // Persist under the app's display name, if it's already resolved -- see
+        // `Inner::output_routing_by_name`'s doc comment. A still-`Pending` name is a rare race
+        // (routing an app the moment it first appears, before its name has resolved); the runtime
+        // update above still takes effect for this run, this just skips the durable write for
+        // that one call -- self-heals the next time the user changes this app's routing.
+        if let Some(pid) = pid_for_session_id(session_id) {
+            let name = match inner.app_info_cache.get(&pid) {
+                Some(AppInfoCacheEntry::Resolved(name, _)) => Some(name.clone()),
+                _ => None,
+            };
+            if let Some(name) = name {
+                match device_id {
+                    Some(device_id) => {
+                        inner
+                            .output_routing_by_name
+                            .insert(name, device_id.to_string());
+                    }
+                    None => {
+                        inner.output_routing_by_name.remove(&name);
+                    }
+                }
+                macos_output_routing::save_settings(&macos_output_routing::OutputRoutingSettings {
+                    by_app_name: inner.output_routing_by_name.clone(),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -2487,6 +3094,71 @@ mod tests {
     #[test]
     fn session_id_matches_windows_backend_convention_shape() {
         assert_eq!(session_id_for_pid(1234), "macos-1234");
+    }
+
+    #[test]
+    fn pid_for_session_id_recovers_the_original_pid() {
+        assert_eq!(pid_for_session_id("macos-1234"), Some(1234));
+    }
+
+    #[test]
+    fn pid_for_session_id_rejects_anything_not_shaped_like_a_macos_session_id() {
+        assert_eq!(pid_for_session_id("win-1234"), None);
+        assert_eq!(pid_for_session_id("macos-not-a-number"), None);
+        assert_eq!(pid_for_session_id(""), None);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // partition_by_target -- the output-routing engine split's one unit-testable piece
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn everything_targeting_the_same_device_lands_in_one_group() {
+        let groups = partition_by_target(&[10, 10, 10]);
+        assert_eq!(groups, vec![(10, vec![0, 1, 2])]);
+    }
+
+    #[test]
+    fn different_targets_split_into_separate_groups() {
+        let groups = partition_by_target(&[10, 20, 10, 20]);
+        assert_eq!(groups, vec![(10, vec![0, 2]), (20, vec![1, 3])]);
+    }
+
+    #[test]
+    fn group_order_follows_first_appearance_not_device_id_value() {
+        // Device 99 is seen before device 5 -- groups must come out in that order, not sorted.
+        let groups = partition_by_target(&[99, 5, 99]);
+        assert_eq!(groups, vec![(99, vec![0, 2]), (5, vec![1])]);
+    }
+
+    #[test]
+    fn single_target_produces_a_single_group_with_every_index() {
+        let groups = partition_by_target(&[7, 7, 7, 7]);
+        assert_eq!(groups, vec![(7, vec![0, 1, 2, 3])]);
+    }
+
+    #[test]
+    fn empty_input_produces_no_groups() {
+        assert_eq!(partition_by_target(&[]), Vec::new());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // is_own_aggregate_uid -- excludes MiXolume's own private capture aggregate from the
+    // output-device picker (Core Audio's "private" flag doesn't hide a device from the process
+    // that created it, only from other processes -- confirmed live, not hypothetical).
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn recognizes_a_real_mixolume_aggregate_uid() {
+        assert!(is_own_aggregate_uid("com.mixolume.aggregate.19a2f3c0b1"));
+    }
+
+    #[test]
+    fn does_not_flag_a_real_hardware_device_uid() {
+        assert!(!is_own_aggregate_uid("BuiltInSpeakerDevice"));
+        assert!(!is_own_aggregate_uid(
+            "AppleUSBAudioEngine:Some Vendor:Headset:1234:2"
+        ));
     }
 
     // ---------------------------------------------------------------------------------------

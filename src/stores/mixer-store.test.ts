@@ -9,6 +9,10 @@ const {
   outputRoutingSupported,
   listOutputDevices,
   setSessionOutputDevice,
+  duckingSupported,
+  getDuckingSettings,
+  setDuckingEnabled,
+  setDuckTriggerPriority,
   capturedCallback,
   unlistenMock,
 } = vi.hoisted(() => {
@@ -25,6 +29,15 @@ const {
     outputRoutingSupported: vi.fn().mockResolvedValue(false),
     listOutputDevices: vi.fn().mockResolvedValue([]),
     setSessionOutputDevice: vi.fn(),
+    // Same "defaults to unsupported" reasoning as `outputRoutingSupported` above.
+    duckingSupported: vi.fn().mockResolvedValue(false),
+    getDuckingSettings: vi.fn().mockResolvedValue({
+      enabled: false,
+      priorityTriggers: [],
+      priorityTriggerIcons: {},
+    }),
+    setDuckingEnabled: vi.fn(),
+    setDuckTriggerPriority: vi.fn(),
     capturedCallback: { current: null as null | ((s: unknown[]) => void) },
     unlistenMock,
   };
@@ -39,6 +52,10 @@ vi.mock("@/lib/tauri", () => ({
   outputRoutingSupported: (...args: unknown[]) => outputRoutingSupported(...args),
   listOutputDevices: (...args: unknown[]) => listOutputDevices(...args),
   setSessionOutputDevice: (...args: unknown[]) => setSessionOutputDevice(...args),
+  duckingSupported: (...args: unknown[]) => duckingSupported(...args),
+  getDuckingSettings: (...args: unknown[]) => getDuckingSettings(...args),
+  setDuckingEnabled: (...args: unknown[]) => setDuckingEnabled(...args),
+  setDuckTriggerPriority: (...args: unknown[]) => setDuckTriggerPriority(...args),
   listenToSessionsChanged: vi.fn((callback: (s: unknown[]) => void) => {
     capturedCallback.current = callback;
     return Promise.resolve(unlistenMock);

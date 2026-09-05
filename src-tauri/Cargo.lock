@@ -2358,7 +2358,7 @@ dependencies = [
 
 [[package]]
 name = "mixolume"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "block2",
  "env_logger",

@@ -10,6 +10,8 @@ pub mod linux;
 pub mod macos;
 #[cfg(target_os = "macos")]
 pub mod macos_ducking;
+#[cfg(target_os = "macos")]
+pub mod macos_output_routing;
 #[cfg(target_os = "windows")]
 pub mod windows;
 #[cfg(target_os = "windows")]
@@ -117,7 +119,43 @@ pub struct OutputDevice {
 pub struct DuckingSettings {
     pub enabled: bool,
     pub priority_triggers: Vec<String>,
+    /// PNG icon bytes for each name in `priority_triggers`, keyed the same way -- captured the
+    /// first time that app is seen actively producing sound (each backend's own `list_sessions`
+    /// reuses whatever icon it already resolved for the live session, the same bytes
+    /// `AppSession::icon_png` carries) and persisted here so the Settings UI can keep showing a
+    /// real icon even after the app quits or across a whole run where it never made a sound.
+    /// Absent for a trigger that's never been seen active since being added; pruned by
+    /// `toggle_priority_trigger` when the matching name is removed.
+    #[serde(default)]
+    pub priority_trigger_icons: std::collections::HashMap<String, Vec<u8>>,
 }
+
+/// Upper bound on a single icon's PNG byte length before it's eligible to be cached into
+/// [`DuckingSettings::priority_trigger_icons`] -- confirmed live as a real, not hypothetical,
+/// safety net: an app whose bundled icon set has no representation near the intended ~128px
+/// target (only, say, 16px and a 1024px master, with nothing in between -- not unusual for
+/// cross-platform/Electron-style apps) falls back to encoding the full master representation,
+/// producing a single icon over a megabyte. Persisted as a JSON `number[]` (one PNG byte per
+/// array element, several characters each once serialized), that turned a settings file that
+/// should be a few KB into one over 14MB -- which then has to be parsed synchronously before the
+/// app can even open a window, confirmed live to make the whole app appear stuck/not launching.
+/// A properly-sized icon at the intended target easily stays under this; skipping the rare
+/// oversized outlier instead of persisting it is a far smaller cost than a corrupted-feeling
+/// settings file. Deliberately generous (not tuned to the ~128px target's theoretical minimum) so
+/// it only ever rejects a genuine anomaly, never a normal icon.
+pub const MAX_CACHEABLE_ICON_BYTES: usize = 65_536;
+
+/// Sanity ceiling on the ducking-settings file's own size, checked before attempting to parse it
+/// at all -- a real settings file (a short trigger-name list plus each one's icon, each capped at
+/// [`MAX_CACHEABLE_ICON_BYTES`]) should never come anywhere close to this even with a couple dozen
+/// apps configured. Exists as a second line of defense alongside that cap, not a replacement for
+/// it: the cap only prevents *future* writes from growing the file further; this protects against
+/// a file that's *already* oversized for any reason (a version predating the cap, manual editing,
+/// disk corruption) by refusing to parse it at all rather than blocking app startup on it -- see
+/// `MAX_CACHEABLE_ICON_BYTES`'s doc comment for the confirmed, real 14MB-file/stuck-launch incident
+/// this whole safety net responds to. An oversized file is treated exactly like a missing or
+/// corrupt one: silently fall back to defaults rather than delay startup trying to parse it.
+pub const MAX_SETTINGS_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum MixerError {
@@ -185,21 +223,24 @@ pub fn seed_priority_apps_from_well_known(
     }
 }
 
-/// Adds (`is_priority: true`) or removes (`false`) `display_name` from `priority_triggers` --
-/// the actual list-mutation logic behind every backend's `set_duck_trigger_priority`, which was
+/// Adds (`is_priority: true`) or removes (`false`) `display_name` from `settings.priority_triggers`
+/// -- the actual list-mutation logic behind every backend's `set_duck_trigger_priority`, which was
 /// otherwise identical across macOS and Windows (only the settings-persistence call after it
-/// differs, since that's backend-specific).
+/// differs, since that's backend-specific). Removing also drops `display_name`'s entry from
+/// `settings.priority_trigger_icons`, if any -- no reason to keep a cached icon around for a name
+/// no longer in the list.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn toggle_priority_trigger(
-    priority_triggers: &mut Vec<String>,
+    settings: &mut DuckingSettings,
     display_name: &str,
     is_priority: bool,
 ) {
-    let already_present = priority_triggers.iter().any(|n| n == display_name);
+    let already_present = settings.priority_triggers.iter().any(|n| n == display_name);
     if is_priority && !already_present {
-        priority_triggers.push(display_name.to_string());
+        settings.priority_triggers.push(display_name.to_string());
     } else if !is_priority {
-        priority_triggers.retain(|n| n != display_name);
+        settings.priority_triggers.retain(|n| n != display_name);
+        settings.priority_trigger_icons.remove(display_name);
     }
 }
 

@@ -18,9 +18,6 @@ interface OutputDevicePickerProps {
   displayName: string;
   outputDeviceId: string | null;
   devices: OutputDevice[];
-  /** Every device id -> name ever seen, including ones no longer plugged in -- see
-   * `MixerState.knownDeviceNames`'s own doc comment. */
-  knownDeviceNames: Record<string, string>;
   disabled: boolean;
   onChange: (sessionId: string, deviceId: string | null) => void;
 }
@@ -36,32 +33,23 @@ export function OutputDevicePicker({
   displayName,
   outputDeviceId,
   devices,
-  knownDeviceNames,
   disabled,
   onChange,
 }: OutputDevicePickerProps) {
-  // Defensive: a device this session is routed to but that's no longer in the current list
-  // (unplugged since, or the OS's own Settings panel routed it somewhere this poll hasn't caught
-  // up to reporting yet) would otherwise leave nothing matching the current value at all -- a
-  // synthetic item keeps the control legible instead of silently showing a blank trigger. Its
-  // label prefers the device's real, previously-seen name ("Headphones (disconnected)") over a
-  // bare "Unknown device" -- almost always available in practice, since a device has to have
-  // been plugged in and enumerated at least once before any session could have been routed to
-  // it in the first place.
+  // A device this session was routed to but that's no longer in the current list (unplugged
+  // since) shows as "System default" rather than a stale, unselectable "disconnected" entry --
+  // the backend independently clears the routing choice itself once it notices the device is
+  // gone (so this is also what the very next push will report), this just avoids a beat of
+  // showing a dead option in the meantime.
   const hasCurrentDevice =
-    outputDeviceId === null || devices.some((device) => device.id === outputDeviceId);
-  const missingDeviceLabel =
-    outputDeviceId && !hasCurrentDevice
-      ? knownDeviceNames[outputDeviceId]
-        ? `${knownDeviceNames[outputDeviceId]} (disconnected)`
-        : "Unknown device"
-      : null;
+    outputDeviceId !== null && devices.some((device) => device.id === outputDeviceId);
+  const selectValue = hasCurrentDevice ? outputDeviceId : SYSTEM_DEFAULT_VALUE;
 
   return (
     <div className="flex items-center gap-2 px-2.5 pb-2.5">
       <Headphones className="text-muted-foreground size-3.5 shrink-0" />
       <Select
-        value={outputDeviceId ?? SYSTEM_DEFAULT_VALUE}
+        value={selectValue}
         disabled={disabled}
         onValueChange={(value) => {
           onChange(sessionId, value === SYSTEM_DEFAULT_VALUE ? null : value);
@@ -75,9 +63,6 @@ export function OutputDevicePicker({
         </SelectTrigger>
         <SelectContent>
           <SelectItem value={SYSTEM_DEFAULT_VALUE}>System default</SelectItem>
-          {missingDeviceLabel && outputDeviceId && (
-            <SelectItem value={outputDeviceId}>{missingDeviceLabel}</SelectItem>
-          )}
           {devices.map((device) => (
             <SelectItem key={device.id} value={device.id}>
               {device.name}

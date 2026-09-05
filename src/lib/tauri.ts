@@ -80,6 +80,11 @@ export type UpdateCheckOutcome =
 export interface DuckingSettings {
   enabled: boolean;
   priorityTriggers: string[];
+  /** PNG icon bytes for each name in `priorityTriggers`, keyed the same way -- captured the first
+   * time that app was seen actively producing sound. Absent for a trigger never seen active since
+   * being added; the Settings UI falls back to a currently-live session's icon when one's
+   * available, and to this cached one otherwise. */
+  priorityTriggerIcons: Record<string, number[]>;
 }
 
 // ===== TAURI COMMANDS =====

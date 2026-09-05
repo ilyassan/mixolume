@@ -25,7 +25,6 @@ function App() {
   const maxVolumePercent = useMixerStore((state) => state.maxVolumePercent);
   const outputRoutingSupported = useMixerStore((state) => state.outputRoutingSupported);
   const outputDevices = useMixerStore((state) => state.outputDevices);
-  const knownDeviceNames = useMixerStore((state) => state.knownDeviceNames);
   const setSessionOutputDevice = useMixerStore((state) => state.setSessionOutputDevice);
 
   const [inactiveExpanded, setInactiveExpanded] = useState(false);
@@ -127,7 +126,6 @@ function App() {
                   maxVolumePercent={maxVolumePercent}
                   outputRoutingSupported={outputRoutingSupported}
                   outputDevices={outputDevices}
-                  knownDeviceNames={knownDeviceNames}
                   onOutputDeviceChange={setSessionOutputDevice}
                 />
               ))}
@@ -173,7 +171,6 @@ function App() {
                             maxVolumePercent={maxVolumePercent}
                             outputRoutingSupported={outputRoutingSupported}
                             outputDevices={outputDevices}
-                            knownDeviceNames={knownDeviceNames}
                             onOutputDeviceChange={setSessionOutputDevice}
                           />
                         ))}

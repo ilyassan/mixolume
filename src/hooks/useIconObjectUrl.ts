@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 /**
  * Converts a raw PNG byte array (as received from the Tauri `AppSession.iconPng` field) into a
@@ -22,11 +22,24 @@ import { useEffect, useState } from "react";
  * lifecycle via an effect) rather than the plain, referentially-transparent function it used to
  * be.
  */
-export function useIconObjectUrl(iconPng: number[] | null): string | null {
+export function useIconObjectUrl(rawIconPng: number[] | null): string | null {
   const [url, setUrl] = useState<string | null>(null);
+
+  // Re-keyed by content, not `rawIconPng`'s own array *reference* -- a caller is free to pass a
+  // freshly-allocated array with identical bytes on every render (e.g. straight off a JSON
+  // deserialize). Depending on the reference directly below would re-run the effect (and, since
+  // it calls `setUrl`, re-render) every single time regardless of whether the bytes actually
+  // changed -- which re-invokes the caller, which can produce yet another fresh reference,
+  // forever: a genuine infinite render loop, reproduced live, not a hypothetical one. `useMemo`
+  // gives every render with the same bytes back the exact same array reference, so the effect
+  // below can depend on `iconPng` itself and still only fire when the content really changes.
+  const iconKey = rawIconPng && rawIconPng.length > 0 ? rawIconPng.join(",") : null;
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- deliberately keyed by content (`iconKey`), not `rawIconPng`'s own reference; see the comment above.
+  const iconPng = useMemo(() => rawIconPng, [iconKey]);
 
   useEffect(() => {
     if (!iconPng || iconPng.length === 0) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- synchronizing with a real external system (the browser's object-URL registry) is the documented, intended use of an effect's setState, not the derived-state anti-pattern this rule exists to catch.
       setUrl(null);
       return;
     }

@@ -814,6 +814,33 @@ impl AudioMixerBackend for WindowsMixerBackend {
             // Debounced against a transient single-tick blip -- see `debounce_output_device`'s
             // doc comment.
             let output_device_id = debounce_output_device(&mut inner, &r.id, output_device_raw);
+            // Cache this app's icon against its duck-trigger entry (if it has one), the first
+            // time a real icon is actually resolved for it -- see `DuckingSettings::
+            // priority_trigger_icons`'s doc comment for why the Settings UI needs this to keep
+            // showing a real icon once the app closes or goes a whole run without making sound.
+            // NOTE: written without access to a Windows machine -- please verify before trusting
+            // it compiles/behaves as intended, same caveat as this file's other less-travelled
+            // corners.
+            if let Some(icon_bytes) = &r.icon_png {
+                if icon_bytes.len() <= super::MAX_CACHEABLE_ICON_BYTES
+                    && inner
+                        .ducking_settings
+                        .priority_triggers
+                        .iter()
+                        .any(|name| name == &r.display_name)
+                    && inner
+                        .ducking_settings
+                        .priority_trigger_icons
+                        .get(&r.display_name)
+                        != Some(icon_bytes)
+                {
+                    inner
+                        .ducking_settings
+                        .priority_trigger_icons
+                        .insert(r.display_name.clone(), icon_bytes.clone());
+                    windows_ducking::save_settings(&inner.ducking_settings);
+                }
+            }
             sessions.push(AppSession {
                 id: r.id,
                 display_name: r.display_name,
@@ -1072,11 +1099,7 @@ impl AudioMixerBackend for WindowsMixerBackend {
         is_priority: bool,
     ) -> Result<(), MixerError> {
         let mut inner = self.inner.lock().unwrap();
-        super::toggle_priority_trigger(
-            &mut inner.ducking_settings.priority_triggers,
-            display_name,
-            is_priority,
-        );
+        super::toggle_priority_trigger(&mut inner.ducking_settings, display_name, is_priority);
         windows_ducking::save_settings(&inner.ducking_settings);
         Ok(())
     }
@@ -1086,7 +1109,46 @@ impl AudioMixerBackend for WindowsMixerBackend {
     }
 
     fn list_output_devices(&self) -> Result<Vec<OutputDevice>, MixerError> {
-        windows_output_routing::list_output_devices()
+        let devices = windows_output_routing::list_output_devices()?;
+        // NOTE: written without access to a Windows machine to compile/run this against -- please
+        // verify on real hardware before trusting it, same caveat already noted elsewhere in this
+        // file for code written the same way.
+        //
+        // Mirrors a fix already verified on macOS: `IAudioPolicyConfigFactory`'s persisted per-app
+        // override has no liveness check of its own -- `get_session_output_device` just returns
+        // whatever's stored, even for a device that's since been unplugged -- so without this, a
+        // session stayed "routed" to a since-unplugged device indefinitely, both in what
+        // `list_sessions` reports and in the OS's own persisted policy store. Piggybacks on this
+        // call's own ~2s poll cadence (`spawn_output_devices_poll_loop` in `lib.rs`) rather than
+        // adding a new one; clearing the OS's own persisted value here is enough on its own --
+        // `list_sessions`'s next ~150ms tick reads it back fresh via `get_session_output_device`
+        // and will correctly see `None`, no need to also touch `output_device_raw`/
+        // `output_device_confirmed` directly.
+        let live_device_ids: std::collections::HashSet<&str> =
+            devices.iter().map(|d| d.id.as_str()).collect();
+        let mut inner = self.inner.lock().unwrap();
+        let stale_session_ids: Vec<String> = inner
+            .output_device_confirmed
+            .iter()
+            .filter_map(|(session_id, device_id)| {
+                let device_id = device_id.as_deref()?;
+                (!live_device_ids.contains(device_id)).then(|| session_id.clone())
+            })
+            .collect();
+        let mut stale_pids: Vec<u32> = Vec::new();
+        for session_id in &stale_session_ids {
+            if let Ok(member_pids) = resolve_member_pids(&inner, session_id) {
+                stale_pids.extend(member_pids);
+            }
+        }
+        if !stale_pids.is_empty() {
+            if let Some(factory) = output_policy_factory(&mut inner) {
+                for pid in stale_pids {
+                    let _ = windows_output_routing::set_session_output_device(factory, pid, None);
+                }
+            }
+        }
+        Ok(devices)
     }
 
     fn set_session_output_device(

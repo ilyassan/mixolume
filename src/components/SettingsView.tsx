@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { ArrowLeft, Plus, X } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import {
@@ -9,13 +9,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Wordmark } from "@/components/Wordmark";
 import { SessionIcon } from "@/components/SessionIcon";
-import {
-  checkForUpdates,
-  duckingSupported,
-  getDuckingSettings,
-  setDuckingEnabled,
-  setDuckTriggerPriority,
-} from "@/lib/tauri";
+import { checkForUpdates } from "@/lib/tauri";
 import { useMixerStore } from "@/stores/mixer-store";
 import icon from "@/assets/icon.svg";
 import pkg from "../../package.json";
@@ -31,19 +25,91 @@ type UpdateStatus =
   | { kind: "installed"; version: string }
   | { kind: "error" };
 
+interface SessionIdentity {
+  id: string;
+  displayName: string;
+  iconPng: number[] | null;
+}
+
+/** All that this view ever actually reads off a session (name + icon, for the priority-app rows
+ * and the "add app" picker) -- deliberately not `volume`/`effectiveVolume`/`isActive`/duck flags,
+ * which change on essentially every ~150ms backend poll tick regardless of whether anything this
+ * view displays actually changed. Used as the equality check for the `sessions` selector below;
+ * `iconPng` compares by reference (not byte-for-byte), matching `mixer-store.ts`'s own
+ * `resolvePushedIcons`, which deliberately carries the *same* array reference forward across polls
+ * when an icon hasn't changed -- so a real icon change is still caught, without a byte compare. */
+function sessionIdentitiesEqual(
+  a: SessionIdentity[],
+  b: SessionIdentity[],
+): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (
+      a[i].id !== b[i].id ||
+      a[i].displayName !== b[i].displayName ||
+      a[i].iconPng !== b[i].iconPng
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function SettingsView({ onBack }: SettingsViewProps) {
   const [openAtStartup, setOpenAtStartup] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>({
     kind: "idle",
   });
-  const [duckingEnabled, setDuckingEnabledState] = useState(false);
-  const [priorityApps, setPriorityApps] = useState<string[]>([]);
-  const [duckingLoaded, setDuckingLoaded] = useState(false);
-  const [duckingIsSupported, setDuckingIsSupported] = useState(false);
   const [showAddPicker, setShowAddPicker] = useState(false);
   const [pickerSearch, setPickerSearch] = useState("");
-  const sessions = useMixerStore((state) => state.sessions);
+  // Deliberately not `useMixerStore((state) => state.sessions)` -- the raw array gets a fresh
+  // reference on essentially every ~150ms backend poll tick (volume/active-state churn, mostly
+  // unrelated to anything this view shows), which reactively re-rendered this whole component
+  // that often for as long as Settings stayed open. Confirmed live as the actual cause of the
+  // ducking panel's toggle animation feeling smooth sometimes and instantly-snapped other times:
+  // purely down to whether a poll-driven re-render happened to land in the middle of Framer
+  // Motion's `height: auto` measurement at the exact moment the user clicked, a race with no
+  // relationship to anything the user was actually doing. The custom equality check here only
+  // treats this as "changed" when a session's identity (name/icon) actually changed, not its
+  // volume or active state -- see `sessionIdentitiesEqual`'s own doc comment.
+  // `useSyncExternalStore` directly, not a plain `useMixerStore(selector)` call -- Zustand v5's
+  // default hook dropped the second `equalityFn` argument the classic API had, so a custom
+  // comparison needs its own escape hatch. `getSnapshot` below caches its last result in a ref and
+  // only replaces it when `sessionIdentitiesEqual` says something actually changed, so React's own
+  // `Object.is` check (which is what decides whether to re-render) sees a stable reference across
+  // polls that didn't change anything this view cares about.
+  const sessionsCacheRef = useRef<SessionIdentity[]>([]);
+  const sessions = useSyncExternalStore(useMixerStore.subscribe, () => {
+    const next = useMixerStore.getState().sessions.map((session) => ({
+      id: session.id,
+      displayName: session.displayName,
+      iconPng: session.iconPng,
+    }));
+    if (!sessionIdentitiesEqual(sessionsCacheRef.current, next)) {
+      sessionsCacheRef.current = next;
+    }
+    return sessionsCacheRef.current;
+  });
+  // Ducking settings are fetched once in `mixer-store.ts`'s `init()` -- essentially at app
+  // launch, well before the user can click into Settings at all -- rather than lazily here on
+  // mount. This component used to fetch them itself, in a `useEffect` that only ever fires after
+  // this view actually mounts, which itself only happens after the page-transition's own exit
+  // animation finishes -- confirmed live as a real, visible stutter: a whole serial chain of
+  // delays (transition, then mount, then paint, then only *then* start fetching) for data that
+  // has nothing to do with which page happens to be showing. Reading it from the store instead
+  // means it's very often already loaded by the time this view exists, and the fetch itself only
+  // ever happens once no matter how many times Settings is opened and closed.
+  const duckingIsSupported = useMixerStore((state) => state.duckingSupported);
+  const duckingLoaded = useMixerStore((state) => state.duckingSettingsLoaded);
+  const duckingEnabled = useMixerStore((state) => state.duckingEnabled);
+  const priorityApps = useMixerStore((state) => state.priorityTriggers);
+  const priorityAppIcons = useMixerStore((state) => state.priorityTriggerIcons);
+  const setDuckingEnabledStore = useMixerStore((state) => state.setDuckingEnabled);
+  const setDuckTriggerPriorityStore = useMixerStore(
+    (state) => state.setDuckTriggerPriority,
+  );
 
   useEffect(() => {
     isAutostartEnabled()
@@ -51,28 +117,16 @@ export function SettingsView({ onBack }: SettingsViewProps) {
       .finally(() => setLoaded(true));
   }, []);
 
-  useEffect(() => {
-    duckingSupported().then((supported) => {
-      setDuckingIsSupported(supported);
-      if (!supported) {
-        setDuckingLoaded(true);
-        return;
-      }
-      getDuckingSettings()
-        .then((settings) => {
-          setDuckingEnabledState(settings.enabled);
-          setPriorityApps(settings.priorityTriggers);
-        })
-        .finally(() => setDuckingLoaded(true));
-    });
-  }, []);
-
-  // A currently-known session's icon for a priority app, by name -- the same identity the
-  // backend persists the list by (see `DuckingSettings`'s doc comment for why display name, not
-  // the pid-based session id, is the stable key here). `null` (SessionIcon's generic fallback)
-  // when the app isn't running right now -- the name alone is still enough to keep it in the list.
+  // A priority app's icon, by name -- the same identity the backend persists the list by (see
+  // `DuckingSettings`'s doc comment for why display name, not the pid-based session id, is the
+  // stable key here). Prefers a currently-live session's icon (freshest, and covers an app added
+  // before this cache existed); falls back to the backend's persisted `priorityTriggerIcons` when
+  // the app isn't currently running. `null` (SessionIcon's generic fallback) only when neither is
+  // available yet -- the name alone is still enough to keep it in the list either way.
   const iconForAppName = (name: string) =>
-    sessions.find((session) => session.displayName === name)?.iconPng ?? null;
+    sessions.find((session) => session.displayName === name)?.iconPng ??
+    priorityAppIcons[name] ??
+    null;
 
   // Apps MiXolume has actually seen making sound (active or not) and isn't already tracking as a
   // priority app, filtered by the search box. Deliberately scoped to sessions rather than every
@@ -111,38 +165,17 @@ export function SettingsView({ onBack }: SettingsViewProps) {
     }
   };
 
-  const toggleDucking = async () => {
-    const next = !duckingEnabled;
-    setDuckingEnabledState(next);
-    try {
-      await setDuckingEnabled(next);
-    } catch (error) {
-      console.error("Failed to update auto-duck:", error);
-      setDuckingEnabledState(!next);
-    }
+  const toggleDucking = () => {
+    setDuckingEnabledStore(!duckingEnabled);
   };
 
-  const addPriorityApp = async (displayName: string) => {
-    const previous = priorityApps;
-    setPriorityApps([...previous, displayName]);
+  const addPriorityApp = (displayName: string) => {
+    setDuckTriggerPriorityStore(displayName, true);
     setShowAddPicker(false);
-    try {
-      await setDuckTriggerPriority(displayName, true);
-    } catch (error) {
-      console.error("Failed to add auto-duck app:", error);
-      setPriorityApps(previous);
-    }
   };
 
-  const removePriorityApp = async (displayName: string) => {
-    const previous = priorityApps;
-    setPriorityApps(previous.filter((name) => name !== displayName));
-    try {
-      await setDuckTriggerPriority(displayName, false);
-    } catch (error) {
-      console.error("Failed to remove auto-duck app:", error);
-      setPriorityApps(previous);
-    }
+  const removePriorityApp = (displayName: string) => {
+    setDuckTriggerPriorityStore(displayName, false);
   };
 
   const handleCheckForUpdates = async () => {
@@ -219,34 +252,112 @@ export function SettingsView({ onBack }: SettingsViewProps) {
             </button>
           </label>
 
-          <AnimatePresence initial={false}>
-            {duckingEnabled && (
-              <motion.div
-                key="ducking-panel"
-                initial={{ height: 0, opacity: 0 }}
-                animate={{ height: "auto", opacity: 1 }}
-                exit={{ height: 0, opacity: 0 }}
-                transition={{ duration: 0.2, ease: "easeOut" }}
-                className="overflow-hidden"
-              >
+          {/* Always mounted (no `AnimatePresence`/conditional-render around this `motion.div`
+              itself) -- only its `height`/`opacity` animate based on `duckingEnabled`. This used
+              to be `{duckingEnabled && (<motion.div key="ducking-panel" .../>)}`, which mounted
+              and unmounted this entire subtree -- rows, icons, everything -- on every single
+              toggle. Confirmed live as a real, perceptible stutter distinct from the "Open at
+              startup" toggle right above it (a trivial local boolean with no associated content):
+              every toggle re-ran every row's own `SessionIcon`/`useIconObjectUrl` effect from
+              scratch (a fresh `Blob`+`URL.createObjectURL` per icon, not free), on top of Framer
+              Motion re-registering every row's `layout="position"` tracking and re-measuring the
+              panel's own `height: auto` target, all synchronously around the same click. Keeping
+              this mounted permanently means icons decode once and stay decoded regardless of how
+              many times the switch gets flipped -- toggling becomes a plain height/opacity
+              transition with nothing underneath it to rebuild. */}
+          <motion.div
+            // Guarantees no animation plays on `SettingsView`'s own mount (only on a genuine
+            // later toggle) -- without this, whatever `duckingEnabled` happens to already be by
+            // the time this first renders (now often `true` already, since ducking settings are
+            // prefetched at app launch) would otherwise animate in from the opposite state.
+            initial={false}
+            animate={{
+              height: duckingEnabled ? "auto" : 0,
+              opacity: duckingEnabled ? 1 : 0,
+            }}
+            transition={{ duration: 0.2, ease: "easeOut" }}
+            className="overflow-hidden"
+            aria-hidden={!duckingEnabled}
+          >
                 <div className="flex flex-col gap-1 rounded-lg bg-card/60 p-2">
-                  <span className="text-muted-foreground px-1 text-xs">
-                    {priorityApps.length === 0
-                      ? "Add an app to get started"
-                      : "Apps that trigger ducking"}
-                  </span>
+                  {/* `duckingLoaded` gates this rather than `priorityApps.length` alone -- before
+                      the initial `getDuckingSettings()` round trip resolves, an empty array just
+                      means "don't know yet," not "there really are zero apps," so showing "Add an
+                      app to get started" during that brief window would be actively misleading,
+                      not just a cosmetic flash.
+                      No `initial={false}` here (unlike page-level transitions elsewhere in this
+                      app) -- that prop only suppresses the animation of whatever's already present
+                      the *very first time* this `AnimatePresence` commits, and a fast-enough local
+                      Tauri round trip can resolve before that first paint even happens, which would
+                      make this text count as "already there" and skip its fade-in entirely instead
+                      of easing in the way it's supposed to. This text should always ease in on its
+                      first real appearance, no matter how quickly the fetch happens to resolve. */}
+                  {/* Both this text and the row list below delay their *entrance* specifically
+                      (a per-keyframe `transition` on `animate`, not the shared one exit already
+                      uses) until just after the panel's own `height: 0 -> auto` reveal above has
+                      finished. The rows live inside that panel's `overflow-hidden`, so without
+                      this, their own fade-in races the exact same duration as the reveal that's
+                      clipping them -- confirmed to read as "the panel opens on an empty list, then
+                      it's suddenly full" rather than one clean sequence, since a row can finish
+                      fading to opaque before the panel has grown enough to actually show it. */}
+                  <AnimatePresence mode="wait">
+                    {duckingLoaded && (
+                      <motion.span
+                        key={priorityApps.length === 0 ? "empty" : "populated"}
+                        initial={{ opacity: 0 }}
+                        animate={{
+                          opacity: 1,
+                          transition: { duration: 0.15, ease: "easeOut", delay: 0.2 },
+                        }}
+                        exit={{ opacity: 0, transition: { duration: 0.15, ease: "easeOut" } }}
+                        className="text-muted-foreground px-1 text-xs"
+                      >
+                        {priorityApps.length === 0
+                          ? "Add an app to get started"
+                          : "Apps that trigger ducking"}
+                      </motion.span>
+                    )}
+                  </AnimatePresence>
 
-                  {priorityApps.length > 0 && (
-                    <div className="flex max-h-40 flex-col gap-0.5 overflow-y-auto">
-                      <AnimatePresence mode="popLayout" initial={false}>
-                        {priorityApps.map((name) => (
+                  {/* Stays mounted regardless of `priorityApps.length` -- conditionally mounting
+                      this whole block on `priorityApps.length > 0` instead (as a naive read of
+                      "only show the list when there's something to show" suggests) would make
+                      `AnimatePresence` first commit exactly when the loaded apps appear, which
+                      matters because of the *other* mistake this fix corrects: no `initial={false}`
+                      below either, for the same reason as the header text's `AnimatePresence` above
+                      -- a fast-enough local Tauri round trip can resolve before this component's
+                      first paint, and `initial={false}` would then treat that very first batch of
+                      rows as "already there" and skip their entrance animation entirely, which is
+                      the exact instant "boom" this whole fix exists to prevent. */}
+                  <div className="flex max-h-40 flex-col gap-0.5 overflow-y-auto">
+                    <AnimatePresence mode="popLayout">
+                      {duckingLoaded &&
+                        priorityApps.map((name) => (
                           <motion.div
                             key={name}
-                            layout
+                            // `layout="position"`, not the plain `layout` boolean (which also
+                            // tracks size, not just position) -- this list lives inside the
+                            // ducking panel's own `height: "auto"` reveal above, and Framer Motion
+                            // already has to force real layout measurement to animate that.
+                            // Stacking a full-size-tracking `layout` animation for every row on
+                            // top of that, at the same time, was confirmed to produce a real,
+                            // visible main-thread freeze (layout thrashing: measure, animate,
+                            // re-measure, repeated per row, per frame) -- not just a hypothetical
+                            // cost. Position-only tracking (a `SessionRow.tsx` precedent, see its
+                            // own comment) still animates reordering smoothly without forcing that
+                            // extra size remeasurement.
+                            layout="position"
                             initial={{ opacity: 0, scale: 0.96 }}
-                            animate={{ opacity: 1, scale: 1 }}
-                            exit={{ opacity: 0, scale: 0.96 }}
-                            transition={{ duration: 0.15, ease: "easeOut" }}
+                            animate={{
+                              opacity: 1,
+                              scale: 1,
+                              transition: { duration: 0.15, ease: "easeOut", delay: 0.2 },
+                            }}
+                            exit={{
+                              opacity: 0,
+                              scale: 0.96,
+                              transition: { duration: 0.15, ease: "easeOut" },
+                            }}
                             className="flex items-center gap-2 rounded px-1 py-1"
                           >
                             <SessionIcon
@@ -268,9 +379,8 @@ export function SettingsView({ onBack }: SettingsViewProps) {
                             </Button>
                           </motion.div>
                         ))}
-                      </AnimatePresence>
-                    </div>
-                  )}
+                    </AnimatePresence>
+                  </div>
 
                   <AnimatePresence initial={false}>
                     {showAddPicker && (
@@ -299,7 +409,11 @@ export function SettingsView({ onBack }: SettingsViewProps) {
                                 {addableApps.map((session) => (
                                   <motion.button
                                     key={session.displayName}
-                                    layout
+                                    // Same reasoning as the priority-apps list above: this sits
+                                    // inside the "add-picker" panel's own `height: "auto"` reveal,
+                                    // so a full-size-tracking `layout` here stacks another forced
+                                    // layout measurement on top of that at the same time.
+                                    layout="position"
                                     initial={{ opacity: 0 }}
                                     animate={{ opacity: 1 }}
                                     exit={{ opacity: 0 }}
@@ -376,9 +490,7 @@ export function SettingsView({ onBack }: SettingsViewProps) {
                     {showAddPicker ? "Done" : "Add app"}
                   </Button>
                 </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
+          </motion.div>
         </div>
         )}
 
