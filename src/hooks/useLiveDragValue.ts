@@ -252,6 +252,7 @@ export function useLiveDragValue(targetValue: number) {
   // update as `liveValue` -- there's no external round trip left to wait on.
   useEffect(() => {
     if (!isDragging && liveValue !== null && Math.abs(confirmed - liveValue) < 0.01) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- releasing an imperatively-set override (`liveValue`, written by the drag-gesture callbacks below, never by render) once a *different* piece of state catches up to it is reconciling two independently-updating values, not the derived-state anti-pattern this rule exists to catch -- see this effect's own doc comment above.
       setLiveValue(null);
     }
   }, [isDragging, liveValue, confirmed]);
@@ -269,6 +270,7 @@ export function useLiveDragValue(targetValue: number) {
     if (isDragging) return;
     if (performance.now() < protectedUntilRef.current) return;
     if (confirmed !== targetValue) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- adopting a prop that changed for a reason external to this hook's own caller (auto-duck lowering `targetValue` out from under an idle slider) into local state is synchronizing with an external system, not the derived-state anti-pattern this rule exists to catch -- see this effect's own doc comment above.
       setConfirmed(targetValue);
     }
   }, [targetValue, isDragging, confirmed]);
