@@ -84,7 +84,7 @@ webrtc-vad = "0.4"
 # references the `windows_core` crate directly, not only through `windows::core`'s re-export --
 # confirmed by the build failing with "could not find `windows_core` in the list of imported
 # crates" until this was added as its own direct dependency.
-windows-core = "0.58"
+windows-core = "0.61"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 regex = "1"
