@@ -2658,11 +2658,24 @@ impl AudioMixerBackend for MacosMixerBackend {
         // Filtering by our own PID (not just bundle id) is the robust check: it doesn't depend
         // on `read_process_bundle_id`'s CFString bridging succeeding.
         let own_pid = std::process::id() as i32;
-        let processes: Vec<AudioProcessInfo> = list_audio_processes()?
+        let mut processes: Vec<AudioProcessInfo> = list_audio_processes()?
             .into_iter()
             .filter(|p| p.pid != own_pid)
             .collect();
         let mut inner = self.inner.lock().unwrap();
+
+        // Also exclude hidden system processes (PowerChime, systemsoundserverd, Control Center,
+        // etc. -- see `is_hidden_system_process_cached`'s own doc comment) here, before
+        // `reconcile_engine` ever sees them, not only when building the UI-facing `sessions` list
+        // further down. Confirmed live as a real bug, not just a display nicety: a hidden process
+        // reporting `is_running_output` used to still enter `reconcile_engine`'s `active` set,
+        // triggering a full Core Audio tap/aggregate-device rebuild for a sound the user never
+        // even sees in the list -- exactly the unnecessary-engine-churn class of problem
+        // `active_hold_until` exists to prevent for *visible* apps, just left open for hidden
+        // ones.
+        processes.retain(|p| {
+            !is_hidden_system_process_cached(&mut inner.hidden_process_cache, p.bundle_id.as_deref(), p.pid)
+        });
 
         // Ensure every currently-audible process has a persistent gain_state entry (freshly-seen
         // -> full volume, unmuted), *before* reconciling the engine so the engine can read the
@@ -2711,13 +2724,7 @@ impl AudioMixerBackend for MacosMixerBackend {
 
         let mut sessions = Vec::with_capacity(processes.len());
         for p in &processes {
-            if is_hidden_system_process_cached(
-                &mut inner.hidden_process_cache,
-                p.bundle_id.as_deref(),
-                p.pid,
-            ) {
-                continue;
-            }
+            // Hidden system processes are already filtered out of `processes` itself, above.
             let id = session_id_for_pid(p.pid);
             // Copy out before touching `app_info_cache` below -- `state` borrows
             // `inner.gain_state` immutably, and the cache lookup needs `inner` mutably; ending

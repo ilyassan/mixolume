@@ -130,6 +130,13 @@ struct Inner {
     /// currently has is never inserted here at all, so a session id's absence unambiguously
     /// means "not a group, parse it as `win-{pid}` instead".
     session_groups: HashMap<String, Vec<u32>>,
+    /// Cached `resolve_process_info` result per pid -- display name plus a PNG-encoded icon,
+    /// resolved once and reused for as long as that pid stays alive, matching macOS's
+    /// `app_info_cache` for the same reason: `extract_icon_png` (`SHGetFileInfoW` + a GDI
+    /// `GetDIBits` readback + a full PNG encode) is real, non-trivial work, and without this it
+    /// used to re-run unconditionally for every active session on every single ~150ms poll tick,
+    /// forever, rather than once per pid ever seen.
+    process_info_cache: HashMap<u32, (String, Option<Vec<u8>>)>,
 }
 
 /// Windows backend: per-app volume via WASAPI audio sessions, auto-duck via WASAPI process
@@ -153,6 +160,7 @@ impl WindowsMixerBackend {
                 output_device_raw: HashMap::new(),
                 output_device_confirmed: HashMap::new(),
                 session_groups: HashMap::new(),
+                process_info_cache: HashMap::new(),
             }),
         }
     }
@@ -414,14 +422,20 @@ fn resolve_member_pids(inner: &Inner, session_id: &str) -> Result<Vec<u32>, Mixe
         .ok_or_else(|| MixerError::SessionNotFound(session_id.to_string()))
 }
 
+/// Takes an already-enumerated `controls_by_pid` (see `enumerate_session_controls_by_pid`)
+/// rather than enumerating internally -- every caller here fans a single logical write out to
+/// however many member pids a merged group has (see `resolve_member_pids`), and enumerating once
+/// up front and reusing it for every member is a full-system, every-active-render-device scan
+/// cheaper than repeating that same scan once per member pid for what's still logically one
+/// write. Confirmed live as real, not theoretical: a 3-process Zoom group used to mean 3 full
+/// re-enumerations for one slider drag.
 fn find_session_control(
     inner: &mut Inner,
+    controls_by_pid: &HashMap<u32, Vec<(String, IAudioSessionControl2)>>,
     session_id: &str,
 ) -> Result<IAudioSessionControl2, MixerError> {
     let target_pid = pid_from_session_id(session_id)
         .ok_or_else(|| MixerError::SessionNotFound(session_id.to_string()))?;
-    let controls_by_pid =
-        enumerate_session_controls_by_pid().map_err(|e| MixerError::Platform(e.to_string()))?;
     let candidates = controls_by_pid
         .get(&target_pid)
         .ok_or_else(|| MixerError::SessionNotFound(session_id.to_string()))?;
@@ -709,7 +723,13 @@ impl AudioMixerBackend for WindowsMixerBackend {
                     .unwrap_or(false);
                 let balance = read_balance(&control).unwrap_or(0.0);
 
-                let (display_name, icon_png) = resolve_process_info(*pid);
+                // Cached by pid -- see `Inner::process_info_cache`'s doc comment for why
+                // re-resolving this every poll tick is real, avoidable, repeated work.
+                let (display_name, icon_png) = inner
+                    .process_info_cache
+                    .entry(*pid)
+                    .or_insert_with(|| resolve_process_info(*pid))
+                    .clone();
 
                 raw.push(RawSession {
                     id: session_id_for(*pid),
@@ -755,7 +775,18 @@ impl AudioMixerBackend for WindowsMixerBackend {
                 .map(|r| r.id.as_str())
                 .collect();
             for r in &raw {
-                if wanted.contains(r.id.as_str()) && !inner.captures.contains_key(&r.id) {
+                if !wanted.contains(r.id.as_str()) {
+                    continue;
+                }
+                // Also (re)start one if the existing entry's capture thread already died on its
+                // own (activation failure, the process going away mid-capture, etc.) -- see
+                // `DuckCapture::is_dead`'s own doc comment for why a merely-present entry isn't
+                // enough to mean "this app still has a working capture."
+                let needs_capture = match inner.captures.get(&r.id) {
+                    Some(capture) => capture.is_dead(),
+                    None => true,
+                };
+                if needs_capture {
                     if let Some(pid) = pid_from_session_id(&r.id) {
                         log::info!(
                             "auto-duck: starting capture for priority app \"{}\" (pid {pid})",
@@ -872,12 +903,33 @@ impl AudioMixerBackend for WindowsMixerBackend {
         inner
             .output_device_confirmed
             .retain(|id, _| live_ids.contains(id));
+        // Pid-keyed, not session-id-keyed like the four maps above, so it's pruned against
+        // `controls_by_pid`'s own keys (every pid WASAPI currently reports a session for)
+        // instead of `live_ids`.
+        inner
+            .process_info_cache
+            .retain(|pid, _| controls_by_pid.contains_key(pid));
 
         // Merges same-named sessions (e.g. Zoom's multiple processes) into one row -- deliberately
         // *after* the retains above, which need every individual pid's own `win-{pid}` id still
         // present in `live_ids` to keep that pid's own bookkeeping alive; the merged group id
         // itself never appears in any of those maps.
         let mut sessions = group_sessions_by_display_name(&mut inner, sessions);
+
+        // `write_generations` is pruned separately from the four maps above, and only now, after
+        // merging -- every setter (`bump_generation`) writes under whatever id the frontend
+        // actually passed, which is the *merged* group id once a group exists, not the individual
+        // pid id the pre-merge `live_ids` above tracks. Pruning against that set here would
+        // incorrectly drop a still-live group's own generation counter every single tick. Without
+        // this at all, every session id (individual or group) ever seen leaves a permanent entry
+        // -- real unbounded growth over a long-running MiXolume session that sees many different
+        // apps come and go, the same class of leak `target_volume`/`applied_ducked`/
+        // `output_device_raw`/`output_device_confirmed` are already guarded against above.
+        let live_ids: std::collections::HashSet<&str> =
+            sessions.iter().map(|s| s.id.as_str()).collect();
+        inner
+            .write_generations
+            .retain(|id, _| live_ids.contains(id.as_str()));
 
         // `IAudioSessionEnumerator` (behind `enumerate_session_controls`) has no documented
         // ordering guarantee either, matching macOS's `kAudioHardwarePropertyProcessObjectList`
@@ -912,6 +964,10 @@ impl AudioMixerBackend for WindowsMixerBackend {
         // processes) -- see `resolve_member_pids`'s doc comment. Exactly one pid otherwise, so
         // this loop is a no-op-shaped identity for the overwhelmingly common case.
         let member_pids = resolve_member_pids(&inner, session_id)?;
+        // Enumerated once for the whole fan-out below, not once per member -- see
+        // `find_session_control`'s own doc comment.
+        let controls_by_pid =
+            enumerate_session_controls_by_pid().map_err(|e| MixerError::Platform(e.to_string()))?;
         let mut applied_to_any = false;
         for pid in member_pids {
             let member_id = session_id_for(pid);
@@ -930,7 +986,8 @@ impl AudioMixerBackend for WindowsMixerBackend {
             // Best-effort per member: one process in a group failing (e.g. it just exited)
             // shouldn't block the volume from being applied to every other member that's still
             // there -- the call only fails outright if *none* of them could be reached.
-            let Ok(control) = find_session_control(&mut inner, &member_id) else {
+            let Ok(control) = find_session_control(&mut inner, &controls_by_pid, &member_id)
+            else {
                 continue;
             };
             unsafe {
@@ -956,10 +1013,15 @@ impl AudioMixerBackend for WindowsMixerBackend {
         // reasoning applies here too.
         let mut inner = self.inner.lock().unwrap();
         let member_pids = resolve_member_pids(&inner, session_id)?;
+        // Enumerated once for the whole fan-out below, not once per member -- see
+        // `find_session_control`'s own doc comment.
+        let controls_by_pid =
+            enumerate_session_controls_by_pid().map_err(|e| MixerError::Platform(e.to_string()))?;
         let mut applied_to_any = false;
         for pid in member_pids {
             let member_id = session_id_for(pid);
-            let Ok(control) = find_session_control(&mut inner, &member_id) else {
+            let Ok(control) = find_session_control(&mut inner, &controls_by_pid, &member_id)
+            else {
                 continue;
             };
             unsafe {
@@ -992,10 +1054,15 @@ impl AudioMixerBackend for WindowsMixerBackend {
         // reasoning applies here too.
         let mut inner = self.inner.lock().unwrap();
         let member_pids = resolve_member_pids(&inner, session_id)?;
+        // Enumerated once for the whole fan-out below, not once per member -- see
+        // `find_session_control`'s own doc comment.
+        let controls_by_pid =
+            enumerate_session_controls_by_pid().map_err(|e| MixerError::Platform(e.to_string()))?;
         let mut applied_to_any = false;
         for pid in member_pids {
             let member_id = session_id_for(pid);
-            let Ok(control) = find_session_control(&mut inner, &member_id) else {
+            let Ok(control) = find_session_control(&mut inner, &controls_by_pid, &member_id)
+            else {
                 continue;
             };
             unsafe {
@@ -1043,8 +1110,11 @@ impl AudioMixerBackend for WindowsMixerBackend {
             .filter(|(_, &was_ducked)| was_ducked)
             .filter_map(|(id, _)| inner.target_volume.get(id).map(|&v| (id.clone(), v)))
             .collect();
+        // A one-shot restore at exit, not a hot path -- enumerated once regardless, matching the
+        // signature `find_session_control` now requires everywhere.
+        let controls_by_pid = enumerate_session_controls_by_pid().unwrap_or_default();
         for (id, target) in restores {
-            if let Ok(control) = find_session_control(&mut inner, &id) {
+            if let Ok(control) = find_session_control(&mut inner, &controls_by_pid, &id) {
                 unsafe {
                     if let Ok(simple_volume) = control.cast::<ISimpleAudioVolume>() {
                         let _ = simple_volume.SetMasterVolume(target, std::ptr::null());

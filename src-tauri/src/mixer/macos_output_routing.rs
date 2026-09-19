@@ -32,11 +32,25 @@ fn config_file_path() -> Option<std::path::PathBuf> {
 }
 
 /// Loads persisted settings from disk, or the default (nothing routed) if none have ever been
-/// saved, the file is unreadable, or `$HOME` can't be resolved -- a missing/corrupt config should
-/// never stop the app from starting.
+/// saved, the file is unreadable or implausibly large (see
+/// [`super::MAX_SETTINGS_FILE_BYTES`]'s doc comment), or `$HOME` can't be resolved -- a missing,
+/// corrupt, or oversized config should never stop the app from starting. This file only ever
+/// holds device UID strings, not the icon bytes that made the size cap necessary for
+/// `macos_ducking.rs` in the first place, but the check is cheap and keeps this module's own
+/// doc comment (mirrors `macos_ducking.rs` "exactly") actually true.
 pub fn load_settings() -> OutputRoutingSettings {
     config_file_path()
-        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|path| {
+            let size = std::fs::metadata(&path).ok()?.len();
+            if size > super::MAX_SETTINGS_FILE_BYTES {
+                log::warn!(
+                    "ignoring output-routing-config.json: {size} bytes exceeds the {} byte sanity ceiling",
+                    super::MAX_SETTINGS_FILE_BYTES
+                );
+                return None;
+            }
+            std::fs::read_to_string(path).ok()
+        })
         .and_then(|contents| serde_json::from_str(&contents).ok())
         .unwrap_or_default()
 }

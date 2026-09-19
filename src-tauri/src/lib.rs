@@ -833,6 +833,25 @@ pub fn run() {
             spawn_output_devices_poll_loop(app.handle().clone(), backend);
             setup_tray(app)?;
 
+            // Windows only: show the window (and, since `skipTaskbar: false`, a taskbar entry
+            // alongside it) immediately on launch, instead of waiting for a tray click -- an
+            // explicit user decision, not a platform requirement (EarTrumpet, the closest real
+            // Windows equivalent to this app, actually stays hidden-until-click too). macOS keeps
+            // its existing hidden-until-tray-click behavior unchanged.
+            //
+            // Relies on the tray icon already having a resolvable screen position by the time
+            // `setup_tray` returns, just above -- true on every platform tested so far, but
+            // unverified specifically on Windows (no Windows machine available here). If the
+            // window ever shows up in an unexpected spot on first launch there, this is the place
+            // to look: `show_main_window_near_tray`'s `None`-rect fallback only has a previous
+            // position to reuse once the window has been shown at least once already, which
+            // isn't true yet on this very first call.
+            #[cfg(target_os = "windows")]
+            {
+                let show_state = app.state::<WindowShowState>();
+                show_main_window_near_tray(app.handle(), &show_state, None);
+            }
+
             // Silent background update check, like Sparkle on macOS -- release builds only (a
             // dev build has no meaningful "latest.json" to compare against, and would just spam
             // the log). The delay lets startup (session polling, tray) finish first; a failed or

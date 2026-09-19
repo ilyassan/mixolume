@@ -143,6 +143,16 @@ impl DuckCapture {
     pub fn is_triggering(&self) -> bool {
         self.is_triggering.load(Ordering::Relaxed)
     }
+
+    /// True once the capture thread has exited on its own -- activation failed, the pid died, or
+    /// any other error `run_capture` returned (see its own doc comment: "the thread logs a
+    /// warning and exits"). Nothing else ever restarts a dead capture, so without this,
+    /// `windows.rs`'s reconciliation loop only ever checks "does *any* entry exist for this app,"
+    /// which a dead one still satisfies -- silently and permanently disabling auto-duck for that
+    /// app until it goes inactive and active again (dropping and recreating the whole entry).
+    pub fn is_dead(&self) -> bool {
+        self.thread.as_ref().is_some_and(|t| t.is_finished())
+    }
 }
 
 impl Drop for DuckCapture {

@@ -93,9 +93,6 @@ webrtc-vad = "0.4"
 # crates" until this was added as its own direct dependency.
 windows-core = "0.58"
 
-[target.'cfg(target_os = "linux")'.dependencies]
-regex = "1"
-
 [target.'cfg(target_os = "macos")'.dependencies]
 # Core Audio Process Tap API backend (see src-tauri/src/mixer/macos.rs's module doc comment and
 # src-tauri/macos-audio/README.md for the full rationale). CATapDescription and the
@@ -170,9 +167,6 @@ libproc = "0.14"
 # audio in exact 10/20/30ms i16 chunks at a fixed sample rate -- see `macos_ducking.rs`'s frame
 # accumulator for why that doesn't just line up with Core Audio's own callback size.
 webrtc-vad = "0.4"
-
-[dev-dependencies]
-tokio-test = "0.4"
 
 # This is a small menu-bar utility that should be light to download and install, so stripping
 # debug symbols from the shipped binary is a clear win with zero behavioral risk (they're not
