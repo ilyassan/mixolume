@@ -51,14 +51,24 @@ runs:
         IS_PRERELEASE=false
         [[ "$TAG" == *-* ]] && IS_PRERELEASE=true
 
+        # `gh release download`, not a plain `curl` against the public download URL -- every
+        # release here starts life as a draft (see CONTRIBUTING.md), and a draft's assets are
+        # NOT reachable through the anonymous `releases/download/<tag>/<file>` URL at all (404,
+        # confirmed live: this silently broke sig-fetching for every single release since signing
+        # was added, invisible until now only because every tag tested so far happened to also be
+        # a prerelease, which skips for a completely different, unrelated reason). `gh`'s own
+        # token-authenticated API access has no such restriction. `platforms.*.url` below still
+        # uses the plain public `$BASE/...` URL, deliberately -- that one's read by an
+        # already-installed end-user app checking for updates, which by definition only ever sees
+        # a release once it's published (no longer a draft), where the public URL works fine.
         fetch_sig() {
-          curl -sL -f "$1" 2>/dev/null || true
+          gh release download "$TAG" -p "$1" -O - 2>/dev/null || true
         }
 
-        WIN_SIG=$(fetch_sig "$BASE/MiXolume_${VERSION}_x64-setup.exe.sig")
-        MAC_SIG=$(fetch_sig "$BASE/MiXolume_universal.app.tar.gz.sig")
+        WIN_SIG=$(fetch_sig "MiXolume_${VERSION}_x64-setup.exe.sig")
+        MAC_SIG=$(fetch_sig "MiXolume_universal.app.tar.gz.sig")
         # Best-effort only -- see this action's own doc comment for why this isn't required.
-        LINUX_SIG=$(fetch_sig "$BASE/MiXolume_${VERSION}_amd64.AppImage.sig")
+        LINUX_SIG=$(fetch_sig "MiXolume_${VERSION}_amd64.AppImage.sig")
 
         if [ -z "$WIN_SIG" ] || [ -z "$MAC_SIG" ]; then
           echo "Windows and/or macOS signature not uploaded yet -- skipping this run."
