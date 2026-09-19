@@ -1,6 +1,6 @@
 [package]
 name = "mixolume"
-version = "0.1.0-beta.11"
+version = "1.0.0"
 description = "Independent per-app volume control for macOS, Windows, and Linux"
 authors = ["Mixolume contributors"]
 license = "MIT"
