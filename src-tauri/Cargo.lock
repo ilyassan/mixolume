@@ -2380,7 +2380,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "webrtc-vad",
  "windows 0.58.0",
