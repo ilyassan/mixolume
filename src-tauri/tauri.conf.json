@@ -33,6 +33,13 @@
     "active": true,
     "targets": ["app", "dmg", "deb", "rpm", "appimage", "nsis"],
     "createUpdaterArtifacts": true,
+    "publisher": "Mixolume",
+    "copyright": "Copyright © 2026 Mixolume contributors",
+    "category": "Utility",
+    "homepage": "https://github.com/ilyassan/mixolume",
+    "shortDescription": "Independent per-app volume control",
+    "longDescription": "Lists every application currently producing sound and gives you an independent volume slider for each one, instead of one system-wide volume control.",
+    "licenseFile": "../LICENSE",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

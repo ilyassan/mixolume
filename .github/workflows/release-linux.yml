@@ -1,16 +1,22 @@
 name: Release Linux
 
-# Tag-triggered Linux release: push a `vX.Y.Z` tag (or `vX.Y.Z-beta.N` for a prerelease) and this
-# builds an AppImage and a .deb and attaches them to a GitHub Release matching the tag -- shared
-# with release-macos.yml and release-windows.yml, which build the same tag in parallel and attach
-# their own installers to that same release.
+# Manually-triggered Linux build: macOS and Windows are the only officially published platforms
+# for now (see CONTRIBUTING.md), so this no longer fires automatically on every tag push --
+# generate-update-manifest's own auto-update manifest only ever waits on Windows+macOS signatures,
+# and this workflow firing unattended alongside them would either race it (attaching a third,
+# untested installer to a release before anyone's actually verified Linux still works) or leave a
+# permanently-unsatisfiable "waiting on a Linux signature that will never arrive" failure mode.
+# Run it by hand (Actions tab -> Release Linux -> Run workflow, tag name as the tag to build for)
+# when Linux support is ready to ship again.
 #
 # Unsigned by convention -- Linux packages aren't part of an OS-level trust chain the way
 # macOS/Windows are.
 on:
-  push:
-    tags:
-      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing git tag to build and attach the Linux installers to
+        required: true
 
 jobs:
   release:
@@ -20,6 +26,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
@@ -47,22 +55,12 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "MiXolume ${{ github.ref_name }}"
+          tagName: ${{ inputs.tag }}
+          releaseName: "MiXolume ${{ inputs.tag }}"
           releaseBody: |
             See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for what's new.
 
-            **macOS:** signed but not yet notarized (Apple Developer Program enrollment pending)
-            -- Gatekeeper will call it "unidentified developer" on first launch. Right-click the
-            app and choose **Open**, or run `xattr -d com.apple.quarantine /path/to/MiXolume.app`.
-            Requires macOS 14.4+.
-
-            **Windows:** unsigned -- SmartScreen may warn on first run. Click **More info → Run
-            anyway**.
+            **Linux:** unsigned, community-maintained build -- not one of the officially published
+            platforms yet. No auto-update on this platform.
           releaseDraft: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
-
-      - name: Update the auto-update manifest
-        uses: ./.github/actions/generate-update-manifest
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          prerelease: ${{ contains(inputs.tag, '-') }}

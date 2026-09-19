@@ -2,8 +2,9 @@ name: Release macOS
 
 # Tag-triggered macOS release: push a `vX.Y.Z` tag (or `vX.Y.Z-beta.N` for a prerelease) and this
 # builds a universal (Apple Silicon + Intel) .dmg and attaches it to a GitHub Release matching the
-# tag -- shared with release-windows.yml and release-linux.yml, which build the same tag in
-# parallel and attach their own installers to that same release.
+# tag -- shared with release-windows.yml, which builds the same tag in parallel and attaches its
+# own installer to that same release. release-linux.yml is separate and manual-only (see its own
+# doc comment).
 #
 # Signing status: signed with a real Apple-issued "Developer ID Application: ILYASS ANIDA
 # (87G5QNR3X3)" certificate (Apple Developer Program membership went active 2026-08-25) --
@@ -18,8 +19,9 @@ name: Release macOS
 # Separately, TAURI_SIGNING_PRIVATE_KEY/_PASSWORD sign the tauri-plugin-updater artifact
 # (MiXolume_universal.app.tar.gz.sig) -- an unrelated Ed25519 keypair used only to prove to a
 # user's already-installed app that an update actually came from us, nothing to do with macOS
-# code signing/Gatekeeper at all. See generate-update-manifest's own comments for how the three
-# release-*.yml workflows turn that into a single latest.json.
+# code signing/Gatekeeper at all. See generate-update-manifest's own comments for how this and
+# release-windows.yml's matching signature turn into latest.json (or latest-beta.json, for a
+# prerelease tag).
 on:
   push:
     tags:
@@ -47,6 +49,20 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
+
+      - name: Point the updater at the beta manifest, for a prerelease tag
+        if: contains(github.ref_name, '-')
+        shell: bash
+        run: |
+          # The committed config points at the stable endpoint (`releases/latest/download/…`),
+          # which GitHub only ever resolves to a published, non-prerelease release -- so a beta
+          # build needs its own, differently-baked config pointing at a manifest a beta install
+          # can actually find. See `generate-update-manifest`'s own doc comment for how
+          # `latest-beta.json` ends up at a fixed, predictable URL despite every beta tag being
+          # its own separate release.
+          jq '.plugins.updater.endpoints = ["https://github.com/${{ github.repository }}/releases/download/latest-beta/latest-beta.json"]' \
+            src-tauri/tauri.conf.json > src-tauri/tauri.conf.json.tmp
+          mv src-tauri/tauri.conf.json.tmp src-tauri/tauri.conf.json
 
       - name: Import macOS signing certificate
         env:

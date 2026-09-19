@@ -62,16 +62,33 @@ cargo check   # from src-tauri/
 - We use **squash merges** into `main` — a PR becomes a single commit on
   `main`, so keep your PR title/description clean, as it becomes the squash
   commit message.
-- `beta` is a prerelease checkpoint, not a place PRs target directly. When
-  `main` is in a state worth letting early testers try before it's a full
-  stable release, fast-forward `beta` to that commit and push a
-  `vX.Y.Z-beta.N` tag from it. A stable release is a `vX.Y.Z` tag pushed
-  directly from `main`. Either tag triggers
-  the three `.github/workflows/release-*.yml` workflows (macOS, Windows,
-  Linux — one file each so each platform's build/re-run status is
-  independent), which build in parallel and attach their installers to the
-  same GitHub Release, marked as a prerelease automatically whenever the tag
-  contains a `-`.
+- There's no separate release branch — both a prerelease and a stable
+  release are tags pushed directly from whatever commit on `main` is ready
+  to ship. Push a `vX.Y.Z-beta.N` tag for an early-tester build, or a plain
+  `vX.Y.Z` tag for a stable release. Either one triggers
+  `.github/workflows/release-macos.yml` and `release-windows.yml` (one file
+  per platform so each one's build/re-run status is independent), which
+  build in parallel and attach their installers to the same GitHub Release
+  — marked as a prerelease automatically whenever the tag contains a `-`.
+  `release-linux.yml` is manual-only (`workflow_dispatch`) for now: Linux
+  isn't an officially published platform yet, see the README.
+- Releases are created as **drafts** — check the assets and release notes
+  on GitHub once both platform workflows finish, then publish it by hand.
+  This is a deliberate manual gate, not a bug: nothing is visible to users
+  (and `tauri-plugin-updater`'s "latest release" endpoint can't resolve to
+  it) until it's published.
+- Auto-update has two independent channels, each pointed at its own build.
+  A stable build's updater endpoint (baked in at build time from
+  `tauri.conf.json`) is GitHub's `releases/latest/download/latest.json` --
+  which only ever resolves to a published, non-prerelease release, so a
+  stable install can never silently jump onto a beta. A beta build gets a
+  different endpoint patched in during CI (see `release-macos.yml`'s/
+  `release-windows.yml`'s "Point the updater at the beta manifest" step),
+  pointed at a fixed, permanently-published `latest-beta` release that
+  `generate-update-manifest` overwrites on every new beta tag -- since
+  every beta tag is its own separate release, unlike stable's `latest`
+  shortcut, that fixed release is the only way a beta install has a
+  constant URL to check.
 
 ## Commit message convention
 

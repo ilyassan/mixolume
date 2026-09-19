@@ -1,10 +1,35 @@
 name: Generate update manifest
 description: >
-  Regenerates and uploads latest.json (the tauri-plugin-updater manifest) for the current tag,
-  from whatever platform .sig files currently exist on this tag's GitHub release. Called as the
-  last step of all three release-*.yml workflows -- they build in parallel on separate runners,
-  so whichever one finishes last naturally produces the complete file; an earlier run just skips
-  with a message instead of publishing a manifest missing the platforms that aren't built yet.
+  Regenerates and uploads the tauri-plugin-updater manifest for the current tag, from whatever
+  platform .sig files currently exist on this tag's GitHub release. Called as the last step of
+  both release-*.yml workflows that run automatically on every tag push (macOS, Windows) -- they
+  build in parallel on separate runners, so whichever one finishes last naturally produces the
+  complete file; an earlier run just skips with a message instead of publishing a manifest missing
+  the platform that isn't built yet.
+
+  A stable (`vX.Y.Z`) tag produces `latest.json`, uploaded to that tag's own release -- this is
+  what `releases/latest/download/latest.json` resolves to, since GitHub's "latest" release
+  shortcut only ever considers a published, non-prerelease release, which is exactly the
+  guarantee that keeps a stable install from ever silently jumping onto a beta.
+
+  A prerelease (`vX.Y.Z-beta.N`) tag produces `latest-beta.json` instead -- but *that* tag's own
+  release isn't a stable, predictable URL an already-installed beta build could point at (every
+  new beta is a brand new release object; there's no GitHub-provided "latest prerelease"
+  shortcut). So `latest-beta.json` is uploaded to a separate, fixed-tag release
+  (`latest-beta`, created the first time this ever runs, permanently published/non-draft since
+  the updater needs to fetch it without anyone manually publishing anything) that gets its one
+  asset overwritten on every new beta -- giving beta installs (built with the beta-specific
+  updater endpoint set by release-macos.yml/release-windows.yml's own "Point the updater at the
+  beta manifest" step) one fixed URL that always reflects the newest beta. The manifest's own
+  `platforms.*.url` fields still point at the real per-version release's installer downloads
+  (permanent once uploaded), so no installer binary is ever duplicated into the fixed release --
+  only the small manifest JSON lives there.
+
+  Linux is intentionally not required for either manifest: release-linux.yml only runs on a
+  manual workflow_dispatch (see its own doc comment), so waiting on a Linux signature that will
+  never arrive on a normal tag push would mean this step -- and therefore auto-update entirely --
+  never fires. A `linux-x86_64` entry is still included, best-effort, if a Linux signature happens
+  to already be attached to this release (e.g. someone ran release-linux.yml by hand first).
 
 inputs:
   github-token:
@@ -23,54 +48,68 @@ runs:
         TAG="${GITHUB_REF#refs/tags/}"
         VERSION="${TAG#v}"
         BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
-
-        # latest.json feeds the updater's "releases/latest/download/latest.json" endpoint, which
-        # GitHub only ever resolves to a published, non-prerelease release -- publishing one for
-        # a beta tag would be actively wrong (nobody's install should silently jump onto a beta).
-        if [[ "$TAG" == *-* ]]; then
-          echo "Prerelease tag ($TAG) -- not generating latest.json."
-          exit 0
-        fi
+        IS_PRERELEASE=false
+        [[ "$TAG" == *-* ]] && IS_PRERELEASE=true
 
         fetch_sig() {
           curl -sL -f "$1" 2>/dev/null || true
         }
 
         WIN_SIG=$(fetch_sig "$BASE/MiXolume_${VERSION}_x64-setup.exe.sig")
-        LINUX_SIG=$(fetch_sig "$BASE/MiXolume_${VERSION}_amd64.AppImage.sig")
         MAC_SIG=$(fetch_sig "$BASE/MiXolume_universal.app.tar.gz.sig")
+        # Best-effort only -- see this action's own doc comment for why this isn't required.
+        LINUX_SIG=$(fetch_sig "$BASE/MiXolume_${VERSION}_amd64.AppImage.sig")
 
-        if [ -z "$WIN_SIG" ] || [ -z "$LINUX_SIG" ] || [ -z "$MAC_SIG" ]; then
-          echo "Not every platform's signature is uploaded yet -- skipping this run."
+        if [ -z "$WIN_SIG" ] || [ -z "$MAC_SIG" ]; then
+          echo "Windows and/or macOS signature not uploaded yet -- skipping this run."
           echo "Whichever release-*.yml workflow finishes last will complete this."
           exit 0
         fi
 
-        cat > latest.json << EOF
-        {
-          "version": "$VERSION",
-          "notes": "See https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md",
-          "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-          "platforms": {
-            "windows-x86_64": {
-              "signature": "$WIN_SIG",
-              "url": "$BASE/MiXolume_${VERSION}_x64-setup.exe"
-            },
-            "linux-x86_64": {
-              "signature": "$LINUX_SIG",
-              "url": "$BASE/MiXolume_${VERSION}_amd64.AppImage"
-            },
-            "darwin-x86_64": {
-              "signature": "$MAC_SIG",
-              "url": "$BASE/MiXolume_universal.app.tar.gz"
-            },
-            "darwin-aarch64": {
-              "signature": "$MAC_SIG",
-              "url": "$BASE/MiXolume_universal.app.tar.gz"
-            }
-          }
-        }
-        EOF
+        PLATFORMS=$(jq -n \
+          --arg win_sig "$WIN_SIG" --arg win_url "$BASE/MiXolume_${VERSION}_x64-setup.exe" \
+          --arg mac_sig "$MAC_SIG" --arg mac_url "$BASE/MiXolume_universal.app.tar.gz" \
+          '{
+            "windows-x86_64": {"signature": $win_sig, "url": $win_url},
+            "darwin-x86_64": {"signature": $mac_sig, "url": $mac_url},
+            "darwin-aarch64": {"signature": $mac_sig, "url": $mac_url}
+          }')
 
-        gh release upload "$TAG" latest.json --clobber
-        echo "Uploaded latest.json for $TAG"
+        if [ -n "$LINUX_SIG" ]; then
+          PLATFORMS=$(echo "$PLATFORMS" | jq \
+            --arg linux_sig "$LINUX_SIG" --arg linux_url "$BASE/MiXolume_${VERSION}_amd64.AppImage" \
+            '. + {"linux-x86_64": {"signature": $linux_sig, "url": $linux_url}}')
+        fi
+
+        if [ "$IS_PRERELEASE" = true ]; then
+          MANIFEST_FILE="latest-beta.json"
+          NOTES="Beta build -- see https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          TARGET_TAG="latest-beta"
+
+          # Racily created at most once: the two parallel release-*.yml runs for one tag push
+          # each only reach this point once the other has already uploaded its own signature
+          # (see the WIN_SIG/MAC_SIG check above), so in practice only whichever finishes second
+          # gets here at all -- but `|| true` covers the rare near-simultaneous-finish case where
+          # both do, so a lost race here is a no-op, not a failed workflow run.
+          if ! gh release view "$TARGET_TAG" >/dev/null 2>&1; then
+            gh release create "$TARGET_TAG" \
+              --title "Beta channel (auto-update manifest)" \
+              --notes "Internal to the auto-updater -- not a real release. Download an actual beta from its own versioned tag instead: https://github.com/${GITHUB_REPOSITORY}/releases" \
+              --prerelease || true
+          fi
+        else
+          MANIFEST_FILE="latest.json"
+          NOTES="See https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md"
+          TARGET_TAG="$TAG"
+        fi
+
+        jq -n \
+          --arg version "$VERSION" \
+          --arg notes "$NOTES" \
+          --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          --argjson platforms "$PLATFORMS" \
+          '{version: $version, notes: $notes, pub_date: $pub_date, platforms: $platforms}' \
+          > "$MANIFEST_FILE"
+
+        gh release upload "$TARGET_TAG" "$MANIFEST_FILE" --clobber
+        echo "Uploaded $MANIFEST_FILE to the '$TARGET_TAG' release"

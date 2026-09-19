@@ -215,11 +215,13 @@ enum UpdateCheckOutcome {
     Installed { version: String },
 }
 
-/// Checks the GitHub-hosted `latest.json` manifest and, if a newer version exists, downloads and
-/// installs it immediately -- the install only *takes effect* on the next launch (Tauri's
-/// updater replaces the on-disk app bundle/installer but doesn't restart the running process),
-/// so this is safe to run silently while the app is in active use. Shared by the silent
-/// startup check and the frontend's manual "Check for Updates" button.
+/// Checks the GitHub-hosted update manifest (`plugins.updater.endpoints` in `tauri.conf.json` --
+/// `latest.json` for a stable build, `latest-beta.json` for a beta one, baked in per-channel at
+/// CI build time; see `CONTRIBUTING.md`) and, if a newer version on the same channel exists,
+/// downloads and installs it immediately -- the install only *takes effect* on the next launch
+/// (Tauri's updater replaces the on-disk app bundle/installer but doesn't restart the running
+/// process), so this is safe to run silently while the app is in active use. Shared by the
+/// silent startup check and the frontend's manual "Check for Updates" button.
 async fn run_update_check(app: AppHandle) -> Result<UpdateCheckOutcome, String> {
     use tauri_plugin_updater::UpdaterExt;
 
@@ -714,8 +716,27 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
             }
         });
 
-    if let Some(icon) = app.default_window_icon() {
-        builder = builder.icon(icon.clone());
+    // macOS menu-bar extras (Wi-Fi, Bluetooth, volume, Control Center) are all monochrome
+    // "template" images that macOS auto-recolors/inverts for the current menu bar appearance --
+    // reusing the full-color app/Dock icon here would look visually inconsistent (a colorful
+    // square standing out among monochrome neighbors) and wouldn't adapt to a light menu bar at
+    // all. `tray-icon.png` is a dedicated solid-black silhouette of the same M-waveform mark
+    // (source: `tray-icon.svg`, one directory up) built specifically for this; only macOS gets
+    // `icon_as_template(true)`, since Windows/Linux tray icons are conventionally full color, not
+    // template images, and every app there (including this one, via `default_window_icon`) does
+    // exactly that.
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(icon) = tauri::image::Image::from_bytes(include_bytes!("../icons/tray-icon.png"))
+        {
+            builder = builder.icon(icon).icon_as_template(true);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(icon) = app.default_window_icon() {
+            builder = builder.icon(icon.clone());
+        }
     }
 
     builder.build(app)?;
@@ -734,6 +755,16 @@ pub fn run() {
     .init();
 
     tauri::Builder::default()
+        // Must come first -- see this plugin's own doc comment in Cargo.toml. A second launch
+        // attempt is treated exactly like a tray-icon "Show" click: it's the same underlying
+        // intent (the user wants to see the app), and reusing `show_main_window_near_tray`
+        // (rather than a bare `set_focus()`) matters here specifically because this app's main
+        // window starts every launch *hidden* -- a plain focus call on a window that's never
+        // been shown yet would silently no-op.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            let show_state = app.state::<WindowShowState>();
+            show_main_window_near_tray(app, &show_state, None);
+        }))
         .plugin(tauri_plugin_opener::init())
         // Uses a real macOS Launch Agent (not an AppleScript login-item hack) -- the frontend
         // toggles it via the `autostart:default` capability's enable/disable/isEnabled commands.
