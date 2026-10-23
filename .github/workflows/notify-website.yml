@@ -1,0 +1,20 @@
+name: Notify website of a published release
+
+# Fires on every release publish in this repo, including from the GitHub UI "Publish release"
+# button (not just from the build workflows) -- `released` specifically means published AND not
+# a pre-release, so beta/draft releases never trigger this.
+on:
+  release:
+    types: [released]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch to mixolume-website
+        run: |
+          curl -sf -X POST \
+            -H "Authorization: token ${{ secrets.WEBSITE_REPO_DISPATCH_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/ilyassan/mixolume-website/dispatches \
+            -d '{"event_type":"release-published"}'
